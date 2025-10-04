@@ -5,10 +5,16 @@ BASE = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl"
 
 MARKETS_GAME = ["h2h", "spreads", "totals"]
 MARKETS_PROPS = [
-    "player_pass_yds", "player_pass_tds",
-    "player_rush_yds", "player_rush_attempts",
-    "player_rec_yds", "player_receptions",
-    "player_rush_rec_yds", "player_anytime_td"
+    "player_pass_yards",         # QB passing yards
+    "player_pass_tds",
+    "player_rush_yards",
+    "player_rush_attempts",
+    "player_receiving_yards",
+    "player_receptions",
+    "player_rush_and_rec_yards",
+    "player_anytime_td"
+]
+"
 ]
 
 def _get(path, **params):
