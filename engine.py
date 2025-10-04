@@ -1,220 +1,214 @@
 # engine.py
+from __future__ import annotations
+
 import os
-import re
+import sys
+from typing import Tuple, List
+
+import numpy as np
 import pandas as pd
 
-from scripts.odds_api import fetch_game_lines, fetch_props_all_events
-from scripts.features_external import build_external
-from scripts.id_map import map_players
-from scripts.pricing import (
-    american_to_prob, devig_two_way, blend, prob_to_american,
-    edge_pct, kelly_fraction, tier
-)
-from scripts.model_core import (
-    base_sigma, over_prob_normal,
-    player_shares,
-    mu_receptions, mu_rec_yards, mu_rush_atts, mu_rush_yards, mu_pass_yards
-)
-from scripts.elite_rules import (
-    funnel_multiplier, volatility_widen, pace_smoothing, sack_to_attempts
-)
+# Local modules
 from scripts.engine_helpers import make_team_last4_from_player_form
-from scripts.rules_engine import apply_rules
-from scripts.volume import consensus_spread_total, team_volume_estimates
-from scripts.td_model import (
-    implied_team_totals, total_to_td_lambda, player_td_probability,
-    qb_pass_tds_lambda, yes_prob_from_lambda
-)
-# from scripts.calibration import apply_shrinkage  # optional; enable after week 1
-# from scripts.sgp import build_sgp  # optional
+from scripts.rules_engine import apply_rules as rules_apply  # your existing rules engine
+from scripts.model_core import price_props_for_events          # your pricing core (if different, adjust)
+from scripts.odds_api import fetch_game_lines, fetch_props_all_events
+from scripts.pricing import devig_american_prob               # if needed inside pricing core
+from scripts.features_external import merge_external_features  # optional; if you have it
 
-def _norm(val) -> str:
-    if val is None: return ""
-    s = str(val).strip()
-    if s.lower() in {"nan","none","null"}: return ""
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    return re.sub(r"\s+"," ",s).strip()
+# --------------------------------------------------------------------------------------
+# Utility helpers
+# --------------------------------------------------------------------------------------
 
-def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
-    # 1) Odds
-    game_df  = fetch_game_lines()
-    props_df = fetch_props_all_events()
+def _ensure_dir(path: str) -> None:
+    if path and not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
 
-    cons = consensus_spread_total(game_df)  # event_id, home_spread, total
 
-    # 2) External features (ids, player_form, team_form, weather)
-    ext = build_external(season)
-    ids = ext["ids"]; team_form = ext["team_form"]; pform = ext["player_form"]; weather_df = ext["weather"]
+def safe_read_csv(path: str, **kw) -> pd.DataFrame:
+    try:
+        if not os.path.exists(path):
+            return pd.DataFrame()
+        return pd.read_csv(path, **kw)
+    except Exception as e:
+        print(f"⚠️  Failed to read {path}: {e}")
+        return pd.DataFrame()
 
-    team_l4_map = make_team_last4_from_player_form(pform)
 
-    # 3) Map player names → ids/position/team
-    props_df = map_players(props_df, ids)
+def _normalize_team_form(team_form: pd.DataFrame) -> pd.DataFrame:
+    """Normalize/patch external team features so downstream joins never fail."""
+    tf = team_form.copy()
 
-    # simple weather lookup
-    weather_by_event = {}
-    if not weather_df.empty and "event_id" in weather_df.columns:
-        weather_by_event = {str(r["event_id"]): r for _, r in weather_df.iterrows()}
+    # Standardize team column
+    if "team" not in tf.columns:
+        if "defteam" in tf.columns:
+            tf = tf.rename(columns={"defteam": "team"})
+        elif "posteam" in tf.columns:
+            tf = tf.rename(columns={"posteam": "team"})
 
-    def team_ctx(team):
-        return team_l4_map.get(team, {"tgt_team_l4": 30.0, "rush_att_team_l4": 25.0})
+    if "team" not in tf.columns:
+        # give up but keep schema
+        tf["team"] = "UNK"
 
-    rows = []
-    for _, r in props_df.iterrows():
-        market = r["market"]
-        if market not in {
-            "player_reception_yds","player_receptions",
-            "player_rush_yds","player_rush_attempts",
-            "player_pass_yds","player_pass_tds",
-            "player_anytime_td",
-        }:
-            continue
+    # Map proe_proxy -> proe if needed
+    if "proe" not in tf.columns and "proe_proxy" in tf.columns:
+        tf["proe"] = tf["proe_proxy"]
+    elif "proe" not in tf.columns:
+        tf["proe"] = 0.0
 
-        price = r["price"]; line = r["point"]; side = r["outcome"]
-        # market fair (de-vig)
-        p_raw = american_to_prob(price)
-        p_over_raw  = p_raw if side in ("Over","Yes") else None
-        p_under_raw = p_raw if side in ("Under","No") else None
-        p_over_fair, p_under_fair = devig_two_way(p_over_raw, p_under_raw)
-        market_p_fair = p_over_fair if side in ("Over","Yes") else p_under_fair
+    # Optional columns (coverage & box shares) — fill safe defaults
+    for col in ["man_rate_z", "zone_rate_z", "heavy_box_share", "light_box_share"]:
+        if col not in tf.columns:
+            tf[col] = 0.0
 
-        # volume
-        ev = cons[cons["event_id"].eq(r["event_id"])].head(1)
-        ev_row = ev.iloc[0] if not ev.empty else {}
-        team_code = r.get("recent_team") or ""
-        is_home = _norm(team_code) and (_norm(team_code) in _norm(r.get("home") or ""))
-        w = weather_by_event.get(str(r.get("event_id")), None)
+    # Required numeric columns — if missing, create safe defaults
+    for col in ["pressure_rate", "pressure_z", "pass_epa_allowed", "pass_epa_z"]:
+        if col not in tf.columns:
+            tf[col] = 0.0
 
-        # team form row for PROE, etc.
-        tf_row = None
-        opp = r.get("opponent") or r.get("opp") or ""
-        if not team_form.empty and opp in team_form.index:
-            tf_row = team_form.loc[opp].to_dict()
+    keep = ["team", "pressure_rate", "pressure_z",
+            "pass_epa_allowed", "pass_epa_z",
+            "proe", "man_rate_z", "zone_rate_z",
+            "heavy_box_share", "light_box_share"]
+    tf = tf[[c for c in keep if c in tf.columns]].drop_duplicates(subset=["team"])
+    return tf.reset_index(drop=True)
 
-        plays, pass_rate, rush_rate, win_prob = team_volume_estimates(ev_row, bool(is_home), tf_row=tf_row, weather=w)
 
-        # player shares/efficiency
-        pid = r.get("gsis_id")
-        pr = pform[pform["gsis_id"] == pid]
-        pr = pr.sort_values("week").tail(1).iloc[0].to_dict() if not pr.empty else {}
-        shares = player_shares(pr, team_ctx(r.get("recent_team")))
-        tgt_share, rush_share, catch_rate, ypr, ypc = shares
+def _downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    for c in df.select_dtypes(include=["float64"]).columns:
+        df[c] = pd.to_numeric(df[c], downcast="float")
+    for c in df.select_dtypes(include=["int64"]).columns:
+        df[c] = pd.to_numeric(df[c], downcast="integer")
+    return df
 
-        pass_mult = funnel_multiplier(True,  def_rush_epa_z=tf_row.get("pass_epa_z",0.0) if tf_row else 0.0,
-                                           def_pass_epa_z=tf_row.get("pass_epa_z",0.0) if tf_row else 0.0)
-        rush_mult = funnel_multiplier(False, def_rush_epa_z=tf_row.get("pass_epa_z",0.0) if tf_row else 0.0,
-                                            def_pass_epa_z=tf_row.get("pass_epa_z",0.0) if tf_row else 0.0)
-        plays = pace_smoothing(plays, 0.0, 0.0)
 
-        sigma = base_sigma(market)
-        model_prob_override = None
+# --------------------------------------------------------------------------------------
+# External features loader (resilient)
+# --------------------------------------------------------------------------------------
 
-        if market == "player_receptions":
-            mu_rec = mu_receptions(plays, pass_rate, tgt_share, catch_rate) * pass_mult
-            mu = mu_rec
+def load_external_features(season: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      team_form (normalized),
+      player_form (raw),
+      id_map
+    """
+    team_form = safe_read_csv("metrics/team_form.csv")
+    if team_form.empty:
+        print("⚠️  team_form.csv is empty.")
+    else:
+        # display any missing optional columns
+        opt = ['heavy_box_share', 'light_box_share', 'man_rate_z', 'zone_rate_z', 'proe', 'proe_proxy']
+        missing = [c for c in opt if c not in team_form.columns]
+        if missing:
+            print(f"ℹ️  team_form.csv missing columns: {missing}")
+    team_form = _normalize_team_form(team_form)
 
-        elif market == "player_reception_yds":
-            mu_rec = mu_receptions(plays, pass_rate, tgt_share, catch_rate) * pass_mult
-            mu = mu_rec_yards(mu_rec, ypr)
+    player_form = safe_read_csv("metrics/player_form.csv")
+    if player_form.empty:
+        print("ℹ️  player_form.csv is empty.")
 
-        elif market == "player_rush_attempts":
-            atts = mu_rush_atts(plays, rush_rate, rush_share) * rush_mult
-            atts = sack_to_attempts(atts, sack_rate_above_avg=0.0)
-            mu = atts
+    id_map = safe_read_csv("metrics/id_map.csv")
+    if id_map.empty:
+        print("ℹ️  id_map.csv is empty.")
 
-        elif market == "player_rush_yds":
-            atts = mu_rush_atts(plays, rush_rate, rush_share) * rush_mult
-            mu = mu_rush_yards(atts, ypc)
+    return team_form, player_form, id_map
 
-        elif market == "player_pass_yds":
-            qb_ypa = (pr.get("pass_yds_l4",0)/max(pr.get("pass_att_l4",1),1)) if pr else 6.8
-            dropbacks = plays * pass_rate
-            mu = mu_pass_yards(dropbacks, qb_ypa, z_opp_pressure=tf_row.get("pressure_z",0.0) if tf_row else 0.0,
-                                              z_opp_pass_epa=tf_row.get("pass_epa_z",0.0) if tf_row else 0.0)
-            sigma = volatility_widen(sigma, pressure_mismatch=False, qb_inconsistent=False)
 
-        elif market == "player_pass_tds":
-            total_pts = float(ev_row.get("total", 43.5) or 43.5)
-            spread    = float(ev_row.get("home_spread", 0.0) or 0.0)  # home - away
-            home_total, away_total = implied_team_totals(total_pts, spread, home_is_favorite=(spread<0))
-            my_team_total = home_total if is_home else away_total
-            lam_td = total_to_td_lambda(my_team_total)
-            lam_pass = qb_pass_tds_lambda(lam_td, pass_rate)
-            model_prob_override = yes_prob_from_lambda(lam_pass)
-            mu = lam_pass
-            sigma = max(0.6, sigma * 0.04)
+# --------------------------------------------------------------------------------------
+# Main pipeline
+# --------------------------------------------------------------------------------------
 
-        elif market == "player_anytime_td":
-            total_pts = float(ev_row.get("total", 43.5) or 43.5)
-            spread    = float(ev_row.get("home_spread", 0.0) or 0.0)
-            home_total, away_total = implied_team_totals(total_pts, spread, home_is_favorite=(spread<0))
-            my_team_total = home_total if is_home else away_total
-            lam_td = total_to_td_lambda(my_team_total)
-            rz_share = float(pr.get("rz_tgt_share_l4", 0.15) if pr else 0.15)
-            goal_bias = 1.15 if str(r.get("position","")).upper() in {"RB","FB"} else 1.0
-            p_yes = player_td_probability(lam_td, rz_share, goal_line_bias=goal_bias)
-            model_prob_override = p_yes
-            mu = p_yes
-            sigma = 1.0
+def run_pipeline(target_date: str, season: int, out_dir: str = "outputs") -> None:
+    """
+    Full slate pipeline:
+      1) Fetch odds (games + props)
+      2) Load external features (team_form, player_form, id_map)
+      3) Build team aggregates from player form (resilient)
+      4) Merge features
+      5) Apply rules (elite rules engine)
+      6) Price props & write outputs
+    """
+    _ensure_dir(out_dir)
 
+    print(f"{season} done.")
+    print("Downcasting floats.")
+
+    # ----------------------------------------------------------------------------------
+    # 1) Fetch odds
+    # ----------------------------------------------------------------------------------
+    print("Fetching game lines …")
+    try:
+        game_df = fetch_game_lines()
+    except Exception as e:
+        print(f"⚠️  fetch_game_lines() failed: {e}")
+        game_df = pd.DataFrame()
+
+    print("Fetching all props for events …")
+    try:
+        props_df = fetch_props_all_events()
+    except Exception as e:
+        print(f"⚠️  fetch_props_all_events() failed: {e}")
+        props_df = pd.DataFrame()
+
+    # ----------------------------------------------------------------------------------
+    # 2) External features
+    # ----------------------------------------------------------------------------------
+    team_form, player_form, id_map = load_external_features(season)
+
+    # ----------------------------------------------------------------------------------
+    # 3) Team aggregates from player_form (resilient)
+    # ----------------------------------------------------------------------------------
+    team_l4 = make_team_last4_from_player_form(player_form)
+
+    # ----------------------------------------------------------------------------------
+    # 4) Merge features (best-effort)
+    # ----------------------------------------------------------------------------------
+    # Example: if you have a helper to merge: merge_external_features()
+    # Otherwise, do light merges here.
+    try:
+        features = merge_external_features(game_df, team_form, team_l4, id_map)
+    except Exception as e:
+        print(f"ℹ️  merge_external_features unavailable or failed ({e}); using minimal features merge.")
+        # Minimal merge on team if possible
+        features = game_df.copy()
+        for side in ("home_team", "away_team"):
+            if side in features.columns and "team" in team_form.columns:
+                tf = team_form.add_prefix(f"{side}_")
+                features = features.merge(
+                    tf.rename(columns={f"{side}_team": side}),
+                    on=side, how="left"
+                )
+
+    # ----------------------------------------------------------------------------------
+    # 5) Apply elite rules (works on features/props)
+    # ----------------------------------------------------------------------------------
+    try:
+        mu, sigma, notes = rules_apply(features)  # Your rules_engine.apply_rules signature
+    except TypeError:
+        # Older signature fallback: rules_apply(features) -> (mu, sigma)
+        tmp = rules_apply(features)
+        if isinstance(tmp, tuple) and len(tmp) == 3:
+            mu, sigma, notes = tmp
         else:
-            mu = 0.0
+            mu, sigma = tmp
+            notes = pd.Series([""] * len(features))
 
-        # Elite rules (now fed real z-scores where available)
-        opp_pressure_z = float(tf_row.get("pressure_z",0.0)) if tf_row else 0.0
-        opp_pass_epa_z = float(tf_row.get("pass_epa_z",0.0)) if tf_row else 0.0
-        heavy_man  = (float(tf_row.get("man_rate_z",0.0))  if tf_row else 0.0) > 0.8
-        heavy_zone = (float(tf_row.get("zone_rate_z",0.0)) if tf_row else 0.0) > 0.8
-        light_box_share = tf_row.get("light_box_share", None) if tf_row else None
-        heavy_box_share = tf_row.get("heavy_box_share", None) if tf_row else None
+    # Attach model parameters
+    features["model_mu"] = mu
+    features["model_sigma"] = sigma
+    features["notes"] = notes
 
-        mu, sigma, notes = apply_rules(
-            market=market, side=side, mu=mu, sigma=sigma,
-            player=pr, team_ctx=team_ctx(r.get("recent_team")),
-            opp_pressure_z=opp_pressure_z, opp_pass_epa_z=opp_pass_epa_z,
-            run_funnel=False, pass_funnel=False,
-            alpha_limited=False, tough_shadow=False,
-            heavy_man=heavy_man, heavy_zone=heavy_zone,
-            team_ay_att_z=0.0, light_box_share=light_box_share, heavy_box_share=heavy_box_share,
-            win_prob=win_prob, qb_inconsistent=False, pressure_mismatch=False,
-        )
+    # ----------------------------------------------------------------------------------
+    # 6) Price props & write outputs
+    # ----------------------------------------------------------------------------------
+    try:
+        priced = price_props_for_events(features, props_df)
+    except Exception as e:
+        print(f"⚠️  price_props_for_events failed: {e}")
+        priced = pd.DataFrame()
 
-        # Optional: μ shrinkage from calibration
-        # mu = apply_shrinkage(market, mu)
-
-        # Price at quoted line
-        if model_prob_override is not None:
-            model_p = model_prob_override if side in ("Over","Yes") else (1.0 - model_prob_override)
-        else:
-            model_p = over_prob_normal(line, mu, sigma) if side in ("Over","Yes") else 1 - over_prob_normal(line, mu, sigma)
-
-        p_blend = blend(model_p, market_p_fair, w_model=0.65)
-        fair_american = prob_to_american(p_blend)
-        edge = edge_pct(p_blend, market_p_fair)
-        kelly = kelly_fraction(p_blend, price, cap=0.05)
-        tier_label = tier(edge)
-
-        rows.append({
-            **r.to_dict(),
-            "model_mu": mu, "model_sigma": sigma,
-            "model_prob": model_p, "market_prob_fair": market_p_fair,
-            "blend_prob": p_blend, "blend_fair_odds": fair_american,
-            "edge_pct": edge, "edge_pp": 100.0 * edge,
-            "kelly_cap": kelly, "tier": tier_label,
-            "notes": notes,
-            "plays_est": plays, "pass_rate_est": pass_rate, "rush_rate_est": rush_rate,
-            "win_prob_est": win_prob,
-        })
-
-    out = pd.DataFrame(rows)
-    os.makedirs(out_dir or "outputs", exist_ok=True)
-    out.to_csv(f"{out_dir}/props_priced.csv", index=False)
-    game_df.to_csv(f"{out_dir}/game_lines.csv", index=False)
-
-    # Optional: build SGPs
-    # sgp_df = build_sgp(out, max_legs=3, min_edge=0.02)
-    # sgp_df.to_csv(f"{out_dir}/sgp.csv", index=False)
-
-    return {"game_lines": game_df, "props_priced": out}
-
+    priced = _downcast_numeric(priced)
+    out_path = os.path.join(out_dir, "props_priced.csv")
+    priced.to_csv(out_path, index=False)
+    print(f"✅ Wrote {out_path} with {len(priced)} rows.")
