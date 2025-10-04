@@ -2,59 +2,72 @@ name: "Full Slate: Lines + Features + Model"
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "15 * * * *"  # disabled
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
+      # 1) Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2) Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # 3) Install deps (base + extended)
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          if [ -f requirements-extended.txt ]; then pip install -r requirements-extended.txt; fi
 
-      - name: Sanity check Odds API key (and remaining credits)
+      # 4) Ensure folder layout (and put stadiums where fetcher expects it)
+      - name: Ensure dirs
+        run: |
+          mkdir -p metrics inputs outputs data
+          if [ -f scripts/stadiums.csv ]; then
+            cp scripts/stadiums.csv data/stadiums.csv
+          fi
+
+      # 5) Quick sanity check for Odds API credits/key
+      - name: Sanity check Odds API key
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python - <<'PY'
-          import os, requests, sys
+          import os, requests
           key = os.environ.get("ODDS_API_KEY","")
           if not key:
-              print("⚠️ No ODDS_API_KEY set; game/props fetch will fail.")
-          r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={key}", timeout=20)
-          print("Status:", r.status_code)
-          print("Remaining credits:", r.headers.get("x-requests-remaining"))
-          if r.status_code != 200:
-              print("Notice:", r.text)
+              print("⚠️  No ODDS_API_KEY set; props/game odds calls will fail.")
+          else:
+              try:
+                  r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={key}", timeout=20)
+                  print("Status:", r.status_code)
+                  print("Remaining credits:", r.headers.get("x-requests-remaining"))
+                  if r.status_code != 200:
+                      print("Notice:", r.text[:400])
+              except Exception as e:
+                  print("⚠️  Sanity call failed:", e)
           PY
 
-      - name: Ensure dirs
-        run: |
-          mkdir -p metrics inputs outputs data
-
-      # ⬇️ NEW: auto-fetch external metrics (team/player form, ids, weather)
+      # 6) NEW: Fetch external metrics (team/player form, ids, weather)
       - name: Fetch external metrics (free sources)
         run: |
           python -m scripts.fetch_all --season 2025
 
+      # 7) Run your model pipeline
       - name: Run pipeline
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python run_model.py --date today --season 2025 --write outputs
 
+      # 8) Upload artifacts (results + fetched metrics)
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
