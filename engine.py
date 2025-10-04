@@ -81,5 +81,111 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
         line  = r["point"]
         side  = r["outcome"]
 
-        # implied prob & de-vi
+        # implied prob & de-vig
+        p_raw = american_to_prob(price)
+        p_over_raw  = p_raw if side in ("Over", "Yes") else None
+        p_under_raw = p_raw if side in ("Under", "No") else None
+        p_over_fair, p_under_fair = devig_two_way(p_over_raw, p_under_raw)
+        market_p_fair = p_over_fair if side in ("Over", "Yes") else p_under_fair
 
+        # Volume from consensus numbers
+        ev = cons[cons["event_id"].eq(r["event_id"])].head(1)
+        ev_row = ev.iloc[0] if not ev.empty else {}
+        nteam = _norm(r.get("recent_team") or "")
+        is_home = bool(nteam) and (nteam in _norm(r.get("home") or ""))
+
+        tf_row = None  # (hook for team_form later)
+        plays, pass_rate, rush_rate, win_prob = team_volume_estimates(ev_row, is_home, tf_row)
+
+        # Player shares/efficiency from last-4
+        team_ctx = get_team_context(r.get("recent_team"))
+        pid = r.get("gsis_id")
+        pr = pform[pform["gsis_id"] == pid]
+        pr = pr.sort_values("week").tail(1).iloc[0].to_dict() if not pr.empty else {}
+        tgt_share, rush_share, catch_rate, ypr, ypc = player_shares(pr, team_ctx)
+
+        # basic multipliers
+        pass_mult = funnel_multiplier(True,  def_rush_epa_z=0.0, def_pass_epa_z=0.0)
+        rush_mult = funnel_multiplier(False, def_rush_epa_z=0.0, def_pass_epa_z=0.0)
+        plays = pace_smoothing(plays, 0.0, 0.0)
+
+        sigma = base_sigma(market)
+
+        if market == "player_receptions":
+            mu_rec = mu_receptions(plays, pass_rate, tgt_share, catch_rate) * pass_mult
+            mu = mu_rec
+
+        elif market == "player_reception_yds":
+            mu_rec = mu_receptions(plays, pass_rate, tgt_share, catch_rate) * pass_mult
+            mu = mu_rec_yards(mu_rec, ypr)
+
+        elif market == "player_rush_attempts":
+            atts = mu_rush_atts(plays, rush_rate, rush_share) * rush_mult
+            atts = sack_to_attempts(atts, sack_rate_above_avg=0.0)
+            mu = atts
+
+        elif market == "player_rush_yds":
+            atts = mu_rush_atts(plays, rush_rate, rush_share) * rush_mult
+            mu = mu_rush_yards(atts, ypc)
+
+        elif market == "player_pass_yds":
+            qb_ypa = (pr.get("pass_yds_l4", 0) / max(pr.get("pass_att_l4", 1), 1)) if pr else 6.8
+            dropbacks = plays * pass_rate
+            mu = mu_pass_yards(dropbacks, qb_ypa, z_opp_pressure=0.0, z_opp_pass_epa=0.0)
+            sigma = volatility_widen(sigma, pressure_mismatch=False, qb_inconsistent=False)
+
+        elif market == "player_pass_tds":
+            qb_ypa = (pr.get("pass_yds_l4", 0) / max(pr.get("pass_att_l4", 1), 1)) if pr else 6.8
+            dropbacks = plays * pass_rate
+            pass_yds_mu = mu_pass_yards(dropbacks, qb_ypa, z_opp_pressure=0.0, z_opp_pass_epa=0.0)
+            mu = max(0.5, pass_yds_mu / 150.0)
+            sigma = max(0.6, sigma * 0.04)
+
+        elif market == "player_anytime_td":
+            mu = 0.0
+            sigma = 1.0
+
+        else:
+            mu = 0.0
+
+        # Elite rules
+        mu, sigma, notes = apply_rules(
+            market=market, side=side, mu=mu, sigma=sigma,
+            player=pr, team_ctx=team_ctx,
+            opp_pressure_z=0.0, opp_pass_epa_z=0.0,
+            run_funnel=False, pass_funnel=False,
+            alpha_limited=False, tough_shadow=False,
+            heavy_man=False, heavy_zone=False,
+            team_ay_att_z=0.0, light_box_share=None, heavy_box_share=None,
+            win_prob=win_prob, qb_inconsistent=False, pressure_mismatch=False,
+        )
+
+        # Price at the quoted line
+        model_p = over_prob_normal(line, mu, sigma) if side in ("Over", "Yes") else 1 - over_prob_normal(line, mu, sigma)
+        p_blend = blend(model_p, market_p_fair, w_model=0.65)
+        fair_american = prob_to_american(p_blend)
+        edge = edge_pct(p_blend, market_p_fair)
+        kelly = kelly_fraction(p_blend, price, cap=0.05)
+
+        rows.append({
+            **r.to_dict(),
+            "model_mu": mu, "model_sigma": sigma,
+            "model_prob": model_p, "market_prob_fair": market_p_fair,
+            "blend_prob": p_blend, "blend_fair_odds": fair_american,
+            "edge_pct": edge, "kelly_cap": kelly, "tier": tier(edge),
+            "notes": notes,
+            "plays_est": plays, "pass_rate_est": pass_rate, "rush_rate_est": rush_rate,
+            "win_prob_est": win_prob,
+        })
+
+    out = pd.DataFrame(rows)
+
+    # ensure output dir
+    out_dir = out_dir or "outputs"
+    os.makedirs(out_dir, exist_ok=True)
+    out.to_csv(f"{out_dir}/props_priced.csv", index=False)
+    game_df.to_csv(f"{out_dir}/game_lines.csv", index=False)
+    return {"game_lines": game_df, "props_priced": out}
+
+
+__all__ = ["run_pipeline"]
