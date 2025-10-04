@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-extended.txt
           if [ -f requirements-extended.txt ]; then pip install -r requirements-extended.txt; fi
 
       # 4) Ensure folder layout (and put stadiums where fetcher expects it)
