@@ -1,111 +1,85 @@
-# scripts/rules_engine.py
-from __future__ import annotations
-import math
-from typing import Dict, Tuple
+# engine.py
+import os
+import re
+import pandas as pd
 
-# ⬇️ absolute import so it works even if scripts isn't a formal package
-from scripts.elite_rules import (
-    pressure_qb_adjust, sack_to_attempts, funnel_multiplier,
-    injury_redistribution, coverage_penalty, airy_cap,
-    boxcount_ypp_mod, script_escalators, pace_smoothing, volatility_widen
+from scripts.odds_api import fetch_game_lines, fetch_props_all_events
+from scripts.features_external import build_external
+from scripts.id_map import map_players
+from scripts.pricing import (
+    american_to_prob, devig_two_way, blend, prob_to_american,
+    edge_pct, kelly_fraction, tier
 )
+from scripts.model_core import (
+    base_sigma, over_prob_normal,
+    estimate_team_rates, player_shares,
+    mu_receptions, mu_rec_yards, mu_rush_atts, mu_rush_yards, mu_pass_yards
+)
+from scripts.elite_rules import (
+    funnel_multiplier, volatility_widen, pace_smoothing, sack_to_attempts
+)
+from scripts.engine_helpers import make_team_last4_from_player_form
+from scripts.rules_engine import apply_rules
+from scripts.volume import consensus_spread_total, team_volume_estimates
 
-def _nz(v, d=0.0):
-    try:
-        return float(v) if v is not None and not math.isnan(float(v)) else d
-    except Exception:
-        return d
 
-def _bool(v): return bool(v) if v is not None else False
+def _norm(val) -> str:
+    """Normalize any input to a lowercase ascii-ish token string. Safe for None/NaN/numbers."""
+    if val is None:
+        return ""
+    s = str(val)
+    if s.strip().lower() in {"nan", "none", "null"}:
+        return ""
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def apply_rules(
-    market: str,
-    side: str,
-    mu: float,
-    sigma: float,
-    *,
-    player: Dict,
-    team_ctx: Dict,
-    opp_pressure_z: float = 0.0,
-    opp_pass_epa_z: float = 0.0,
-    run_funnel: bool = False,
-    pass_funnel: bool = False,
-    alpha_limited: bool = False,
-    tough_shadow: bool = False,
-    heavy_man: bool = False,
-    heavy_zone: bool = False,
-    team_ay_att_z: float = 0.0,
-    light_box_share: float | None = None,
-    heavy_box_share: float | None = None,
-    win_prob: float = 0.5,
-    qb_inconsistent: bool = False,
-    pressure_mismatch: bool = False,
-) -> Tuple[float, float, str]:
+
+def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
     """
-    Returns (mu_adj, sigma_adj, notes)
+    1) Fetch lines/props
+    2) Build external features
+    3) Map players
+    4) Volume + elite rules -> μ/σ
+    5) Price lines, write CSVs
     """
-    notes = []
+    # 1) Odds
+    game_df  = fetch_game_lines()
+    props_df = fetch_props_all_events()
 
-    # Funnels
-    if market in ("player_receptions", "player_reception_yds", "player_pass_yds", "player_pass_tds"):
-        mult = funnel_multiplier(True, def_rush_epa_z=(-1.0 if run_funnel else 0.0),
-                                      def_pass_epa_z=( 1.0 if run_funnel else 0.0))
-        if mult != 1.0:
-            mu *= mult; notes.append(f"pass_funnel_mult={mult:.2f}")
-    if market in ("player_rush_attempts", "player_rush_yds"):
-        mult = funnel_multiplier(False, def_rush_epa_z=( 1.0 if run_funnel else 0.0),
-                                       def_pass_epa_z=(-1.0 if run_funnel else 0.0))
-        if mult != 1.0:
-            mu *= mult; notes.append(f"run_funnel_mult={mult:.2f}")
+    # consensus spread/total for volume
+    cons = consensus_spread_total(game_df)  # event_id, home_spread, total
 
-    # Coverage / zone
-    if market in ("player_receptions", "player_reception_yds"):
-        ypt = _nz(player.get("rec_yds_l4", 0)) / max(_nz(player.get("rec_l4", 0), 1.0), 1.0)
-        ts  = 0.17
-        ypt2, ts2 = coverage_penalty(ypt, ts, tough_shadow=tough_shadow, heavy_man=heavy_man, heavy_zone=heavy_zone)
-        if ypt > 0 and abs(ypt2 - ypt) > 1e-6:
-            mu *= (ypt2 / ypt)
-            notes.append("coverage_adj")
+    # 2) External features
+    ext = build_external(season)
+    ids = ext["ids"]
+    team_form = ext["team_form"]
+    pform = ext["player_form"]
 
-    # Air-yards sanity cap
-    if market == "player_reception_yds":
-        ypr_proxy = _nz(player.get("rec_yds_l4", 0)) / max(_nz(player.get("rec_l4", 0), 1.0), 1.0)
-        ypr_capped = airy_cap(ypr_proxy, team_ay_att_z, cap_pct=0.80, ay_threshold_z=-0.8)
-        if ypr_proxy > 0 and ypr_capped < ypr_proxy:
-            mu *= (ypr_capped / ypr_proxy); notes.append("air_yards_cap")
+    # team context (L4 totals)
+    team_l4_map = make_team_last4_from_player_form(pform)
 
-    # Box-count leverage
-    if market == "player_rush_yds":
-        ypc_proxy = _nz(player.get("ry_l4", 0)) / max(_nz(player.get("ra_l4", 0), 1.0), 1.0)
-        ypc2 = boxcount_ypp_mod(ypc_proxy, light_box_share=light_box_share, heavy_box_share=heavy_box_share)
-        if ypc_proxy > 0 and abs(ypc2 - ypc_proxy) > 1e-6:
-            mu *= (ypc2 / ypc_proxy); notes.append("boxcount_ypp_mod")
+    # 3) map players
+    props_df = map_players(props_df, ids)
 
-    # Sack elasticity (volume)
-    if market in ("player_pass_yds", "player_pass_tds", "player_receptions", "player_reception_yds"):
-        atts_mult = sack_to_attempts(1.0, sack_rate_above_avg=0.0)
-        if atts_mult != 1.0:
-            mu *= atts_mult; notes.append("sack_elasticity")
+    def get_team_context(team):
+        return team_l4_map.get(team, {"tgt_team_l4": 30.0, "rush_att_team_l4": 25.0})
 
-    # Pressure-adjusted QB baseline (positional args)
-    if market in ("player_pass_yds", "player_pass_tds"):
-        before = mu
-        mu = pressure_qb_adjust(mu, opp_pressure_z, opp_pass_epa_z)
-        if mu != before:
-            notes.append("pressure_qb_adj")
+    rows = []
+    for _, r in props_df.iterrows():
+        market = r["market"]
+        if market not in {
+            "player_reception_yds", "player_receptions",
+            "player_rush_yds", "player_rush_attempts",
+            "player_pass_yds", "player_pass_tds",
+            "player_anytime_td",
+        }:
+            continue
 
-    # Script escalators
-    if market in ("player_rush_attempts", "player_rush_yds"):
-        rb_atts, qb_scr = script_escalators(mu if market=="player_rush_attempts" else 0.0, 0.0, win_prob=win_prob)
-        if market == "player_rush_attempts" and rb_atts != mu:
-            mu = rb_atts; notes.append("script_escalator")
+        price = r["price"]
+        line  = r["point"]
+        side  = r["outcome"]
 
-    # Pace smoothing (mild)
-    mu *= pace_smoothing(1.0, 0.0, 0.0)
+        # implied prob & de-vi
 
-    # Volatility widening
-    if market in ("player_pass_yds", "player_reception_yds") and (pressure_mismatch or qb_inconsistent):
-        sigma = volatility_widen(sigma, pressure_mismatch=pressure_mismatch, qb_inconsistent=qb_inconsistent)
-        notes.append("volatility_widen")
-
-    return mu, sigma, ";".join(notes)
