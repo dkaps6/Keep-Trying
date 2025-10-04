@@ -3,12 +3,12 @@ import pandas as pd
 
 BASE = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl"
 
-MARKETS_GAME = ["h2h","spreads","totals"]
+MARKETS_GAME = ["h2h", "spreads", "totals"]
 MARKETS_PROPS = [
-    "player_pass_yds","player_pass_tds",
-    "player_rush_yds","player_rush_attempts",
-    "player_rec_yds","player_receptions",
-    "player_rush_rec_yds","player_anytime_td"
+    "player_pass_yds", "player_pass_tds",
+    "player_rush_yds", "player_rush_attempts",
+    "player_rec_yds", "player_receptions",
+    "player_rush_rec_yds", "player_anytime_td"
 ]
 
 def _get(path, **params):
@@ -53,9 +53,9 @@ def fetch_props_all_events(regions="us", sleep=0.25):
                         "event_id": eid, "start": start, "home": home, "away": away,
                         "book": book, "market": mkey,
                         "player_name_raw": o.get("description"),
-                        "outcome": o.get("name"),
+                        "outcome": o.get("name"),        # Over/Under or Yes/No
                         "price": o.get("price"),
-                        "point": o.get("point")
+                        "point": o.get("point")           # alternates come through here
                     })
         time.sleep(sleep)
     return pd.DataFrame(all_rows)
