@@ -5,8 +5,5 @@ nfl-data-py
 python-dateutil
 beautifulsoup4
 lxml
-selenium
-nflfastpy
-sportsdataverse
 pyarrow
 numpy
