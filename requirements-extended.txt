@@ -1,7 +1,7 @@
 pandas
 requests
 scipy
-nfl-data-py>=0.3.3
+nfl-data-py
 python-dateutil
 beautifulsoup4
 lxml
