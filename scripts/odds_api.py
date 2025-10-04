@@ -6,17 +6,19 @@ import pandas as pd
 
 BASE = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl"
 
+# Game markets
 MARKETS_GAME = ["h2h", "spreads", "totals"]
 
-# ✅ Correct v4 prop market keys (use *_yds, not *_yards)
+# --- v4 Player prop market keys (per official list) ---
+# https://the-odds-api.com/sports-odds-data/betting-markets.html
 MARKETS_PROPS = [
     "player_pass_yds",
     "player_pass_tds",
     "player_rush_yds",
     "player_rush_attempts",
-    "player_rec_yds",
     "player_receptions",
-    "player_rush_rec_yds",
+    "player_reception_yds",        # <- receiving yards
+    "player_rush_reception_yds",   # <- rush + reception yards
     "player_anytime_td",
 ]
 
@@ -28,6 +30,7 @@ def _get(path: str, **params):
     url = f"{BASE}{path}"
     r = requests.get(url, params=params, timeout=25)
     if r.status_code >= 400:
+        # redact key in logs
         safe_url = r.request.url.replace(key, "***")
         print("ERROR calling:", safe_url)
         print("Response:", r.text[:800])
@@ -44,7 +47,8 @@ def fetch_game_lines(regions: str = "us") -> pd.DataFrame:
     )
     rows = []
     for ev in js:
-        eid = ev["id"]; home = ev.get("home_team"); away = ev.get("away_team"); start = ev.get("commence_time")
+        eid = ev["id"]
+        home = ev.get("home_team"); away = ev.get("away_team"); start = ev.get("commence_time")
         for bk in ev.get("bookmakers", []):
             book = bk.get("title") or bk.get("key")
             for m in bk.get("markets", []):
@@ -52,18 +56,20 @@ def fetch_game_lines(regions: str = "us") -> pd.DataFrame:
                 for o in m.get("outcomes", []):
                     rows.append({
                         "event_id": eid, "start": start, "home": home, "away": away,
-                        "book": book, "market": mkey,
-                        "name": o.get("name"),
-                        "price": o.get("price"),
-                        "point": o.get("point"),
+                        "book": book, "market": mkey,           # h2h / spreads / totals
+                        "name": o.get("name"),                   # team/selection
+                        "price": o.get("price"),                 # American odds
+                        "point": o.get("point"),                 # spread/total number if present
                     })
     return pd.DataFrame(rows)
 
-def fetch_props_all_events(regions: str = "us", markets: list[str] | None = None, sleep: float = 0.25) -> pd.DataFrame:
+def fetch_props_all_events(regions: str = "us",
+                           markets: list[str] | None = None,
+                           sleep: float = 0.25) -> pd.DataFrame:
     if markets is None:
         markets = MARKETS_PROPS
 
-    # 1) enumerate events
+    # 1) enumerate events cheaply
     events = _get(
         "/odds",
         regions=regions,
@@ -74,9 +80,10 @@ def fetch_props_all_events(regions: str = "us", markets: list[str] | None = None
 
     all_rows = []
     for ev in events:
-        eid = ev["id"]; home = ev.get("home_team"); away = ev.get("away_team"); start = ev.get("commence_time")
+        eid = ev["id"]
+        home = ev.get("home_team"); away = ev.get("away_team"); start = ev.get("commence_time")
 
-        # 2) per-event props
+        # 2) pull props for this event
         js = _get(
             f"/events/{eid}/odds",
             regions=regions,
@@ -87,15 +94,15 @@ def fetch_props_all_events(regions: str = "us", markets: list[str] | None = None
         for bk in js.get("bookmakers", []):
             book = bk.get("title") or bk.get("key")
             for m in bk.get("markets", []):
-                mkey = m.get("key")
+                mkey = m.get("key")              # e.g., player_reception_yds
                 for o in m.get("outcomes", []):
                     all_rows.append({
                         "event_id": eid, "start": start, "home": home, "away": away,
                         "book": book, "market": mkey,
-                        "player_name_raw": o.get("description"),
-                        "outcome": o.get("name"),      # Over/Under or Yes/No
+                        "player_name_raw": o.get("description"),  # player name
+                        "outcome": o.get("name"),                 # Over/Under or Yes/No
                         "price": o.get("price"),
-                        "point": o.get("point"),       # alternates are multiple rows with different points
+                        "point": o.get("point"),                  # alt lines appear as multiple rows
                     })
         time.sleep(sleep)
 
