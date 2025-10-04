@@ -7,6 +7,5 @@ beautifulsoup4
 lxml
 selenium
 nflfastpy
-git+https://github.com/sportsdataverse/py-sportsdataverse.git@main#egg=sportsdataverse
 pyarrow
 numpy
