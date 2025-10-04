@@ -3,3 +3,5 @@ requests
 scipy
 nfl-data-py
 python-dateutil
+nfl-data-py>=0.3.1
+sportsdataverse>=0.6.0
