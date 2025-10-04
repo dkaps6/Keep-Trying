@@ -1,52 +1,33 @@
-import numpy as np
-from scipy.stats import norm
+# scripts/sgp.py
+import itertools
+import pandas as pd
 
-# default pairwise correlations
-DEFAULT_R = {
-    ("QB_pass_yds","WR_rec_yds"): 0.60,
-    ("RB_rush_yds","QB_pass_yds"): -0.35,
-    ("WR1_rec_yds","WR2_rec_yds"): 0.20,
+# placeholder correlations; swap to copula later if you like
+CORR = {
+    ("QB_PASS_YDS","WR_YDS"): 0.6,
+    ("QB_PASS_YDS","RB_RUSH_YDS"): -0.4,
+    ("WR1_YDS","WR2_YDS"): 0.2,
 }
 
-def _rho(a, b, overrides=None):
-    if overrides and (a,b) in overrides: return overrides[(a,b)]
-    if overrides and (b,a) in overrides: return overrides[(b,a)]
-    return DEFAULT_R.get((a,b), DEFAULT_R.get((b,a), 0.0))
+def joint_prob_independent(ps):
+    p = 1.0
+    for x in ps: p *= max(min(float(x),1.0),0.0)
+    return p
 
-def parlay_prob_monte_carlo(legs, n=5000, overrides=None, seed=42):
-    """
-    legs: list of dicts with keys:
-      - 'name': unique leg label
-      - 'p': marginal hit probability (blended)
-      - 'tag': market tag for correlation lookup e.g., 'QB_pass_yds'
-    """
-    rng = np.random.default_rng(seed)
-    k = len(legs)
-    # Build correlation matrix for normals
-    R = np.eye(k)
-    for i in range(k):
-        for j in range(i+1, k):
-            R[i,j] = R[j,i] = _rho(legs[i]["tag"], legs[j]["tag"], overrides)
-
-    # Cholesky (ensure PSD)
-    eps = 1e-6
-    try:
-        L = np.linalg.cholesky(R)
-    except np.linalg.LinAlgError:
-        # fallback: jitter diagonal
-        L = np.linalg.cholesky(R + eps*np.eye(k))
-
-    # thresholds for marginals
-    z = norm.ppf([leg["p"] for leg in legs])
-
-    hits = 0
-    for _ in range(n):
-        z0 = rng.standard_normal(k)
-        zc = L @ z0
-        # leg is hit if zc[i] <= z[i] for Bernoulli via probit
-        ok = True
-        for i in range(k):
-            if not (zc[i] <= z[i]):
-                ok = False; break
-        hits += 1 if ok else 0
-    return hits / n
+def build_sgp(priced_df: pd.DataFrame, max_legs=3, min_edge=0.02):
+    pool = priced_df[priced_df["edge_pct"] > min_edge].copy()
+    pool = pool.sort_values("edge_pct", ascending=False).head(150)
+    sgps = []
+    for L in range(2, max_legs+1):
+        for idxs in itertools.combinations(pool.index, L):
+            block = pool.loc[list(idxs)]
+            jp = joint_prob_independent(block["blend_prob"].tolist())  # TODO: corr-adjust
+            # convert probability to fair american
+            fair = -100/jp if jp>=0.5 else 100*(1-jp)/jp
+            sgps.append({
+                "n_legs": L,
+                "legs": " | ".join(block.get("description", block["market"]).astype(str).tolist()),
+                "joint_prob": jp,
+                "fair_odds": fair
+            })
+    return pd.DataFrame(sgps)
