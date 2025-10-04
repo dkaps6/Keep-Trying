@@ -17,6 +17,8 @@ def main():
     # Import the engine module safely
     try:
         engine = importlib.import_module("engine")
+        # 🔎 show exactly which engine.py was loaded
+        print("Loaded engine module from:", getattr(engine, "__file__", "<unknown>"))
     except Exception as e:
         print("❌ Failed to import engine module:", e)
         traceback.print_exc()
@@ -29,12 +31,17 @@ def main():
         sys.exit(1)
 
     # Run the pipeline
-    result = engine.run_pipeline(
-        target_date=args.date,
-        season=args.season,
-        out_dir=args.write,
-    )
-    print("✅ Pipeline completed. Wrote outputs to:", args.write)
+    try:
+        engine.run_pipeline(
+            target_date=args.date,
+            season=args.season,
+            out_dir=args.write,
+        )
+        print("✅ Pipeline completed. Wrote outputs to:", args.write)
+    except Exception as e:
+        print("❌ Pipeline crashed:", e)
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
