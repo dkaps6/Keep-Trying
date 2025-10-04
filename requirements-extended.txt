@@ -1,12 +1,13 @@
 pandas
 requests
 scipy
-nfl-data-py
+nfl-data-py>=0.3.3
 python-dateutil
 beautifulsoup4
 lxml
 selenium
 nflfastpy
+# Option A: PyPI pre-release that supports py3.11
 sportsdataverse==0.6.0a0
 pyarrow
 numpy
