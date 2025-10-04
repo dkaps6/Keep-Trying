@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 from typing import Dict, Tuple
 
-from .elite_rules import (
+# ⬇️ absolute import so it works even if scripts isn't a formal package
+from scripts.elite_rules import (
     pressure_qb_adjust, sack_to_attempts, funnel_multiplier,
     injury_redistribution, coverage_penalty, airy_cap,
     boxcount_ypp_mod, script_escalators, pace_smoothing, volatility_widen
@@ -86,7 +87,7 @@ def apply_rules(
         if atts_mult != 1.0:
             mu *= atts_mult; notes.append("sack_elasticity")
 
-    # Pressure-adjusted QB baseline  <-- positional args to avoid keyword mismatch
+    # Pressure-adjusted QB baseline (positional args)
     if market in ("player_pass_yds", "player_pass_tds"):
         before = mu
         mu = pressure_qb_adjust(mu, opp_pressure_z, opp_pass_epa_z)
