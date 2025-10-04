@@ -1,64 +1,104 @@
+# scripts/model_core.py
+"""
+Core modeling and pricing functions for the NFL predictive pipeline.
+"""
+
+import pandas as pd
 import numpy as np
-from scipy.stats import norm
-from .elite_rules import (pressure_qb_adjust, sack_to_attempts, funnel_multiplier,
-                          injury_redistribution, coverage_penalty, airy_cap,
-                          boxcount_ypp_mod, script_escalators, pace_smoothing,
-                          volatility_widen)
 
-DEFAULT_SD = {
-    "player_rec_yds": 26.0, "player_receptions": 1.8,
-    "player_rush_yds": 23.0, "player_rush_attempts": 3.0,
-    "player_pass_yds": 48.0, "player_pass_tds": 0.9
-}
+from scripts.engine_helpers import safe_divide
 
-def base_sigma(market): return DEFAULT_SD.get(market, 20.0)
 
-def over_prob_normal(L, mu, sigma):
-    sigma = max(float(sigma), 1e-6)
-    z = (L - mu) / sigma
-    return 1 - norm.cdf(z)
+def price_props_for_events(events_df, odds_df=None, player_form=None, team_form=None):
+    """
+    Core pricing engine for player and team props.
 
-# -------- Volume model (simplified but real) --------
-def _safe_div(a, b, default=0.0):
-    return default if b in (0, None) else (a / b)
+    Parameters
+    ----------
+    events_df : pd.DataFrame
+        Event-level data for upcoming games (QB, WR, RB props, etc.)
+    odds_df : pd.DataFrame, optional
+        Odds from sportsbooks (Moneyline, Totals, Props) from odds_api.py
+    player_form : pd.DataFrame, optional
+        Player-level recent performance metrics (EPA, YAC, route %, etc.)
+    team_form : pd.DataFrame, optional
+        Team-level context metrics (pass_rate_over_exp, pace, neutral_script, etc.)
 
-def estimate_team_rates(team_form_row):
-    # pass rate ~ dropbacks / plays ; rush rate ~ rushes / plays
-    plays = team_form_row.get("off_plays_l4") or team_form_row.get("off_plays") or 60
-    drop = team_form_row.get("off_dropbacks_l4") or team_form_row.get("off_dropbacks") or 35
-    rush = team_form_row.get("off_rushes_l4") or team_form_row.get("off_rushes") or 25
-    pr = _safe_div(drop, plays, 0.55)
-    rr = _safe_div(rush, plays, 0.45)
-    return plays, pr, rr
+    Returns
+    -------
+    priced_df : pd.DataFrame
+        Merged and priced dataset with model probabilities and fair odds
+    """
 
-def player_shares(player_row, team_rows_last4):
-    # target share / rush share / catch rate / YPR / YPC
-    tgt = player_row.get("tgt_l4", 0.0); rec = player_row.get("rec_l4", 0.0)
-    ryd = player_row.get("rec_yds_l4", 0.0)
-    ra  = player_row.get("ra_l4", 0.0);  ryd_rush = player_row.get("ry_l4", 0.0)
-    team_tgts = max(1.0, team_rows_last4.get("tgt_team_l4", 30.0))
-    team_att  = max(1.0, team_rows_last4.get("rush_att_team_l4", 25.0))
-    tgt_share  = _safe_div(tgt, team_tgts, 0.17)
-    rush_share = _safe_div(ra,  team_att,  0.35)
-    catch_rate = _safe_div(rec, max(tgt, 1.0), 0.68)
-    ypr        = _safe_div(ryd, max(rec, 1.0), 11.0)
-    ypc        = _safe_div(ryd_rush, max(ra, 1.0), 4.2)
-    return tgt_share, rush_share, catch_rate, ypr, ypc
+    # --- Step 1: Basic merge of core sources
+    df = events_df.copy()
 
-def mu_receptions(plays, pass_rate, tgt_share, catch_rate):
-    team_targets = plays * pass_rate * 1.0  # 1 target per dropback approx
-    return team_targets * tgt_share * catch_rate
+    if odds_df is not None:
+        df = df.merge(odds_df, on=["game_id", "player_id"], how="left")
 
-def mu_rec_yards(mu_rec, ypr):
-    return mu_rec * max(ypr, 0.1)
+    if player_form is not None:
+        df = df.merge(
+            player_form,
+            on="player_id",
+            how="left",
+            suffixes=("", "_pform")
+        )
 
-def mu_rush_atts(plays, rush_rate, rush_share):
-    team_rushes = plays * rush_rate
-    return team_rushes * rush_share
+    if team_form is not None:
+        df = df.merge(
+            team_form,
+            on="team",
+            how="left",
+            suffixes=("", "_tform")
+        )
 
-def mu_rush_yards(atts, ypc): return atts * max(ypc, 0.1)
+    # --- Step 2: Core model scoring
+    df["expected_yards"] = (
+        0.35 * df.get("targets", 0)
+        + 0.65 * df.get("receptions", 0)
+        + 0.10 * df.get("yac_per_reception", 0)
+        + 0.25 * df.get("air_yards_share", 0)
+    )
 
-def mu_pass_yards(team_dropbacks, qb_ypa, z_opp_pressure=0.0, z_opp_pass_epa=0.0):
-    base = team_dropbacks * max(qb_ypa, 3.0)
-    return pressure_qb_adjust(base, z_opp_pressure, z_opp_pass_epa)
+    df["expected_tds"] = (
+        0.04 * df.get("redzone_tgt_share", 0)
+        + 0.03 * df.get("team_td_rate", 0)
+        + 0.05 * df.get("deep_tgt_share", 0)
+    )
 
+    # --- Step 3: Fair odds and probability modeling
+    df["proj_line"] = df["expected_yards"] + (df["expected_tds"] * 25)
+    df["fair_prob"] = 1 / (1 + np.exp(-0.08 * (df["proj_line"] - df.get("prop_line", 0))))
+    df["fair_odds"] = safe_divide(1, df["fair_prob"])
+
+    # --- Step 4: Edge calculation
+    if "book_odds" in df.columns:
+        df["edge"] = (df["fair_odds"] - df["book_odds"]) / df["book_odds"]
+    else:
+        df["edge"] = np.nan
+
+    # --- Step 5: Cleanup
+    df["timestamp"] = pd.Timestamp.utcnow()
+
+    return df
+
+
+def simulate_event_outcomes(priced_df, n_sims=10000, random_seed=42):
+    """
+    Monte Carlo simulation for pricing and probability validation.
+    """
+
+    np.random.seed(random_seed)
+    sims = []
+
+    for _, row in priced_df.iterrows():
+        mu = row.get("proj_line", 0)
+        sigma = row.get("proj_line_std", 12)
+        samples = np.random.normal(mu, sigma, n_sims)
+        win_prob = np.mean(samples > row.get("prop_line", 0))
+        sims.append(win_prob)
+
+    priced_df["sim_win_prob"] = sims
+    priced_df["sim_fair_odds"] = safe_divide(1, priced_df["sim_win_prob"])
+
+    return priced_df
