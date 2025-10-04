@@ -2,15 +2,16 @@ name: "Full Slate: Lines + Features + Model"
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "15 * * * *"  # hourly at :15 past (UTC)
+  # schedule:
+  #   - cron: "15 * * * *"  # Disabled hourly run to save API credits
 
 jobs:
-  run:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -18,26 +19,38 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- Sanity check your Odds API key BEFORE the main run ---
-      - name: Sanity check Odds API key
+      # --- Sanity check your API key + remaining credits ---
+      - name: Sanity check Odds API key (and remaining credits)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python - <<'PY'
-          import os, requests
-          key = os.environ.get("ODDS_API_KEY")
-          assert key, "ODDS_API_KEY missing (add in Settings → Secrets → Actions)"
-          url = f"https://api.the-odds-api.com/v4/sports?apiKey={key}"
-          r = requests.get(url, timeout=20)
+          import os, requests, sys
+          key = os.environ["ODDS_API_KEY"]
+          r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={key}", timeout=20)
+          rem = r.headers.get("x-requests-remaining")
+          used = r.headers.get("x-requests-used")
           print("Status:", r.status_code)
-          print("Body:", r.text[:300])
-          r.raise_for_status()
+          print("Remaining credits:", rem)
+          print("Used credits:", used)
+          if r.status_code != 200:
+              print("Error:", r.text)
+              sys.exit(1)
+          try:
+              if rem is not None and int(rem) < 5:
+                  print("⚠️ Low credits, skipping run.")
+                  sys.exit(0)
+          except ValueError:
+              pass
           PY
+
+      - name: Ensure outputs dir exists
+        run: mkdir -p outputs
 
       - name: Run pipeline
         env:
@@ -45,8 +58,9 @@ jobs:
         run: |
           python run_model.py --date today --season 2025 --write outputs
 
-      - name: Upload artifacts (CSV outputs)
+      - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: nfl-outputs
-          path: outputs/**
+          path: outputs/
