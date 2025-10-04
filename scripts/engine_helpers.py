@@ -1,89 +1,81 @@
 # scripts/engine_helpers.py
-from __future__ import annotations
-import math
-from typing import Union, Optional
 
+from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-Number = Union[int, float, np.number]
-ArrayLike = Union[pd.Series, pd.DataFrame, np.ndarray, list, tuple, Number]
+__all__ = [
+    "safe_divide",
+    "make_team_last4_from_player_form",
+]
 
-
-def _as_series(x: ArrayLike) -> pd.Series:
-    """Coerce scalars/arrays to a pandas Series for aligned vectorized math."""
-    if isinstance(x, pd.Series):
-        return x
-    if isinstance(x, pd.DataFrame):
-        # pick first column for safety; caller should pass a Series ideally
-        return x.iloc[:, 0]
-    if isinstance(x, np.ndarray):
-        if x.ndim == 0:
-            return pd.Series([x.item()])
-        return pd.Series(x)
-    if isinstance(x, (list, tuple)):
-        return pd.Series(x)
-    # scalar
-    return pd.Series([x])
-
-
-def safe_divide(
-    num: ArrayLike,
-    den: ArrayLike,
-    default: float = 0.0,
-    *,
-    clip_inf: bool = True,
-    precision: Optional[int] = None,
-) -> ArrayLike:
+def safe_divide(a, b, default: float = 0.0):
     """
-    Division that never crashes on zero/NaN and preserves the input shape/type.
-
-    - If denominator is 0 or NaN → returns `default` at that position.
-    - Works for scalars or vector types (Series/ndarray/list).
-    - Optionally rounds to `precision` decimal places.
-    - If both inputs are scalars, returns a scalar float.
-
-    Examples
-    --------
-    safe_divide(10, 2) -> 5.0
-    safe_divide([1, 2, 3], [0, 2, 0], default=0) -> [0.0, 1.0, 0.0]
+    Elementwise safe division that returns `default` when denominator is 0/NaN.
+    Works with scalars, numpy arrays, and pandas Series.
     """
-    # Scalar–scalar fast path
-    if isinstance(num, (int, float, np.number)) and isinstance(den, (int, float, np.number)):
-        if den is None or (isinstance(den, float) and math.isnan(den)) or den == 0:
-            out = float(default)
-        else:
-            out = float(num) / float(den)
-        if precision is not None:
-            out = round(out, precision)
-        return out
-
-    s_num = _as_series(num)
-    s_den = _as_series(den)
-
-    # Align lengths if different (pad the shorter with NaN)
-    if len(s_num) != len(s_den):
-        max_len = max(len(s_num), len(s_den))
-        s_num = s_num.reindex(range(max_len))
-        s_den = s_den.reindex(range(max_len))
-
-    mask = (s_den != 0) & (~s_den.isna())
-    out = pd.Series(np.full(len(s_den), default, dtype="float64"))
+    a_arr = np.asarray(a, dtype=float)
+    b_arr = np.asarray(b, dtype=float)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        out.loc[mask] = s_num.loc[mask].astype("float64") / s_den.loc[mask].astype("float64")
+        out = np.true_divide(a_arr, b_arr)
+        # where b == 0 or NaN -> default
+        mask = ~np.isfinite(out)  # inf or nan
+        out[mask] = default
 
-    if clip_inf:
-        out.replace([np.inf, -np.inf], default, inplace=True)
+    # If the inputs were scalars, return a scalar
+    if np.isscalar(a) and np.isscalar(b):
+        return float(out)
+    # If the inputs were pandas objects, preserve type
+    if isinstance(a, (pd.Series, pd.Index)) or isinstance(b, (pd.Series, pd.Index)):
+        return pd.Series(out, index=getattr(a, "index", None))
+    return out
 
-    if precision is not None:
-        out = out.round(precision)
 
-    # Return in the same "shape kind" as the numerator
-    if isinstance(num, pd.Series):
-        out.index = num.index
-        return out
-    if isinstance(num, (list, tuple, np.ndarray)):
-        return out.to_numpy()
-    # if the original was scalar-like but we took vector path, return scalar if single value
-    return out.iloc[0] if len(out) == 1 else out
+def make_team_last4_from_player_form(pform: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a simple 'last 4 weeks' team aggregate from player_form.
+    - Robust to empty/missing data (returns empty DataFrame in that case).
+    - Only uses numeric columns it can find; ignores id / text columns.
+
+    Returns:
+        DataFrame with one row per team and the mean of the last 4 weeks
+        of any numeric columns present. Columns are suffixed with `_last4`.
+    """
+    # Guard: nothing to do
+    if pform is None or len(pform) == 0:
+        # empty result – engine will continue gracefully
+        return pd.DataFrame()
+
+    # Need at least these columns to group on
+    required = {"team", "week"}
+    if not required.issubset(set(pform.columns)):
+        return pd.DataFrame()
+
+    # Keep only numeric columns to aggregate
+    numeric_cols = [
+        c for c in pform.columns
+        if c not in ["team", "week", "player", "player_name", "gsis_id", "recent_team", "position"]
+        and pd.api.types.is_numeric_dtype(pform[c])
+    ]
+    if not numeric_cols:
+        return pd.DataFrame()
+
+    # Sort so tail(4) is the latest four weeks
+    pform = pform.sort_values(["team", "week"])
+
+    # For each team, take the mean of the last 4 weeks of numeric columns
+    def last4_mean(g: pd.DataFrame) -> pd.Series:
+        tail4 = g.tail(4)
+        return tail4[numeric_cols].mean(numeric_only=True)
+
+    out = (
+        pform.groupby("team", as_index=False)
+        .apply(last4_mean)
+        .reset_index(drop=True)
+    )
+
+    # Suffix to make it obvious these are last-4 aggregates
+    out = out.add_suffix("_last4")
+    out = out.rename(columns={"team_last4": "team"})  # keep a 'team' key
+    return out
