@@ -1,8 +1,10 @@
-name: Full Slate: Lines + Features + Model
+name: "Full Slate: Lines + Features + Model"
+
 on:
   workflow_dispatch:
   schedule:
     - cron: "15 * * * *"  # hourly at :15 past (UTC)
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -22,3 +24,4 @@ jobs:
         with:
           name: nfl-outputs
           path: outputs/**
+
