@@ -1,6 +1,7 @@
 # engine.py
 import os
 import pandas as pd
+import re
 
 from scripts.odds_api import fetch_game_lines, fetch_props_all_events
 from scripts.features_external import build_external
@@ -18,6 +19,17 @@ from scripts.elite_rules import (
     funnel_multiplier, volatility_widen, pace_smoothing, sack_to_attempts
 )
 from scripts.engine_helpers import make_team_last4_from_player_form
+from scripts.rules_engine import apply_rules
+from scripts.volume import consensus_spread_total, team_volume_estimates
+
+
+def _norm(s: str | None) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
@@ -26,26 +38,16 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
       1) Fetch game lines and player props from The Odds API
       2) Build external features (ids, team/player rolling form, injuries, depth)
       3) Map sportsbook player names -> gsis_id
-      4) Compute μ/σ with volume scaffolding + rules hooks
+      4) Compute μ/σ with volume scaffolding + elite rules
       5) Price at book lines (model prob -> 65/35 blend -> fair odds, edge, kelly, tier)
       6) Write tidy CSVs into outputs/
-
-    Parameters
-    ----------
-    target_date : str
-        e.g. "2025-10-04" or "today" (already resolved by caller)
-    season : int
-        NFL season (e.g. 2025)
-    out_dir : str
-        Output folder (created automatically if missing)
     """
-    print(season - 1, "done.")
-    print(season, "done.")
-    print("Downcasting floats.")
-
     # --- 1) Odds
-    game_df = fetch_game_lines()
+    game_df  = fetch_game_lines()
     props_df = fetch_props_all_events()
+
+    # Consensus spread/total (for volume + win prob)
+    cons = consensus_spread_total(game_df)  # cols: event_id, home_spread, total
 
     # --- 2) External features
     ext = build_external(season)
@@ -61,10 +63,8 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
 
     # Helper: team L4 row by team string (fallback defaults)
     def get_team_context(team):
-        # returns dict like {"tgt_team_l4": 30.0, "rush_att_team_l4": 25.0}
         return team_l4_map.get(team, {"tgt_team_l4": 30.0, "rush_att_team_l4": 25.0})
 
-    # --- 4) Price each prop
     rows = []
     for _, r in props_df.iterrows():
         market = r["market"]
@@ -74,33 +74,44 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
             "player_rush_yds",
             "player_rush_attempts",
             "player_pass_yds",
-            "player_pass_tds",           # placeholder handled like yards for now
-            "player_anytime_td"          # placeholder (binary) for later expansion
+            "player_pass_tds",           # placeholder (rough)
+            "player_anytime_td",         # placeholder (rough)
         }:
             continue
 
         price = r["price"]
-        line = r["point"]
-        side = r["outcome"]
+        line  = r["point"]
+        side  = r["outcome"]
 
-        # Convert American odds -> implied prob (raw)
+        # Convert American odds -> implied raw prob
         p_raw = american_to_prob(price)
-
-        # De-vig two-way where possible
-        p_over_raw = p_raw if side in ("Over", "Yes") else None
+        p_over_raw  = p_raw if side in ("Over", "Yes") else None
         p_under_raw = p_raw if side in ("Under", "No") else None
         p_over_fair, p_under_fair = devig_two_way(p_over_raw, p_under_raw)
         market_p_fair = p_over_fair if side in ("Over", "Yes") else p_under_fair
 
-        # --- Volume baseline
-        team = r.get("recent_team")
-        team_ctx = get_team_context(team)
+        # ---------- Volume model from consensus lines ----------
+        # Pull consensus numbers for this event
+        ev = cons[cons["event_id"].eq(r["event_id"])].head(1)
+        ev_row = ev.iloc[0] if not ev.empty else {}
 
-        # (Optional) use team_form to refine; for now, simple defaults
-        # plays, pass_rate, rush_rate = estimate_team_rates(team_form_row)  # when joined
-        plays, pass_rate, rush_rate = 60.0, 0.55, 0.45
+        # Try to detect if player's team is home (best-effort, substring match)
+        team_code = r.get("recent_team") or ""
+        home_name = r.get("home") or ""
+        away_name = r.get("away") or ""
+        is_home = False
+        nteam = _norm(team_code)
+        if nteam and (nteam in _norm(home_name) or nteam in _norm(away_name)):
+            is_home = (nteam in _norm(home_name))
+        # If we couldn't match, team side won't affect win_prob computation much; model will use baseline split.
 
-        # Player shares & efficiencies from player_form (latest available)
+        # (optional) you could also look up per-team recent pass/rush rates from team_form here
+        tf_row = None
+
+        plays, pass_rate, rush_rate, win_prob = team_volume_estimates(ev_row, is_home, tf_row)
+
+        # ---------- Player shares/efficiency from last-4 ----------
+        team_ctx = get_team_context(r.get("recent_team"))
         pid = r.get("gsis_id")
         pr = pform[pform["gsis_id"] == pid]
         if not pr.empty:
@@ -110,14 +121,14 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
 
         tgt_share, rush_share, catch_rate, ypr, ypc = player_shares(pr, team_ctx)
 
-        # Simple funnel multipliers (you can wire real z-scores later)
-        pass_mult = funnel_multiplier(True, def_rush_epa_z=0.0, def_pass_epa_z=0.0)
+        # small funnel multipliers (can wire real z-scores later)
+        pass_mult = funnel_multiplier(True,  def_rush_epa_z=0.0, def_pass_epa_z=0.0)
         rush_mult = funnel_multiplier(False, def_rush_epa_z=0.0, def_pass_epa_z=0.0)
 
-        # Pace smoothing hook (z-scores 0.0 for now)
+        # pace smoothing (z’s not computed yet; neutral)
         plays = pace_smoothing(plays, 0.0, 0.0)
 
-        # ---- market-specific μ/σ
+        # ---------- market-specific μ / σ ----------
         sigma = base_sigma(market)
 
         if market == "player_receptions":
@@ -130,7 +141,7 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
 
         elif market == "player_rush_attempts":
             atts = mu_rush_atts(plays, rush_rate, rush_share) * rush_mult
-            atts = sack_to_attempts(atts, sack_rate_above_avg=0.0)  # hook
+            atts = sack_to_attempts(atts, sack_rate_above_avg=0.0)  # hook for live sack rate
             mu = atts
 
         elif market == "player_rush_yds":
@@ -138,37 +149,58 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
             mu = mu_rush_yards(atts, ypc)
 
         elif market == "player_pass_yds":
-            # approximate team dropbacks from plays * pass_rate; qb ypa from player_form
+            # approximate team dropbacks from plays*pass_rate; qb ypa from player_form
             qb_ypa = (pr.get("pass_yds_l4", 0) / max(pr.get("pass_att_l4", 1), 1)) if pr else 6.8
             dropbacks = plays * pass_rate
             mu = mu_pass_yards(dropbacks, qb_ypa, z_opp_pressure=0.0, z_opp_pass_epa=0.0)
             sigma = volatility_widen(sigma, pressure_mismatch=False, qb_inconsistent=False)
 
         elif market == "player_pass_tds":
-            # Placeholder: convert pass yards mean to approx TDs (very rough).
-            # You will replace this with Bernoulli/Poisson logic later.
+            # Very rough mapping until we wire a Poisson/NegBin with team totals.
             qb_ypa = (pr.get("pass_yds_l4", 0) / max(pr.get("pass_att_l4", 1), 1)) if pr else 6.8
             dropbacks = plays * pass_rate
             pass_yds_mu = mu_pass_yards(dropbacks, qb_ypa, z_opp_pressure=0.0, z_opp_pass_epa=0.0)
-            mu = max(0.5, pass_yds_mu / 150.0)  # rough anchor
+            mu = max(0.5, pass_yds_mu / 150.0)
             sigma = max(0.6, sigma * 0.04)
 
         elif market == "player_anytime_td":
-            # Placeholder: will be Bernoulli with team total soon.
-            # For now set a mild neutral mean to keep pricing from blowing up.
+            # Placeholder for Bernoulli using implied team total later.
             mu = 0.0
             sigma = 1.0
 
         else:
             mu = 0.0
 
-        # ---- convert μ/σ to model probability at quoted line
+        # ---------- Elite rules: adjust μ / σ & capture notes ----------
+        mu, sigma, notes = apply_rules(
+            market=market,
+            side=side,
+            mu=mu,
+            sigma=sigma,
+            player=pr,
+            team_ctx=team_ctx,
+            opp_pressure_z=0.0,     # fill with real z-scores later
+            opp_pass_epa_z=0.0,
+            run_funnel=False,
+            pass_funnel=False,
+            alpha_limited=False,     # can be set from ext["inj"]
+            tough_shadow=False,
+            heavy_man=False,
+            heavy_zone=False,
+            team_ay_att_z=0.0,
+            light_box_share=None,
+            heavy_box_share=None,
+            win_prob=win_prob,       # <-- from volume model
+            qb_inconsistent=False,
+            pressure_mismatch=False,
+        )
+
+        # ---------- price at the quoted line ----------
         if side in ("Over", "Yes"):
             model_p = over_prob_normal(line, mu, sigma)
         else:
             model_p = 1 - over_prob_normal(line, mu, sigma)
 
-        # Blend with market (65/35) and compute outputs
         p_blend = blend(model_p, market_p_fair, w_model=0.65)
         fair_american = prob_to_american(p_blend)
         edge = edge_pct(p_blend, market_p_fair)
@@ -179,7 +211,10 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
             "model_mu": mu, "model_sigma": sigma,
             "model_prob": model_p, "market_prob_fair": market_p_fair,
             "blend_prob": p_blend, "blend_fair_odds": fair_american,
-            "edge_pct": edge, "kelly_cap": kelly, "tier": tier(edge)
+            "edge_pct": edge, "kelly_cap": kelly, "tier": tier(edge),
+            "notes": notes,
+            "plays_est": plays, "pass_rate_est": pass_rate, "rush_rate_est": rush_rate,
+            "win_prob_est": win_prob,
         })
 
     out = pd.DataFrame(rows)
@@ -188,9 +223,8 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
     out_dir = out_dir or "outputs"
     os.makedirs(out_dir, exist_ok=True)
 
-    # 5) Write outputs
+    # Write outputs
     out.to_csv(f"{out_dir}/props_priced.csv", index=False)
     game_df.to_csv(f"{out_dir}/game_lines.csv", index=False)
 
     return {"game_lines": game_df, "props_priced": out}
-
