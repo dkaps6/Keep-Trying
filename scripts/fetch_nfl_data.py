@@ -1,146 +1,242 @@
 # scripts/fetch_nfl_data.py
+# ---------------------------------------------------------------------
+# Builds:
+#   - team_form.csv    (pressure, pass EPA allowed, PROE proxy)
+#   - player_form.csv  (rolling last-4 form via provider chain)
+#   - id_map.csv       (player_name -> gsis_id / team / position)
+#
+# Weekly provider chain for player_form (in order):
+#   1) nflverse (nfl_data_py)
+#   2) ESPN via sportsdataverse (if installed)
+#   3) Manual PFR CSV in inputs/pfr_player_weekly_{season}.csv
+#
+# All builders are resilient: on failure they return a schema-correct
+# (possibly empty) DataFrame so the pipeline never crashes.
+# ---------------------------------------------------------------------
+
 from __future__ import annotations
-import pandas as pd
+
+import os
+from typing import List, Optional
+
 import numpy as np
-from typing import Tuple, List
+import pandas as pd
+
+# Primary public source
 import nfl_data_py as nfl
 
+# ----- Provider chain (weekly) ------------------------------------------------
+# These modules live in scripts/providers/*
+from scripts.providers.base import empty_weekly_df, coerce_weekly_schema
+from scripts.providers.nflverse_provider import NFLVerseProvider
+from scripts.providers.espn_provider import ESPNProvider
+from scripts.providers.pfr_provider import PFRProvider
+
+
+# ===== Utils ==================================================================
+
 def _parse_weeks(weeks: str) -> List[int]:
-    if weeks.lower() == "all":
-        return list(range(1, 19))
-    if "-" in weeks:
-        a, b = weeks.split("-", 1)
-        return list(range(int(a), int(b) + 1))
+    """
+    Turn "1-18" or "all" or "7" into a list of ints.
+    """
+    if isinstance(weeks, str):
+        ws = weeks.strip().lower()
+        if ws == "all":
+            return list(range(1, 19))
+        if "-" in ws:
+            a, b = ws.split("-", 1)
+            return list(range(int(a), int(b) + 1))
+        return [int(ws)]
+    if isinstance(weeks, (list, tuple)):
+        return list(map(int, weeks))
     return [int(weeks)]
 
-# ---------- TEAM FORM ----------
+
+def _zscore(s: pd.Series) -> pd.Series:
+    m = s.mean()
+    sd = s.std(ddof=0)
+    if sd == 0 or np.isnan(sd):
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    return (s - m) / sd
+
+
+# ===== Team Form ==============================================================
+
 def build_team_form(season: int, weeks: str = "1-18") -> pd.DataFrame:
+    """
+    Build team-level matchup features:
+      - Defensive pressure rate + Z
+      - Defensive pass EPA allowed + Z
+      - Neutral pass rate proxy (PROE-ish) vs league
+
+    Uses nfl_data_py play-by-play. If a specific column is missing on a
+    given season mirror, we fall back gracefully.
+    """
     wks = _parse_weeks(weeks)
+
+    # Pull PBP once
     print(f"Downloading pbp for season={season}, weeks={wks} ...")
-    pbp = nfl.import_pbp_data([season], downcast=True)
-    pbp = pbp[pbp["week"].isin(wks)]
+    try:
+        pbp = nfl.import_pbp_data([season])
+    except Exception as e:
+        print(f"⚠️  Failed to download pbp for {season}: {e}")
+        return pd.DataFrame(columns=[
+            "team", "pressure_rate", "pressure_z",
+            "pass_epa_allowed", "pass_epa_z",
+            "proe_proxy"
+        ])
 
-    # Offense/Defense team labels
-    pbp = pbp.assign(
-        offense = pbp["posteam"].fillna(""),
-        defense = pbp["defteam"].fillna(""),
-        pass_play = pbp["pass"].fillna(0).astype(int),
-        rush_play = pbp["rush"].fillna(0).astype(int),
-        db = (pbp["pass"] == 1).astype(int)
-    )
+    if pbp is None or pbp.empty:
+        print("⚠️  pbp empty; returning empty team_form.")
+        return pd.DataFrame(columns=[
+            "team", "pressure_rate", "pressure_z",
+            "pass_epa_allowed", "pass_epa_z",
+            "proe_proxy"
+        ])
 
-    # Early-down neutral (proxy for PROE): Q1-3, score diff in [-7,7], not garbage time
-    neutral = pbp[
-        (pbp["qtr"].between(1,3)) &
-        (pbp["score_differential"].fillna(0).between(-7,7)) &
-        (pbp["down"].isin([1,2]))
-    ].copy()
+    # Filter to requested weeks if column exists
+    if "week" in pbp.columns:
+        pbp = pbp[pbp["week"].isin(wks)].copy()
 
-    # DEF pressure proxy: sacks / dropbacks (dropbacks approx = pass attempts + sacks)
-    def_agg = pbp.groupby("defense").agg(
-        def_pass_plays=("pass_play","sum"),
-        def_dropbacks=("qb_dropback","sum"),
-        def_sacks=("sack","sum"),
-        def_pass_epa=("epa","mean")  # EPA allowed per play (mixed); tighten to pass snaps only below
-    ).reset_index().rename(columns={"defense":"team"})
+    # ---- Defensive pressure rate
+    # dropbacks ≈ pass_attempt + sacks + scrambles
+    # pressure ≈ sacks + qb_hit (if qb_hit exists), else just sacks
+    pa = pd.to_numeric(pbp.get("pass_attempt"), errors="coerce").fillna(0)
+    sacks = pd.to_numeric(pbp.get("sack"), errors="coerce").fillna(0)
+    scrambles = pd.to_numeric(pbp.get("qb_scramble"), errors="coerce").fillna(0)
+    qb_hit = pd.to_numeric(pbp.get("qb_hit"), errors="coerce").fillna(0)
 
-    # EPA against PASS only
-    def_pass = pbp[pbp["pass_play"]==1].groupby("defense").agg(
-        def_pass_epa=("epa","mean")
-    ).reset_index().rename(columns={"defense":"team"})
-    def_agg = def_agg.drop(columns=["def_pass_epa"], errors="ignore").merge(def_pass, on="team", how="left")
+    dropbacks = pa + sacks + scrambles
+    pressures = sacks + (qb_hit if "qb_hit" in pbp.columns else 0)
 
-    def_agg["def_dropbacks"] = def_agg["def_dropbacks"].replace(0, np.nan)
-    def_agg["pressure_rate"] = def_agg["def_sacks"] / def_agg["def_dropbacks"]
+    defteam = pbp.get("defteam") if "defteam" in pbp.columns else pbp.get("defense_team")
+    if defteam is None:
+        # Absolute fallback: try offense team and just keep shape
+        defteam = pbp.get("defteam_abbr", pd.Series(["UNK"] * len(pbp)))
 
-    # Neutral pass rate by offense (proxy for PROE)
-    off_neutral = neutral.groupby("offense").agg(
-        neutral_plays=("play_id","count"),
-        neutral_pass=("pass_play","sum")
-    ).reset_index().rename(columns={"offense":"team"})
-    off_neutral["neutral_pass_rate"] = off_neutral["neutral_pass"] / off_neutral["neutral_plays"].replace(0,np.nan)
-
-    # League means
-    pr_mu = def_agg["pressure_rate"].mean(skipna=True)
-    pr_sd = def_agg["pressure_rate"].std(ddof=0, skipna=True)
-    epa_mu = def_agg["def_pass_epa"].mean(skipna=True)
-    epa_sd = def_agg["def_pass_epa"].std(ddof=0, skipna=True)
-    npr_mu = off_neutral["neutral_pass_rate"].mean(skipna=True)
-
-    # Z-scores & PROE proxy
-    def_agg["pressure_z"] = (def_agg["pressure_rate"] - pr_mu) / (pr_sd if pr_sd else 1.0)
-    def_agg["pass_epa_z"]  = (def_agg["def_pass_epa"] - epa_mu) / (epa_sd if epa_sd else 1.0)
-
-    tf = def_agg.merge(off_neutral[["team","neutral_pass_rate"]], on="team", how="left")
-    tf["proe"] = tf["neutral_pass_rate"] - npr_mu
-
-    # Placeholders (None) for coverage/box counts (safe in rules)
-    tf["light_box_share"] = np.nan
-    tf["heavy_box_share"] = np.nan
-    tf["man_rate_z"] = np.nan
-    tf["zone_rate_z"] = np.nan
-
-    # Clean
-    tf = tf[[
-        "team","pressure_rate","pressure_z","def_pass_epa","pass_epa_z",
-        "neutral_pass_rate","proe","light_box_share","heavy_box_share","man_rate_z","zone_rate_z"
-    ]].sort_values("team")
-    return tf
-
-# ---------- PLAYER FORM ----------
-def build_player_form(season: int, weeks: str = "1-18") -> pd.DataFrame:
-    wks = _parse_weeks(weeks)
-    weekly = nfl.import_weekly_data([season])
-    weekly = weekly[weekly["week"].isin(wks)].copy()
-
-    # Keep core fields (names vary by version; be defensive)
-    cols = weekly.columns
-    def get(c): return c if c in cols else None
-
-    # Rolling last-4 by player
-    weekly = weekly.sort_values(["player_id","week"])
-    grp = weekly.groupby("player_id", as_index=False)
-
-    def last4_sum(s): return s.rolling(4, min_periods=1).sum()
-
-    weekly["rec_l4"]       = grp[get("rec")]        ["rec"].transform(last4_sum) if get("rec") else 0
-    weekly["rec_yds_l4"]   = grp[get("rec_yds")]    ["rec_yds"].transform(last4_sum) if get("rec_yds") else 0
-    weekly["ra_l4"]        = grp[get("rush_att")]   ["rush_att"].transform(last4_sum) if get("rush_att") else 0
-    weekly["ry_l4"]        = grp[get("rush_yds")]   ["rush_yds"].transform(last4_sum) if get("rush_yds") else 0
-    weekly["pass_att_l4"]  = grp[get("attempts")]   ["attempts"].transform(last4_sum) if get("attempts") else 0
-    weekly["pass_yds_l4"]  = grp[get("passing_yards")]["passing_yards"].transform(last4_sum) if get("passing_yards") else 0
-
-    # Red zone target share (approx): use rzs targets if present, else estimate from inside-20 targets
-    if "targets" in cols:
-        weekly["tgt_l4"] = grp["targets"].transform(last4_sum)
-    else:
-        weekly["tgt_l4"] = 0
-
-    # crude RZ share: if there is a 'redzone_targets' column use it; else fallback to 15% baseline
-    if "redzone_targets" in cols:
-        weekly["rz_tgts_l4"] = grp["redzone_targets"].transform(last4_sum)
-        weekly["rz_tgt_share_l4"] = weekly["rz_tgts_l4"] / weekly["tgt_l4"].replace(0,np.nan)
-    else:
-        weekly["rz_tgt_share_l4"] = 0.15
-
-    out = weekly.rename(columns={
-        "player_id":"gsis_id",
-        "recent_team":"recent_team",
-        "position":"position",
-        "player_name":"player_name",
+    df_press = pd.DataFrame({
+        "defteam": defteam,
+        "pressures": pressures,
+        "dropbacks": dropbacks
     })
-    keep = ["gsis_id","week","player_name","recent_team","position",
-            "rec_l4","rec_yds_l4","ra_l4","ry_l4","pass_att_l4","pass_yds_l4","rz_tgt_share_l4"]
-    out = out[[c for c in keep if c in out.columns]].dropna(subset=["gsis_id"])
+    grp = df_press.groupby("defteam", as_index=False).sum(numeric_only=True)
+    grp["pressure_rate"] = (grp["pressures"] / grp["dropbacks"].replace(0, np.nan)).fillna(0.0)
+
+    # ---- Pass EPA allowed (defense)
+    epa = pd.to_numeric(pbp.get("epa"), errors="coerce")
+    is_pass = pd.to_numeric(pbp.get("pass"), errors="coerce").fillna(0).astype(int)
+    if "defteam" not in pbp.columns:
+        pbp["defteam"] = defteam
+
+    pass_plays = pbp[(is_pass == 1) & epa.notna()]
+    df_epa = pass_plays.groupby("defteam", as_index=False)["epa"].mean()
+    df_epa = df_epa.rename(columns={"epa": "pass_epa_allowed"})
+
+    # ---- Neutral pass rate proxy (PROE-ish)
+    # Approximation: downs 1-2, win_prob between 0.2-0.8, yardline 20-80
+    neutral = pbp.copy()
+    if "down" in neutral.columns:
+        neutral = neutral[neutral["down"].isin([1, 2])]
+    if "wp" in neutral.columns:
+        neutral = neutral[(neutral["wp"] >= 0.2) & (neutral["wp"] <= 0.8)]
+    if "yardline_100" in neutral.columns:
+        neutral = neutral[(neutral["yardline_100"] >= 20) & (neutral["yardline_100"] <= 80)]
+
+    # Offense team column name differs by season mirror
+    off = None
+    for cand in ["posteam", "pos_team", "offense_team"]:
+        if cand in neutral.columns:
+            off = cand
+            break
+    if off is None:
+        off = "posteam"
+        neutral[off] = "UNK"
+
+    neutral["is_pass"] = pd.to_numeric(neutral.get("pass"), errors="coerce").fillna(0).astype(int)
+    team_pass = neutral.groupby(off, as_index=False)["is_pass"].mean()
+    team_pass = team_pass.rename(columns={off: "team", "is_pass": "neutral_pass_rate"})
+    league_neutral = float(team_pass["neutral_pass_rate"].mean()) if not team_pass.empty else 0.5
+    team_pass["proe_proxy"] = team_pass["neutral_pass_rate"] - league_neutral
+    team_pass = team_pass[["team", "proe_proxy"]]
+
+    # ---- Merge all
+    out = grp.merge(df_epa, how="left", left_on="defteam", right_on="defteam")
+    out = out.rename(columns={"defteam": "team"})
+    out = out.merge(team_pass, how="left", on="team")
+
+    # Fill and z-scores
+    out["pass_epa_allowed"] = out["pass_epa_allowed"].fillna(out["pass_epa_allowed"].mean())
+    out["proe_proxy"] = out["proe_proxy"].fillna(0.0)
+
+    out["pressure_z"] = _zscore(out["pressure_rate"])
+    out["pass_epa_z"] = _zscore(out["pass_epa_allowed"])
+
+    cols = ["team", "pressure_rate", "pressure_z",
+            "pass_epa_allowed", "pass_epa_z", "proe_proxy"]
+    out = out[cols].sort_values("team").reset_index(drop=True)
     return out
 
-# ---------- ID MAP ----------
+
+# ===== Player Form (weekly) ===================================================
+
+def build_player_form(season: int, weeks: str = "1-18") -> pd.DataFrame:
+    """
+    Try weekly providers in order:
+      1) nflverse (nfl_data_py)
+      2) ESPN (sportsdataverse)
+      3) PFR manual CSV (inputs/pfr_player_weekly_{season}.csv)
+
+    Returns a schema-correct DataFrame (possibly empty) filtered to requested weeks.
+    """
+    providers = [NFLVerseProvider(), ESPNProvider(), PFRProvider()]
+    for prov in providers:
+        print(f"▶ Trying weekly provider: {prov.name}")
+        df = prov.fetch_weekly(season)
+        if not df.empty:
+            print(f"  ✓ {prov.name}: {len(df)} rows")
+            wks = _parse_weeks(weeks)
+            df["week"] = pd.to_numeric(df["week"], errors="coerce")
+            df = df[df["week"].isin(wks)].copy()
+            return coerce_weekly_schema(df)
+        else:
+            print(f"  … {prov.name} returned empty; trying next.")
+    print("⚠️  All weekly providers returned empty.")
+    return empty_weekly_df()
+
+
+# ===== ID Map =================================================================
+
 def build_id_map(season: int) -> pd.DataFrame:
-    rosters = nfl.import_rosters([season])
-    out = rosters.rename(columns={
-        "gsis_id":"gsis_id",
-        "player_name":"player_name",
-        "team":"recent_team",
-        "position":"position"
-    })
-    return out[["player_name","gsis_id","recent_team","position"]].dropna(subset=["gsis_id"])
+    """
+    Basic player id map from rosters:
+      player_name, gsis_id, recent_team, position
+    """
+    try:
+        ros = nfl.import_rosters([season])
+    except Exception as e:
+        print(f"⚠️  import_rosters failed for {season}: {e}")
+        return pd.DataFrame(columns=["player_name", "gsis_id", "recent_team", "position"])
+
+    if ros is None or ros.empty:
+        return pd.DataFrame(columns=["player_name", "gsis_id", "recent_team", "position"])
+
+    # Normalize column names across seasons
+    rename = {
+        "player_name": "player_name",
+        "team": "recent_team",
+        "recent_team": "recent_team",
+        "position": "position",
+        "gsis_id": "gsis_id",
+        "gsisid": "gsis_id",
+        "player_id": "gsis_id",
+    }
+    cols = {c: rename.get(c, c) for c in ros.columns}
+    ros = ros.rename(columns=cols)
+
+    keep = ["player_name", "gsis_id", "recent_team", "position"]
+    for c in keep:
+        if c not in ros.columns:
+            ros[c] = None
+
+    out = ros[keep].drop_duplicates().dropna(subset=["player_name"])
+    return out.reset_index(drop=True)
