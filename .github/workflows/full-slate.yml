@@ -8,34 +8,45 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
-        run: pip install -r requirements.txt
-              - name: Sanity check Odds API key
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --- Sanity check your Odds API key BEFORE the main run ---
+      - name: Sanity check Odds API key
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python - <<'PY'
-          import os, requests, sys
+          import os, requests
           key = os.environ.get("ODDS_API_KEY")
-          assert key, "ODDS_API_KEY missing"
+          assert key, "ODDS_API_KEY missing (add in Settings → Secrets → Actions)"
           url = f"https://api.the-odds-api.com/v4/sports?apiKey={key}"
           r = requests.get(url, timeout=20)
           print("Status:", r.status_code)
           print("Body:", r.text[:300])
           r.raise_for_status()
           PY
+
       - name: Run pipeline
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-        run: python run_model.py --date today --season 2025 --write outputs
-      - name: Upload artifacts
+        run: |
+          python run_model.py --date today --season 2025 --write outputs
+
+      - name: Upload artifacts (CSV outputs)
         uses: actions/upload-artifact@v4
         with:
           name: nfl-outputs
           path: outputs/**
-
