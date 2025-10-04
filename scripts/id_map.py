@@ -1,12 +1,11 @@
-import pandas as pd
-import re
+import pandas as pd, re
 
 CACHE_PATH = "inputs/player_id_cache.csv"
 
 def _norm_name(s: str) -> str:
     if not s: return ""
     s = s.lower().strip()
-    s = re.sub(r"[^a-z\s\.']", " ", s)
+    s = re.sub(r"[^a-z\s\.\'-]", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s
 
@@ -19,19 +18,19 @@ def load_cache() -> pd.DataFrame:
 
 def map_players(props_df: pd.DataFrame, ids_df: pd.DataFrame) -> pd.DataFrame:
     cache = load_cache()
-    props_df["name_norm"] = props_df["player_name_raw"].fillna("").map(_norm_name)
-    ids_df = ids_df.copy()
-    ids_df["player_name_norm"] = ids_df["player_name"].fillna("").map(_norm_name)
+    df = props_df.copy()
+    df["name_norm"] = df["player_name_raw"].fillna("").map(_norm_name)
 
-    # direct join on normalized name
-    m1 = props_df.merge(ids_df[["player_name_norm","gsis_id"]],
-                        left_on="name_norm", right_on="player_name_norm", how="left")
-    m1.drop(columns=["player_name_norm"], inplace=True)
+    ids = ids_df.copy()
+    ids["player_name_norm"] = ids["player_name"].fillna("").map(_norm_name)
 
-    # apply cache overrides
+    out = df.merge(ids[["player_name_norm","gsis_id","position","recent_team"]],
+                   left_on="name_norm", right_on="player_name_norm", how="left")
+    out.drop(columns=["player_name_norm"], inplace=True)
+
     if not cache.empty:
-        m1 = m1.merge(cache, on="player_name_raw", how="left", suffixes=("","_cache"))
-        m1["gsis_id"] = m1["gsis_id_cache"].fillna(m1["gsis_id"])
-        m1 = m1.drop(columns=[c for c in m1.columns if c.endswith("_cache")])
+        out = out.merge(cache, on="player_name_raw", how="left", suffixes=("","_cache"))
+        out["gsis_id"] = out["gsis_id_cache"].fillna(out["gsis_id"])
+        out.drop(columns=[c for c in out.columns if c.endswith("_cache")], inplace=True)
+    return out
 
-    return m1
