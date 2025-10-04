@@ -7,7 +7,6 @@ beautifulsoup4
 lxml
 selenium
 nflfastpy
-# Option A: PyPI pre-release that supports py3.11
-sportsdataverse==0.6.0a0
+git+https://github.com/sportsdataverse/py-sportsdataverse.git@main#egg=sportsdataverse
 pyarrow
 numpy
