@@ -3,12 +3,12 @@ name: "Full Slate: Lines + Features + Model"
 on:
   workflow_dispatch:
   # schedule:
-  #   - cron: "15 * * * *"  # Disabled hourly run to save API credits
+  #   - cron: "15 * * * *"  # disabled
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -24,33 +24,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- Sanity check your API key + remaining credits ---
       - name: Sanity check Odds API key (and remaining credits)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python - <<'PY'
           import os, requests, sys
-          key = os.environ["ODDS_API_KEY"]
+          key = os.environ.get("ODDS_API_KEY","")
+          if not key:
+              print("⚠️ No ODDS_API_KEY set; game/props fetch will fail.")
           r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={key}", timeout=20)
-          rem = r.headers.get("x-requests-remaining")
-          used = r.headers.get("x-requests-used")
           print("Status:", r.status_code)
-          print("Remaining credits:", rem)
-          print("Used credits:", used)
+          print("Remaining credits:", r.headers.get("x-requests-remaining"))
           if r.status_code != 200:
-              print("Error:", r.text)
-              sys.exit(1)
-          try:
-              if rem is not None and int(rem) < 5:
-                  print("⚠️ Low credits, skipping run.")
-                  sys.exit(0)
-          except ValueError:
-              pass
+              print("Notice:", r.text)
           PY
 
-      - name: Ensure outputs dir exists
-        run: mkdir -p outputs
+      - name: Ensure dirs
+        run: |
+          mkdir -p metrics inputs outputs data
+
+      # ⬇️ NEW: auto-fetch external metrics (team/player form, ids, weather)
+      - name: Fetch external metrics (free sources)
+        run: |
+          python -m scripts.fetch_all --season 2025
 
       - name: Run pipeline
         env:
@@ -63,4 +60,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nfl-outputs
-          path: outputs/
+          path: |
+            outputs/
+            metrics/
+            inputs/
