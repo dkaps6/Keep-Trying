@@ -17,30 +17,40 @@ jobs:
         with:
           python-version: "3.11"
 
+      # 1) Install your normal requirements.txt
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-extended.txt
+          pip install -r requirements.txt
 
-      # OPTIONAL ESPN provider (won’t fail the job if it can’t be installed)
-      - name: (Optional) Install ESPN provider (sportsdataverse)
+      # 2) BEST-EFFORT backup install for sportsdataverse (won't fail the job)
+      #    If it's already installed from requirements.txt, this is a no-op.
+      - name: (Optional) Ensure sportsdataverse is available
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip
-          # Try PyPI pre-release first, then GitHub; if both fail, skip.
-          pip install --pre sportsdataverse || \
-          pip install --no-deps "git+https://github.com/sportsdataverse/py-sportsdataverse.git@main#egg=sportsdataverse" || \
-          echo "sportsdataverse skipped"
           python - <<'PY'
           try:
               import sportsdataverse as sdv
-              print("sportsdataverse OK:", getattr(sdv, "__version__", "unknown"))
+              print("sportsdataverse already installed ✅", getattr(sdv, "__version__", "unknown"))
+              raise SystemExit(0)
+          except Exception:
+              pass
+          PY
+          # Try PyPI pre-release first (if ever published), then GitHub
+          pip install --pre sportsdataverse || \
+          pip install --no-deps "git+https://github.com/sportsdataverse/py-sportsdataverse.git@main#egg=sportsdataverse" || \
+          echo "sportsdataverse skipped (optional)"
+          python - <<'PY'
+          try:
+              import sportsdataverse as sdv
+              print("sportsdataverse available ✅", getattr(sdv, "__version__", "unknown"))
           except Exception as e:
-              print("sportsdataverse unavailable (optional):", e)
+              print("sportsdataverse unavailable (optional) ❌", e)
           PY
 
+      # 3) Sanity check Odds API key (won't fail build if missing)
       - name: Sanity check Odds API key
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -58,20 +68,24 @@ jobs:
                   print("Notice:", r.text)
           PY
 
+      # 4) Make sure output dirs exist
       - name: Ensure dirs
         run: |
           mkdir -p metrics inputs outputs data
 
+      # 5) Fetch external metrics (nflverse → espn → pfr fallbacks inside the script)
       - name: Fetch external metrics (free sources)
         run: |
           python -m scripts.fetch_all --season 2025
 
+      # 6) Run the main pricing/model pipeline
       - name: Run pipeline
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python run_model.py --date today --season 2025 --write outputs
 
+      # 7) Upload all artifacts (outputs + the fetched metrics)
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
@@ -80,4 +94,4 @@ jobs:
           path: |
             outputs/
             metrics/
-            inputs/
+          if-no-files-found: warn
