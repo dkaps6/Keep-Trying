@@ -1,7 +1,7 @@
 # engine.py
 import os
-import pandas as pd
 import re
+import pandas as pd
 
 from scripts.odds_api import fetch_game_lines, fetch_props_all_events
 from scripts.features_external import build_external
@@ -23,8 +23,16 @@ from scripts.rules_engine import apply_rules
 from scripts.volume import consensus_spread_total, team_volume_estimates
 
 
-def _norm(s: str | None) -> str:
-    if not s:
+# ---------- helpers ----------
+def _norm(val) -> str:
+    """
+    Normalize any input to a lowercase ascii-ish token string.
+    Safe for None/NaN/numbers.
+    """
+    if val is None:
+        return ""
+    s = str(val)
+    if s.strip().lower() in {"nan", "none", "null"}:
         return ""
     s = s.lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
@@ -32,6 +40,7 @@ def _norm(s: str | None) -> str:
     return s
 
 
+# ---------- main pipeline ----------
 def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
     """
     Orchestrates the pipeline:
@@ -42,6 +51,7 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
       5) Price at book lines (model prob -> 65/35 blend -> fair odds, edge, kelly, tier)
       6) Write tidy CSVs into outputs/
     """
+
     # --- 1) Odds
     game_df  = fetch_game_lines()
     props_df = fetch_props_all_events()
@@ -61,7 +71,7 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
     # --- 3) Map player names → ids/position/team
     props_df = map_players(props_df, ids)
 
-    # Helper: team L4 row by team string (fallback defaults)
+    # Helper: team L4 context (fallbacks if unknown)
     def get_team_context(team):
         return team_l4_map.get(team, {"tgt_team_l4": 30.0, "rush_att_team_l4": 25.0})
 
@@ -83,7 +93,7 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
         line  = r["point"]
         side  = r["outcome"]
 
-        # Convert American odds -> implied raw prob
+        # Convert American odds -> implied raw prob; de-vig two-way if we have both sides
         p_raw = american_to_prob(price)
         p_over_raw  = p_raw if side in ("Over", "Yes") else None
         p_under_raw = p_raw if side in ("Under", "No") else None
@@ -91,21 +101,16 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
         market_p_fair = p_over_fair if side in ("Over", "Yes") else p_under_fair
 
         # ---------- Volume model from consensus lines ----------
-        # Pull consensus numbers for this event
         ev = cons[cons["event_id"].eq(r["event_id"])].head(1)
         ev_row = ev.iloc[0] if not ev.empty else {}
 
-        # Try to detect if player's team is home (best-effort, substring match)
         team_code = r.get("recent_team") or ""
         home_name = r.get("home") or ""
         away_name = r.get("away") or ""
-        is_home = False
         nteam = _norm(team_code)
-        if nteam and (nteam in _norm(home_name) or nteam in _norm(away_name)):
-            is_home = (nteam in _norm(home_name))
-        # If we couldn't match, team side won't affect win_prob computation much; model will use baseline split.
+        is_home = bool(nteam) and (nteam in _norm(home_name))
 
-        # (optional) you could also look up per-team recent pass/rush rates from team_form here
+        # Optional: we could pull per-team recent pass/rush from team_form here
         tf_row = None
 
         plays, pass_rate, rush_rate, win_prob = team_volume_estimates(ev_row, is_home, tf_row)
@@ -121,11 +126,10 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
 
         tgt_share, rush_share, catch_rate, ypr, ypc = player_shares(pr, team_ctx)
 
-        # small funnel multipliers (can wire real z-scores later)
+        # mild funnel multipliers (neutral for now; wire z-scores later)
         pass_mult = funnel_multiplier(True,  def_rush_epa_z=0.0, def_pass_epa_z=0.0)
         rush_mult = funnel_multiplier(False, def_rush_epa_z=0.0, def_pass_epa_z=0.0)
 
-        # pace smoothing (z’s not computed yet; neutral)
         plays = pace_smoothing(plays, 0.0, 0.0)
 
         # ---------- market-specific μ / σ ----------
@@ -149,14 +153,13 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
             mu = mu_rush_yards(atts, ypc)
 
         elif market == "player_pass_yds":
-            # approximate team dropbacks from plays*pass_rate; qb ypa from player_form
             qb_ypa = (pr.get("pass_yds_l4", 0) / max(pr.get("pass_att_l4", 1), 1)) if pr else 6.8
             dropbacks = plays * pass_rate
             mu = mu_pass_yards(dropbacks, qb_ypa, z_opp_pressure=0.0, z_opp_pass_epa=0.0)
             sigma = volatility_widen(sigma, pressure_mismatch=False, qb_inconsistent=False)
 
         elif market == "player_pass_tds":
-            # Very rough mapping until we wire a Poisson/NegBin with team totals.
+            # Rough mapping until we swap to Bernoulli/Poisson via team totals
             qb_ypa = (pr.get("pass_yds_l4", 0) / max(pr.get("pass_att_l4", 1), 1)) if pr else 6.8
             dropbacks = plays * pass_rate
             pass_yds_mu = mu_pass_yards(dropbacks, qb_ypa, z_opp_pressure=0.0, z_opp_pass_epa=0.0)
@@ -164,7 +167,6 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
             sigma = max(0.6, sigma * 0.04)
 
         elif market == "player_anytime_td":
-            # Placeholder for Bernoulli using implied team total later.
             mu = 0.0
             sigma = 1.0
 
@@ -190,7 +192,7 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
             team_ay_att_z=0.0,
             light_box_share=None,
             heavy_box_share=None,
-            win_prob=win_prob,       # <-- from volume model
+            win_prob=win_prob,       # from volume model
             qb_inconsistent=False,
             pressure_mismatch=False,
         )
@@ -219,7 +221,7 @@ def run_pipeline(target_date: str, season: int, out_dir: str = "outputs"):
 
     out = pd.DataFrame(rows)
 
-    # --- make sure output dir exists BEFORE writing ---
+    # --- ensure output dir exists BEFORE writing ---
     out_dir = out_dir or "outputs"
     os.makedirs(out_dir, exist_ok=True)
 
