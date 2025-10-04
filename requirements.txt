@@ -1,7 +1,6 @@
 pandas
 requests
 scipy
-nfl-data-py
-python-dateutil
 nfl-data-py>=0.3.1
-sportsdataverse>=0.6.0
+python-dateutil
+git+https://github.com/sportsdataverse/py-sportsdataverse.git
