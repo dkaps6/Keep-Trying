@@ -15,6 +15,20 @@ jobs:
           python-version: "3.11"
       - name: Install deps
         run: pip install -r requirements.txt
+              - name: Sanity check Odds API key
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os, requests, sys
+          key = os.environ.get("ODDS_API_KEY")
+          assert key, "ODDS_API_KEY missing"
+          url = f"https://api.the-odds-api.com/v4/sports?apiKey={key}"
+          r = requests.get(url, timeout=20)
+          print("Status:", r.status_code)
+          print("Body:", r.text[:300])
+          r.raise_for_status()
+          PY
       - name: Run pipeline
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
