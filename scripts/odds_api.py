@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Set
 
 import pandas as pd
@@ -12,30 +13,22 @@ BASE = "https://api.the-odds-api.com/v4"
 SPORT = "americanfootball_nfl"
 HEADERS = {"User-Agent": "keep-trying/props-pipeline python-requests"}
 
-# A broad superset of NFL player-prop market keys (per docs)
-# We'll probe with these once, discover what's actually available,
-# then use only the discovered set for the full slate.
+# ---- TUNABLE SAFETY LIMITS (via env) ----------------------------------------
+EVENT_WINDOW_HOURS = int(os.environ.get("ODDS_API_EVENT_WINDOW_HOURS", "48"))  # only call games in next N hours
+MAX_EVENTS = int(os.environ.get("ODDS_API_MAX_EVENTS", "8"))                    # hard cap on events to price
+REGIONS = os.environ.get("ODDS_API_REGIONS", "us,us2")                          # regions to request
+# -----------------------------------------------------------------------------
+
+# Broad candidate set; we discover what's actually available for your key/region
 MARKET_CANDIDATES: List[str] = [
-    # passing
     "player_pass_yds", "player_pass_tds",
     "player_pass_attempts", "player_pass_completions",
     "player_pass_interceptions", "player_pass_longest_completion",
-    "player_pass_rush_yds", "player_pass_rush_reception_yds",
-    # rushing
-    "player_rush_yds", "player_rush_attempts",
-    "player_rush_longest", "player_rush_tds",
-    "player_rush_reception_yds", "player_rush_reception_tds",
-    # receiving
-    "player_receptions", "player_reception_yds",
-    "player_reception_longest", "player_reception_tds",
-    # kickers / defense (sometimes available)
-    "player_field_goals", "player_kicking_points",
-    "player_sacks", "player_solo_tackles", "player_tackles_assists",
-    # scorers
+    "player_rush_yds", "player_rush_attempts", "player_rush_longest",
+    "player_receptions", "player_reception_yds", "player_reception_longest",
     "player_anytime_td", "player_1st_td", "player_last_td",
 ]
 
-# Accept any of these "positive" outcomes as our anchor row
 _POS_DESCS = {"over", "yes", ""}
 
 
@@ -51,10 +44,9 @@ def _key() -> str:
 def _get(url: str, params: Dict[str, Any]) -> Any:
     r = requests.get(url, params=params, headers=HEADERS, timeout=30)
 
-    # credits log
     rem = r.headers.get("x-requests-remaining")
     used = r.headers.get("x-requests-used")
-    lim = r.headers.get("x-requests-limit")
+    lim  = r.headers.get("x-requests-limit")
     if rem or used or lim:
         print(f"[odds_api] credits remaining={rem} used={used} limit={lim}")
 
@@ -70,31 +62,47 @@ def _get(url: str, params: Dict[str, Any]) -> Any:
 
 
 def _list_events(key: str) -> List[Dict[str, Any]]:
-    """Enumerate events via featured market (h2h). Costs 1 request."""
     url = f"{BASE}/sports/{SPORT}/odds"
     params = dict(
         apiKey=key,
-        markets="h2h",
-        regions="us,us2",
+        markets="h2h",             # cheap feature market to enumerate events
+        regions=REGIONS,
         oddsFormat="american",
         dateFormat="iso",
     )
+    data = _get(url, params)
+    return data if isinstance(data, list) else []
+
+
+def _parse_time(ts: str) -> datetime | None:
     try:
-        data = _get(url, params)
-        return data if isinstance(data, list) else []
-    except RuntimeError:  # out of credits
-        raise
-    except Exception as e:
-        print(f"[odds_api] events list failed: {e}")
-        return []
+        # Samples look like "2025-10-05T17:00:00Z"
+        if ts.endswith("Z"):
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
 
 
-def _event_props_once(key: str, event_id: str, markets: Iterable[str]) -> Dict[str, Any]:
-    """Call event endpoint once for a specific set of markets."""
+def _filter_events_window(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Only keep events starting within EVENT_WINDOW_HOURS from now (UTC)."""
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(hours=EVENT_WINDOW_HOURS)
+    kept = []
+    for ev in events:
+        ct = ev.get("commence_time")
+        dt = _parse_time(ct) if ct else None
+        if dt and now <= dt <= cutoff:
+            kept.append(ev)
+    print(f"[odds_api] events visible={len(events)}  in_window({EVENT_WINDOW_HOURS}h)={len(kept)}  cap={MAX_EVENTS}")
+    return kept[:MAX_EVENTS]
+
+
+def _event_once(key: str, event_id: str, markets: Iterable[str]) -> Dict[str, Any]:
     url = f"{BASE}/sports/{SPORT}/events/{event_id}/odds"
     params = dict(
         apiKey=key,
-        regions="us,us2",
+        regions=REGIONS,
         markets=",".join(markets),
         oddsFormat="american",
         dateFormat="iso",
@@ -103,17 +111,14 @@ def _event_props_once(key: str, event_id: str, markets: Iterable[str]) -> Dict[s
 
 
 def _discover_markets(key: str, event_id: str) -> Set[str]:
-    """
-    Probe the first event with MARKET_CANDIDATES (chunked) and return the
-    subset of market keys that actually appear in the response.
-    """
+    """Probe the first event in small chunks; keep only markets we actually see."""
     discovered: Set[str] = set()
-    CHUNK = 12  # keep query strings reasonable
-    candidates = list(dict.fromkeys(MARKET_CANDIDATES))  # de-dupe but preserve order
+    CHUNK = 10
+    candidates = list(dict.fromkeys(MARKET_CANDIDATES))
     for i in range(0, len(candidates), CHUNK):
-        chunk = candidates[i : i + CHUNK]
+        chunk = candidates[i:i+CHUNK]
         try:
-            j = _event_props_once(key, event_id, chunk)
+            j = _event_once(key, event_id, chunk)
         except RuntimeError:
             raise
         except Exception as e:
@@ -122,98 +127,102 @@ def _discover_markets(key: str, event_id: str) -> Set[str]:
 
         for bm in j.get("bookmakers", []):
             for mkt in bm.get("markets", []):
-                discovered.add(mkt.get("key"))
-
+                k = mkt.get("key")
+                if k:
+                    discovered.add(k)
         time.sleep(0.12)
 
-    # Keep only the ones we know how to price downstream
-    discovered = {m for m in discovered if m in set(MARKET_CANDIDATES)}
-    print(f"[odds_api] discovered markets for event {event_id}: {sorted(discovered)}")
+    discovered &= set(MARKET_CANDIDATES)
+    print(f"[odds_api] discovered markets for event {event_id}: {sorted(discovered) or 'NONE'}")
     return discovered
 
 
-def _rows_from_event_json(j: Dict[str, Any], allowed_markets: Set[str]) -> List[Dict[str, Any]]:
+def _rows_from_event_json(j: Dict[str, Any], allowed: Set[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for bm in j.get("bookmakers", []):
         book = bm.get("key")
         for mkt in bm.get("markets", []):
             mkey = mkt.get("key")
-            if mkey not in allowed_markets:
+            if mkey not in allowed:
                 continue
             for oc in mkt.get("outcomes", []):
                 desc = (oc.get("description") or "").lower()
-                if desc not in _POS_DESCS:
+                if desc not in {"over", "yes", ""}:
                     continue
                 player = oc.get("name")
-                line = oc.get("point")
-                price = oc.get("price")
+                line   = oc.get("point")
+                price  = oc.get("price")
                 if player is None or line is None or price is None:
                     continue
-                rows.append(
-                    {
-                        "event_id": j.get("id"),
-                        "home_team": j.get("home_team"),
-                        "away_team": j.get("away_team"),
-                        "commence_time": j.get("commence_time"),
-                        "book": book,
-                        "market": mkey,
-                        "player": player,
-                        "line": float(line),
-                        "price": float(price),
-                    }
-                )
+                rows.append({
+                    "event_id": j.get("id"),
+                    "home_team": j.get("home_team"),
+                    "away_team": j.get("away_team"),
+                    "commence_time": j.get("commence_time"),
+                    "book": book,
+                    "market": mkey,
+                    "player": player,
+                    "line": float(line),
+                    "price": float(price),
+                })
     return rows
 
 
 def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
     """
-    Returns a normalized DataFrame:
+    Returns normalized rows:
       [player, market, line, price, book, event_id, home_team, away_team, commence_time]
-    Also writes outputs/props_raw.csv for debugging/inspection.
+    Writes outputs/props_raw.csv for inspection.
     """
     key = _key()
     if not key:
         return pd.DataFrame()
 
+    # 1) Enumerate and filter events to a small, near-term set
     try:
-        events = _list_events(key)
+        evs = _list_events(key)
     except RuntimeError as rte:
         if "ODDS_API_OUT_OF_CREDITS" in str(rte):
             print("[odds_api] out of usage credits; aborting Odds API pulls this run.")
             return pd.DataFrame()
         raise
 
-    if not events:
+    if not evs:
         print("[odds_api] 0 events listed")
         return pd.DataFrame()
 
-    # 1) Discover which prop markets are actually available for this slate
-    first_event_id = next((e.get("id") for e in events if e.get("id")), None)
-    if not first_event_id:
-        print("[odds_api] no valid event id found in listing")
+    evs = _filter_events_window(evs)
+    if not evs:
+        print("[odds_api] no events within window; nothing to fetch")
+        return pd.DataFrame()
+
+    # 2) Discover prop markets on the first event
+    first_id = evs[0].get("id")
+    if not first_id:
+        print("[odds_api] first event has no id")
         return pd.DataFrame()
 
     try:
-        discovered = _discover_markets(key, first_event_id)
+        markets = _discover_markets(key, first_id)
     except RuntimeError as rte:
         if "ODDS_API_OUT_OF_CREDITS" in str(rte):
-            print("[odds_api] out of usage credits during discovery; aborting.")
+            print("[odds_api] out of credits during discovery; aborting.")
             return pd.DataFrame()
         raise
 
-    if not discovered:
-        print("[odds_api] discovery found no player prop markets (plan/region/book coverage?)")
+    if not markets:
+        print("[odds_api] discovery returned no player-prop markets for this plan/region")
         return pd.DataFrame()
 
-    # 2) Fetch props for each event using only discovered keys
+    # 3) Fetch those markets for each capped event
     all_rows: List[Dict[str, Any]] = []
-    for ev in events:
+    for ev in evs:
         eid = ev.get("id")
         if not eid:
             continue
         try:
-            j = _event_props_once(key, eid, sorted(discovered))
-            all_rows.extend(_rows_from_event_json(j, discovered))
+            j = _event_once(key, eid, sorted(markets))
+            all_rows.extend(_rows_from_event_json(j, markets))
         except RuntimeError as rte:
             if "ODDS_API_OUT_OF_CREDITS" in str(rte):
                 print("[odds_api] out of credits mid-loop; stopping.")
@@ -228,32 +237,22 @@ def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
         print("[odds_api] 0 player-prop rows")
         return df
 
-    keep = [
-        "player",
-        "market",
-        "line",
-        "price",
-        "book",
-        "event_id",
-        "home_team",
-        "away_team",
-        "commence_time",
-    ]
+    keep = ["player","market","line","price","book","event_id","home_team","away_team","commence_time"]
     for k in keep:
         if k not in df.columns:
             df[k] = None
     df = df[keep].copy()
 
-    # debug snapshot
+    # snapshot for debugging
     try:
         os.makedirs("outputs", exist_ok=True)
         df.to_csv("outputs/props_raw.csv", index=False)
     except Exception:
         pass
 
-    print(f"[odds_api] assembled {len(df)} rows")
+    print(f"[odds_api] assembled {len(df)} rows from {len(evs)} events, markets={sorted(markets)}")
     return df
 
 
-# Backwards-compat aliases
+# Back-compat aliases
 get_props = build_props_frame = load_props = fetch_props
