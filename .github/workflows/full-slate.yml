@@ -1,43 +1,40 @@
 name: "Full Slate (Odds API only, fail-fast)"
 
 on:
-  workflow_dispatch:  # manual only; will not auto-run
+  workflow_dispatch:  # manual only
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # ---- Configure your pull here ----
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-      # full-slate window & cap (edit if you want)
-      ODDS_API_EVENT_WINDOW_HOURS: "168"          # next 7 days
-      ODDS_API_MAX_EVENTS: "40"                   # hard cap
-      # API request shaping:
-      ODDS_API_REGIONS: "us"                      # try "us,us2" or "us,us2,eu" if needed
-      ODDS_API_BOOKMAKERS: "draftkings,fanduel,betmgm,caesars,pointsbetus"  # remove this line to query ALL books (uses many more credits)
+      # full-slate window & caps
+      ODDS_API_EVENT_WINDOW_HOURS: "168"     # next 7 days
+      ODDS_API_MAX_EVENTS: "40"
+      # shaping (tune as you like)
+      ODDS_API_REGIONS: "us"
+      ODDS_API_BOOKMAKERS: "draftkings,fanduel,betmgm,caesars,pointsbetus"
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # A cheap call that does NOT hit props endpoints; shows key & remaining credits
       - name: Check Odds API quota (pre-run)
         shell: bash
         run: |
           python - <<'PY'
           import os, requests
           k = os.environ.get("ODDS_API_KEY","")
-          if not k:
+          if not k: 
               print("No ODDS_API_KEY set."); raise SystemExit(0)
           r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={k}", timeout=20)
           print("HTTP", r.status_code, "| key suffix ...", k[-4:])
@@ -47,32 +44,24 @@ jobs:
           if r.status_code != 200: print(r.text[:400])
           PY
 
-      # 🔴 DIRECT provider pull (Odds API only; NO CSV fallback).
       - name: Fetch props (Odds API only; no CSV fallback)
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-        run: |
-          python -m scripts.fetch_all --season 2025
+        run: python -m scripts.fetch_all --season 2025
 
-      # Stop immediately if we didn't actually fetch props; show reason + drop debug files.
       - name: Assert props present (fail-fast)
         shell: bash
         run: |
           if [ ! -s outputs/props_raw.csv ]; then
             echo "❌ No props fetched."
             [ -f outputs/_NO_PROPS ] && echo "--- Reason ---" && cat outputs/_NO_PROPS
-            echo "--- Debug payloads (if any) ---"
+            echo "--- Debug payloads ---"
             ls -l outputs/debug || true
             exit 1
           fi
-          echo "✅ props_raw.csv present (sample):"
+          echo "✅ props_raw.csv present:"
           head -n 12 outputs/props_raw.csv
 
       - name: Run pricing/model
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-        run: |
-          python run_model.py --date today --season 2025 --write outputs
+        run: python run_model.py --date today --season 2025 --write outputs
 
       - name: Check Odds API quota (post-run)
         shell: bash
@@ -83,8 +72,7 @@ jobs:
           if not k: raise SystemExit(0)
           r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={k}", timeout=20)
           print("Post-run Remaining:", r.headers.get("x-requests-remaining"),
-                "Used:", r.headers.get("x-requests-used"),
-                "Limit:", r.headers.get("x-requests-limit"))
+                "Used:", r.headers.get("x-requests-used"))
           PY
 
       - name: Upload artifacts
