@@ -18,6 +18,10 @@ EVENT_WINDOW_HOURS = int(os.environ.get("ODDS_API_EVENT_WINDOW_HOURS", "168"))
 MAX_EVENTS = int(os.environ.get("ODDS_API_MAX_EVENTS", "40"))
 REGIONS = os.environ.get("ODDS_API_REGIONS", "us")
 BOOKMAKERS = os.environ.get("ODDS_API_BOOKMAKERS", "").strip()
+BOOK_PREF = os.environ.get(
+    "ODDS_API_BOOK_PREFERENCE",
+    "draftkings,fanduel,betmgm,caesars,pointsbetus"
+).split(",")
 
 # prop markets we care about
 CORE_MARKETS = [
@@ -29,6 +33,23 @@ CORE_MARKETS = [
 ]
 
 ANCHORS = {"over", "yes", "under", "no"}
+
+def american_to_prob(odds: float) -> float:
+    if odds is None: return float("nan")
+    try:
+        o = float(odds)
+    except Exception:
+        return float("nan")
+    if o < 0:  # favorite
+        return (-o) / ((-o) + 100.0)
+    return 100.0 / (o + 100.0)
+
+def devig_two_way(p_a: float, p_b: float) -> Tuple[float, float]:
+    """Return fair probs from two implied probs (simple normalization)."""
+    if pd.isna(p_a) or pd.isna(p_b) or p_a + p_b <= 0:
+        return p_a, p_b
+    s = p_a + p_b
+    return p_a / s, p_b / s
 
 def _key() -> str:
     k = os.environ.get("ODDS_API_KEY", "")
@@ -67,6 +88,51 @@ def _filter_window(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     print(f"[odds_api] events listed={len(events)} in_window({EVENT_WINDOW_HOURS}h)={len(kept)} cap={MAX_EVENTS}")
     return kept[:MAX_EVENTS]
 
+def _pick_bookmaker(bm_list: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not bm_list: return None
+    by_key = {bm.get("key"): bm for bm in bm_list if bm.get("key")}
+    for pref in BOOK_PREF:
+        if pref in by_key: return by_key[pref]
+    return bm_list[0]
+
+def _extract_h2h_winprobs(events: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    From the listing (h2h) call, compute a devigged win-prob per team for the
+    chosen bookmaker (preference order). No extra API calls.
+    """
+    rows = []
+    for ev in events:
+        bm = _pick_bookmaker(ev.get("bookmakers", []))
+        if not bm: 
+            continue
+        mkts = bm.get("markets", [])
+        m_h2h = next((m for m in mkts if m.get("key") == "h2h"), None)
+        if not m_h2h: 
+            continue
+        outs = m_h2h.get("outcomes", [])
+        # map by name to price
+        prices = {o.get("name"): o.get("price") for o in outs}
+        home = ev.get("home_team"); away = ev.get("away_team")
+        p_home = american_to_prob(prices.get(home))
+        p_away = american_to_prob(prices.get(away))
+        p_home_fair, p_away_fair = devig_two_way(p_home, p_away)
+        rows.append({
+            "event_id": ev.get("id"),
+            "commence_time": ev.get("commence_time"),
+            "book": bm.get("key"),
+            "home_team": home,
+            "away_team": away,
+            "home_price": prices.get(home),
+            "away_price": prices.get(away),
+            "home_wp": p_home_fair,
+            "away_wp": p_away_fair,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        Path("outputs").mkdir(exist_ok=True)
+        df.to_csv("outputs/game_lines.csv", index=False)
+    return df
+
 def _event_props(key: str, event_id: str, markets: Iterable[str]) -> Dict[str, Any]:
     url = f"{BASE}/sports/{SPORT}/events/{event_id}/odds"
     params = dict(
@@ -89,7 +155,6 @@ def _classify(player_field: str, desc_field: str) -> Tuple[str,str]:
         return desc, nlow
     if dlow in ANCHORS:
         return name, dlow
-    # neither looks like a side → treat `name` as player, empty side
     return name or desc, ""
 
 def _rows_from_event_json(j: Dict[str, Any], allowed: set) -> List[Dict[str, Any]]:
@@ -116,7 +181,7 @@ def _rows_from_event_json(j: Dict[str, Any], allowed: set) -> List[Dict[str, Any
                     "book": book,
                     "market": mkey,
                     "player": player,
-                    "side": side,                # keep both sides; devig later
+                    "side": side,
                     "line": line,
                     "price": price,
                 })
@@ -128,11 +193,15 @@ def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
 
     DBG = Path("outputs/debug"); DBG.mkdir(parents=True, exist_ok=True)
 
-    evs = _filter_window(_list_events(key))
+    # 1) list + window + extract H2H win-probs
+    evs_all = _list_events(key)
+    _extract_h2h_winprobs(evs_all)   # writes outputs/game_lines.csv
+    evs = _filter_window(evs_all)
     if not evs: 
-        print("[odds_api] no events within window"); return pd.DataFrame()
+        print("[odds_api] no events within window"); 
+        return pd.DataFrame()
 
-    # discover which markets exist on the first event
+    # 2) discover which markets exist on the first event
     first_id = evs[0].get("id")
     j0 = _event_props(key, first_id, CORE_MARKETS)
     (DBG / f"event_{first_id}_discovery.json").write_text(json.dumps(j0, indent=2))
@@ -143,6 +212,7 @@ def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
         print("[odds_api] discovery had no usable markets")
         return pd.DataFrame()
 
+    # 3) fetch loop
     all_rows: List[Dict[str, Any]] = []
     for idx, ev in enumerate(evs, start=1):
         eid = ev.get("id")
