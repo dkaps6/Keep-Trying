@@ -1,367 +1,422 @@
 # engine.py
-# End-to-end pipeline:
-#  1) fetch/load props
-#  2) merge contextual features (team/player form, weather, id map)
-#  3) apply rules to compute (mu, sigma) and model probability
-#  4) attach pricing columns (market_prob, fair_prob, fair_american, edge, kelly)
-#  5) write outputs
-
 from __future__ import annotations
+
 import os
 import json
-from math import erf, sqrt
-from typing import Dict, Tuple, Any, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# --- Optional imports guarded so engine never breaks if they’re missing ---
+# ---- Local modules (import defensively) --------------------------------------
 try:
-    # Your rules entry point must exist
-    from scripts.rules_engine import apply_rules
-except Exception as e:  # pragma: no cover
-    apply_rules = None
-
-try:
-    # Optional: external feature merge (weather, injuries, extra metrics)
-    from scripts.features_external import merge_external_features
-except Exception:
-    merge_external_features = None
+    from scripts import rules_engine as rules
+except Exception as e:
+    raise RuntimeError(f"Failed to import rules_engine: {e}")
 
 try:
-    # Optional: odds API fetchers
-    from scripts.odds_api import fetch_props_all_events
+    # prefer attribute-access over fragile "from x import y"
+    from scripts import pricing as pr
+except Exception as e:
+    raise RuntimeError(f"Failed to import pricing: {e}")
+
+# optional fetchers; tolerate absence
+try:
+    from scripts.odds_api import fetch_props_all_events, fetch_game_lines
 except Exception:
     fetch_props_all_events = None
-
-# Pricing helpers (shipped earlier)
-from scripts.pricing import attach_pricing_columns
-
-# -------------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------------
-
-ROOT = os.getcwd()
-DIR_OUTPUTS = os.path.join(ROOT, "outputs")
-DIR_METRICS = os.path.join(ROOT, "metrics")
-DIR_INPUTS  = os.path.join(ROOT, "inputs")
-
-os.makedirs(DIR_OUTPUTS, exist_ok=True)
-os.makedirs(DIR_METRICS, exist_ok=True)
-os.makedirs(DIR_INPUTS,  exist_ok=True)
+    fetch_game_lines = None
 
 
-def _read_csv_safe(path: str, **kw) -> pd.DataFrame:
-    """Read CSV if it exists; otherwise return empty DF with no error."""
+# ---- Small helpers -----------------------------------------------------------
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _read_csv(path: str, **kwargs) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
     try:
-        if os.path.exists(path):
-            return pd.read_csv(path, **kw)
+        return pd.read_csv(path, **kwargs)
     except Exception:
-        pass
-    return pd.DataFrame()
+        # keep pipeline alive; upstream sources might be empty
+        return pd.DataFrame()
 
 
-def _write_csv_safe(df: pd.DataFrame, path: str) -> None:
+def _american_to_decimal(american: Any) -> Optional[float]:
+    """Convert American odds to decimal price; returns None on failure."""
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        df.to_csv(path, index=False)
+        a = float(american)
     except Exception:
-        # best-effort write; don't crash the pipeline on I/O
-        pass
+        return None
+    if a > 0:
+        return 1.0 + a / 100.0
+    if a < 0:
+        return 1.0 + 100.0 / abs(a)
+    return None
 
 
-def _norm_cdf(z: float) -> float:
-    """Standard normal CDF via erf (no SciPy dependency)."""
-    if z is None or not np.isfinite(z):
-        return np.nan
-    return 0.5 * (1.0 + erf(z / sqrt(2.0)))
+def _decimal_to_prob(decimal_price: Optional[float]) -> Optional[float]:
+    if decimal_price and decimal_price > 1.0:
+        return 1.0 / decimal_price
+    return None
 
 
-def _normalize_team(abbr: Any) -> str:
-    """Uppercase simple normalizer; add mapping here if you need."""
-    if isinstance(abbr, str):
-        return abbr.strip().upper()
-    return ""
+TEAM_ABBR_MAP = {
+    # keep this tiny and non-opinionated; rules/metrics can own the full map
+    "JAX": "JAC",
+    "LA": "LAR",
+    "WSH": "WAS",
+}
 
 
-def _load_context_tables() -> Dict[str, pd.DataFrame]:
-    """Load metrics and inputs tables; empty DataFrames if missing."""
-    team_form       = _read_csv_safe(os.path.join(DIR_METRICS, "team_form.csv"))
-    team_week_form  = _read_csv_safe(os.path.join(DIR_METRICS, "team_week_form.csv"))
-    player_form     = _read_csv_safe(os.path.join(DIR_METRICS, "player_form.csv"))
-    id_map          = _read_csv_safe(os.path.join(DIR_INPUTS,  "id_map.csv"))
-    weather         = _read_csv_safe(os.path.join(DIR_INPUTS,  "weather.csv"))
-
-    # Basic normalization for merge keys
-    for df in (team_form, team_week_form):
-        if "team" in df.columns:
-            df["team"] = df["team"].astype(str).str.upper()
-
-    return {
-        "team_form": team_form,
-        "team_week_form": team_week_form,
-        "player_form": player_form,
-        "id_map": id_map,
-        "weather": weather,
-    }
+def _norm_team(x: Any) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip().upper()
+    return TEAM_ABBR_MAP.get(s, s)
 
 
-def _fetch_props(date: Optional[str], season: Optional[int]) -> pd.DataFrame:
+# ---- Rules adapter (new and legacy signatures) -------------------------------
+def _apply_rules_compat(row: Dict[str, Any]) -> Tuple[float, float, str]:
     """
-    Fetch props from your odds source if available.
-    Fallbacks:
-      - a local 'inputs/props.csv' if you keep one around for tests
-      - otherwise return empty DF
+    Adapts to either:
+      - new style: apply_rules(features: dict) -> (mu, sigma, notes) or dict
+      - old style: apply_rules(side, mu, sigma, features={..., player=..., team_ctx=...})
     """
-    # Preferred: live odds API if configured
-    if callable(fetch_props_all_events):
+    # Most models use the team of the player (if present)
+    team_ctx = row.get("team", "") or row.get("team_norm", "")
+    player = row.get("player", "")
+
+    # Prefer a single-features dict
+    features = dict(row)
+    features["team_ctx"] = team_ctx
+    features["player"] = player
+
+    try:
+        out = rules.apply_rules(features)  # new style?
+        if isinstance(out, dict):
+            mu = float(out.get("mu", 0.0))
+            sigma = float(out.get("sigma", 1.0))
+            notes = str(out.get("notes", ""))
+            return mu, sigma, notes
+        if isinstance(out, (list, tuple)) and len(out) >= 2:
+            mu = float(out[0])
+            sigma = float(out[1])
+            notes = "" if len(out) < 3 else str(out[2])
+            return mu, sigma, notes
+    except TypeError:
+        # legacy signature
         try:
-            return fetch_props_all_events(date=date, season=season)
+            mu, sigma, notes = rules.apply_rules(
+                features.get("side", "over"),
+                features.get("mu", 0.0),
+                features.get("sigma", 1.0),
+                features=features,
+            )
+            return float(mu), float(sigma), str(notes)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Fallback: neutral, uninformative
+    return 0.0, 1.0, "rules_default"
+
+
+# ---- Pricing adapters --------------------------------------------------------
+def _call(fn_name: str, *args, **kwargs):
+    """Call a function in scripts.pricing by name if present, else None."""
+    fn = getattr(pr, fn_name, None)
+    if callable(fn):
+        return fn(*args, **kwargs)
+    return None
+
+
+def _model_prob(mu: float, sigma: float, side: str, line: float) -> Optional[float]:
+    # try most common internal helper names
+    for name in ("_model_prob", "model_prob", "model_probability"):
+        out = _call(name, mu, sigma, side, line)
+        if out is not None:
+            return float(out)
+    # very conservative default if nothing provided
+    # assuming normal model: P(X >= line) for OVER
+    try:
+        from math import erf, sqrt
+
+        z = (line - mu) / (sigma if sigma > 0 else 1.0)
+        # Φ(z)
+        phi = 0.5 * (1.0 + erf(-z / sqrt(2.0)))
+        return 1.0 - phi if str(side).lower() == "over" else phi
+    except Exception:
+        return None
+
+
+def _fair_prob_blend(model_prob: Optional[float], market_prob: Optional[float]) -> Optional[float]:
+    for name in ("_blend", "blend_prob", "blend"):
+        out = _call(name, model_prob, market_prob)
+        if out is not None:
+            return float(out)
+    # default: if both available, 50/50 blend; else whichever exists
+    if model_prob is not None and market_prob is not None:
+        return 0.5 * model_prob + 0.5 * market_prob
+    return model_prob if model_prob is not None else market_prob
+
+
+def _edge(model_prob: Optional[float], market_prob: Optional[float]) -> Optional[float]:
+    for name in ("_edge", "edge"):
+        out = _call(name, model_prob, market_prob)
+        if out is not None:
+            return float(out)
+    if model_prob is None or market_prob is None:
+        return None
+    return model_prob - market_prob
+
+
+def _prob_to_american(prob: Optional[float]) -> Optional[float]:
+    for name in ("prob_to_american", "prob2american", "prob_to_price"):
+        out = _call(name, prob)
+        if out is not None:
+            return float(out)
+    if prob is None or prob <= 0 or prob >= 1:
+        return None
+    # convert to American
+    if prob >= 0.5:
+        return -100.0 * prob / (1.0 - prob)
+    else:
+        return 100.0 * (1.0 - prob) / prob
+
+
+def _kelly(edge: Optional[float], market_prob: Optional[float]) -> Optional[float]:
+    # Preferred: pricing.kelly(american_or_prob, market_prob) or similar
+    out = _call("kelly", edge, market_prob)
+    if out is not None:
+        try:
+            return float(out)
+        except Exception:
+            pass
+    # simple Kelly fraction on an even unit bet if we only have prob/edge
+    if edge is None or market_prob is None:
+        return None
+    # Kelly ~ edge / variance proxy (avoid negative explosions)
+    return max(0.0, edge) * 0.5
+
+
+# ---- Core pipeline -----------------------------------------------------------
+@dataclass
+class PipelineResult:
+    priced: pd.DataFrame
+    features_source: str
+    note: str = ""
+
+
+def _load_metrics() -> Dict[str, pd.DataFrame]:
+    mets = {
+        "team_form": _read_csv("metrics/team_form.csv"),
+        "team_week_form": _read_csv("metrics/team_week_form.csv"),
+        "player_form": _read_csv("metrics/player_form.csv"),
+        "id_map": _read_csv("inputs/id_map.csv"),
+        "weather": _read_csv("inputs/weather.csv"),
+    }
+    # normalize basic team column if present
+    for k in ("team_form", "team_week_form"):
+        if not mets[k].empty and "team" in mets[k].columns:
+            mets[k]["team_norm"] = mets[k]["team"].map(_norm_team)
+    return mets
+
+
+def _fetch_props(odds_key: Optional[str]) -> pd.DataFrame:
+    # 1) live from Odds API if available
+    if fetch_props_all_events is not None:
+        try:
+            return fetch_props_all_events(api_key=odds_key)
+        except TypeError:
+            try:
+                return fetch_props_all_events(ODDS_API_KEY=odds_key)
+            except Exception:
+                pass
         except Exception:
             pass
 
-    # Fallback for local testing
-    local = os.path.join(DIR_INPUTS, "props.csv")
-    df = _read_csv_safe(local)
-    if not df.empty:
+    # 2) if you’ve stashed a CSV, use it
+    for p in ("inputs/props.csv", "inputs/props_raw.csv"):
+        if os.path.exists(p):
+            df = _read_csv(p)
+            if not df.empty:
+                return df
+
+    # 3) otherwise empty frame with expected schema
+    return pd.DataFrame(
+        columns=[
+            "event_id", "player", "team", "market", "line", "price",
+            "side"  # optional; default to OVER
+        ]
+    )
+
+
+def _normalize_props(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
         return df
 
-    # Last resort: empty
-    return pd.DataFrame(columns=["event_id", "market", "prop", "player", "team", "opp_team", "price"])
+    out = df.copy()
 
-
-def _coalesce_team_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure 'team' and 'opp_team' exist; coalesce from common alternatives if needed."""
-    if "team" not in df.columns:
-        for cand in ("home_team", "participant", "team_abbr", "team_name"):
-            if cand in df.columns:
-                df["team"] = df[cand]
-                break
-    if "opp_team" not in df.columns:
-        for cand in ("away_team", "opponent", "opp_abbr", "opp_name"):
-            if cand in df.columns:
-                df["opp_team"] = df[cand]
-                break
-
-    # Normalize to uppercase strings
-    if "team" in df.columns:
-        df["team"] = df["team"].astype(str).str.upper()
-    else:
-        df["team"] = ""
-
-    if "opp_team" in df.columns:
-        df["opp_team"] = df["opp_team"].astype(str).str.upper()
-    else:
-        df["opp_team"] = ""
-
-    return df
-
-
-def _merge_features(props_df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
-    """
-    Merge contextual tables with raw props.
-    Returns (merged_df, source_note)
-    """
-    note_chunks = []
-
-    if props_df is None or props_df.empty:
-        return pd.DataFrame(), "props:empty"
-
-    df = props_df.copy()
-    df = _coalesce_team_columns(df)
-
-    ctx = _load_context_tables()
-    team_form      = ctx["team_form"]
-    team_week_form = ctx["team_week_form"]
-    player_form    = ctx["player_form"]
-    weather        = ctx["weather"]
-
-    # Left joins on team (and week if you have one)
-    if not team_form.empty and "team" in team_form.columns:
-        df = df.merge(team_form.add_prefix("team_"), left_on="team", right_on="team_team", how="left")
-        note_chunks.append("team_form")
-    else:
-        note_chunks.append("team_form:empty")
-
-    if not team_week_form.empty and "team" in team_week_form.columns:
-        df = df.merge(team_week_form.add_prefix("tw_"), left_on="team", right_on="tw_team", how="left")
-        note_chunks.append("team_week_form")
-    else:
-        note_chunks.append("team_week_form:empty")
-
-    if not player_form.empty:
-        # Heuristic join on player name, if present
-        key = "player" if "player" in df.columns else None
-        if key and "player" in player_form.columns:
-            df = df.merge(player_form.add_prefix("pf_"), left_on=key, right_on="pf_player", how="left")
-            note_chunks.append("player_form")
-        else:
-            note_chunks.append("player_form:nojoin")
-    else:
-        note_chunks.append("player_form:empty")
-
-    # Optional external merge
-    if callable(merge_external_features):
-        try:
-            df_ext = merge_external_features(df)
-            if isinstance(df_ext, pd.DataFrame) and len(df_ext) == len(df):
-                df = df_ext
-                note_chunks.append("external_features")
-            else:
-                note_chunks.append("external_features:skipped")
-        except Exception:
-            note_chunks.append("external_features:err")
-    else:
-        note_chunks.append("external_features:none")
-
-    # Optional weather merge: if event_id key exists
-    if not weather.empty and "event_id" in df.columns and "event_id" in weather.columns:
-        df = df.merge(weather.add_prefix("w_"), on="event_id", how="left")
-        note_chunks.append("weather")
-    else:
-        note_chunks.append("weather:skip")
-
-    return df, ";".join(note_chunks)
-
-
-def _make_features_row(row: pd.Series, merge_note: str) -> Dict[str, Any]:
-    """
-    Produce a features dict per row to feed the rules engine.
-    Put *everything* you might need here; rules_engine can pick/ignore.
-    """
-    out = {
-        "player": row.get("player"),
-        "market": row.get("market"),
-        "prop":   row.get("prop"),
-        "team":   _normalize_team(row.get("team")),
-        "opp_team": _normalize_team(row.get("opp_team")),
-        "price":  row.get("price"),
-        "odds":   row.get("odds", row.get("price")),
-        "merge_note": merge_note,
-        # examples from merges (safe .get)
-        "team_pressure_rate": row.get("team_pressure_rate"),
-        "pass_epa_allowed":   row.get("team_pass_epa_allowed", row.get("pass_epa_allowed")),
-        "pace":               row.get("tw_pace", row.get("pace")),
-        "pf_usage":           row.get("pf_usage"),
-        "w_temp":             row.get("w_temp"),
-        "w_wind":             row.get("w_wind"),
+    # common column names from Odds API providers
+    rename = {
+        "american_odds": "price",
+        "odds_american": "price",
+        "odds": "price",
+        "participant": "player",
+        "book": "bookmaker",
+        "team_abbr": "team",
     }
+    for a, b in rename.items():
+        if a in out.columns and b not in out.columns:
+            out = out.rename(columns={a: b})
+
+    # derive prob from American odds if only price present
+    if "prob" not in out.columns and "price" in out.columns:
+        dec = out["price"].map(_american_to_decimal)
+        out["market_prob"] = dec.map(_decimal_to_prob)
+    elif "prob" in out.columns:
+        out["market_prob"] = out["prob"].astype(float)
+
+    # team normalization (best-effort)
+    if "team" in out.columns:
+        out["team_norm"] = out["team"].map(_norm_team)
+    else:
+        out["team_norm"] = ""
+
+    if "side" not in out.columns:
+        out["side"] = "over"
+
+    # line numeric
+    if "line" in out.columns:
+        with np.errstate(all="ignore"):
+            out["line"] = pd.to_numeric(out["line"], errors="coerce")
+
+    # keep only props with a line
+    out = out[out["line"].notna()].copy()
+
+    REQUIRED = ["event_id", "player", "market", "line", "price"]
+    missing = [c for c in REQUIRED if c not in out.columns]
+    if missing:
+        # don’t hard-fail; keep pipeline usable but indicate missing schema
+        out["__schema_missing__"] = ",".join(missing)
+
     return out
 
 
-def _apply_rules_compat(fdict: Dict[str, Any]) -> Tuple[float, float, str]:
-    """
-    Call rules_engine.apply_rules(features) and normalize its return.
-    Supported returns:
-      - (mu, sigma, note)
-      - dict with keys: mu, sigma, note or notes
-    """
-    if not callable(apply_rules):
-        # Fallback: neutral model → p=0.5
-        return 0.0, 1e-6, "rules:missing"
+def _merge_features(props: pd.DataFrame, mets: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, str]:
+    """Left-join any metrics we have on team."""
+    src = []
+    out = props.copy()
 
-    try:
-        res = apply_rules(fdict)
-    except Exception as e:
-        return 0.0, 1e-6, f"rules:error:{e}"
+    for k in ("team_form", "team_week_form"):
+        df = mets[k]
+        if df.empty:
+            continue
+        use_cols = [c for c in df.columns if c not in ("team",)]
+        left_key = "team_norm" if "team_norm" in out.columns else "team"
+        right_key = "team_norm" if "team_norm" in df.columns else "team"
 
-    # tuple-like
-    if isinstance(res, (list, tuple)) and len(res) >= 2:
-        mu = float(res[0])
-        sigma = float(res[1]) if np.isfinite(res[1]) and res[1] != 0 else 1e-6
-        note = str(res[2]) if len(res) > 2 else ""
-        return mu, sigma, note
+        out = out.merge(
+            df[use_cols + [right_key]],
+            how="left",
+            left_on=left_key,
+            right_on=right_key,
+            suffixes=("", f"_{k}"),
+        )
+        src.append(k)
 
-    # dict-like
-    if isinstance(res, dict):
-        mu = float(res.get("mu", 0.0))
-        sigma = res.get("sigma", 1e-6)
-        try:
-            sigma = float(sigma)
-            if not np.isfinite(sigma) or sigma == 0:
-                sigma = 1e-6
-        except Exception:
-            sigma = 1e-6
-        note = str(res.get("note", res.get("notes", "")))
-        return mu, sigma, note
-
-    # unknown fallback
-    return 0.0, 1e-6, "rules:unknown_return"
+    return out, ("+".join(src) if src else "none")
 
 
-def _price_frame(priced_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize columns and attach pricing metrics (market_prob, fair_prob, fair_american, edge, kelly).
-    - Accepts 'price' as American odds; maps to 'odds'
-    - Requires 'model_prob' (produced below); if missing, defaults to 0.5
-    """
-    if priced_df is None or len(priced_df) == 0:
-        return priced_df
+def _price_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
 
-    df = priced_df.copy()
+    records = []
+    for _, r in df.iterrows():
+        features = r.to_dict()
+        mu, sigma, notes = _apply_rules_compat(features)
 
-    if "player" not in df.columns and "player_name_raw" in df.columns:
-        df["player"] = df["player_name_raw"]
+        model_prob = _model_prob(mu, sigma, str(r.get("side", "over")).lower(), float(r.get("line", 0.0)))
+        market_prob = r.get("market_prob", None)
+        fair_prob = _fair_prob_blend(model_prob, market_prob)
+        edge = _edge(model_prob, market_prob)
+        fair_american = _prob_to_american(fair_prob)
+        kelly = _kelly(edge, market_prob)
 
-    if "odds" not in df.columns and "price" in df.columns:
-        df["odds"] = df["price"]
-
-    if "model_prob" not in df.columns:
-        df["model_prob"] = 0.5
-    else:
-        df["model_prob"] = pd.to_numeric(df["model_prob"], errors="coerce").fillna(0.5)
-
-    df = attach_pricing_columns(df)
-
-    if "rule_notes" in df.columns:
-        df["rule_notes"] = df["rule_notes"].apply(lambda x: x if isinstance(x, str) else str(x))
-
-    return df
-
-
-# -------------------------------------------------------------------------
-# Public entrypoint
-# -------------------------------------------------------------------------
-
-def run_pipeline(date: Optional[str] = None,
-                 season: Optional[int] = None,
-                 write_outputs: bool = True) -> pd.DataFrame:
-    """
-    Orchestrates the full run. Returns the final priced DataFrame.
-    """
-    # 1) Fetch props
-    props_df = _fetch_props(date=date, season=season)
-
-    # 2) Merge features
-    merged_df, merge_note = _merge_features(props_df)
-
-    # 3) Apply rules → mu, sigma, model_prob
-    rows = []
-    for _, row in merged_df.iterrows():
-        fdict = _make_features_row(row, merge_note)
-        mu, sigma, note = _apply_rules_compat(fdict)
-        # model probability from z-score (mu/sigma)
-        z = mu / sigma if sigma not in (0, None) else np.nan
-        model_prob = _norm_cdf(z) if np.isfinite(z) else 0.5
-
-        rows.append({
-            **row.to_dict(),
+        rec = dict(r)
+        rec.update({
             "mu": mu,
             "sigma": sigma,
             "model_prob": model_prob,
-            "rule_notes": note
+            "market_prob": market_prob,
+            "fair_prob": fair_prob,
+            "edge": edge,
+            "fair_american": fair_american,
+            "kelly": kelly,
+            "rule_notes": notes,
         })
+        records.append(rec)
 
-    if rows:
-        priced_input = pd.DataFrame(rows)
-    else:
-        priced_input = merged_df.copy()
+    out = pd.DataFrame.from_records(records)
+    return out
 
-    # 4) Pricing
-    priced = _price_frame(priced_input)
 
-    # 5) Write outputs
+# ------------------------------------------------------------------------------
+def run_pipeline(
+    season: int = 2025,
+    date: Optional[str] = None,
+    *,
+    target_date: Optional[str] = None,   # accepted for CLI compatibility
+    write_outputs: bool = True,
+    odds_api_key: Optional[str] = None,
+    ODDS_API_KEY: Optional[str] = None,
+    **kwargs,
+) -> PipelineResult:
+    """
+    Main entry point used by run_model.py.
+
+    Parameters
+    ----------
+    season : int
+        Season tag you’re running against.
+    date : str | None
+        Optional date selector (not required).
+    target_date : str | None
+        Accepted but unused (compatibility with older run_model.py).
+    write_outputs : bool
+        Write outputs/props_priced.csv if True.
+    odds_api_key / ODDS_API_KEY : str | None
+        Odds API key (either spelling is accepted).
+    """
+    # Make the API key flexible
+    odds_key = odds_api_key or ODDS_API_KEY
+
+    # 1) Fetch props (or load inputs/props.csv if fetcher not available)
+    props_raw = _fetch_props(odds_key)
+    props_norm = _normalize_props(props_raw)
+
+    # 2) Merge external metrics (best-effort)
+    mets = _load_metrics()
+    feats_df, feats_src = _merge_features(props_norm, mets)
+
+    # 3) Apply rules + pricing
+    priced_df = _price_frame(feats_df)
+
+    # 4) Write outputs (optional)
     if write_outputs:
-        _write_csv_safe(priced, os.path.join(DIR_OUTPUTS, "props_priced.csv"))
+        _ensure_dir("outputs")
+        out_path = os.path.join("outputs", "props_priced.csv")
+        priced_df.to_csv(out_path, index=False)
 
-    return priced
+    return PipelineResult(priced=priced_df, features_source=feats_src, note="ok")
+
+
+# Convenience for ad-hoc runs
+if __name__ == "__main__":
+    res = run_pipeline(write_outputs=True)
+    print(f"Wrote {len(res.priced)} rows (features: {res.features_source})")
