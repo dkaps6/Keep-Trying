@@ -1,214 +1,226 @@
 # engine.py
+# Turn-key pipeline driver for pricing + rules + outputs
+# Robust to optional modules and signature changes.
+
 from __future__ import annotations
 
 import os
 import sys
-from typing import Tuple, List
+import math
+import importlib
+from typing import Dict, Tuple, Any, Optional
 
-import numpy as np
 import pandas as pd
 
-# Local modules
-from scripts.engine_helpers import make_team_last4_from_player_form
-from scripts.rules_engine import apply_rules as rules_apply  # your existing rules engine
-from scripts.model_core import price_props_for_events          # your pricing core (if different, adjust)
-from scripts.odds_api import fetch_game_lines, fetch_props_all_events
-from scripts.pricing import devig_american_prob               # if needed inside pricing core
-from scripts.features_external import merge_external_features  # optional; if you have it
 
-# --------------------------------------------------------------------------------------
-# Utility helpers
-# --------------------------------------------------------------------------------------
+# -----------------------------
+# Optional helpers / fallbacks
+# -----------------------------
+def _print(msg: str) -> None:
+    print(msg, flush=True)
 
-def _ensure_dir(path: str) -> None:
+
+def ensure_dir(path: str) -> None:
     if path and not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
 
 
-def safe_read_csv(path: str, **kw) -> pd.DataFrame:
-    try:
-        if not os.path.exists(path):
-            return pd.DataFrame()
-        return pd.read_csv(path, **kw)
-    except Exception as e:
-        print(f"⚠️  Failed to read {path}: {e}")
+# --- optional helpers (safe to miss) ---
+try:
+    from scripts.engine_helpers import (
+        make_team_last4_from_player_form,
+        safe_divide,
+    )
+except Exception:
+    def make_team_last4_from_player_form(_: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
-
-def _normalize_team_form(team_form: pd.DataFrame) -> pd.DataFrame:
-    """Normalize/patch external team features so downstream joins never fail."""
-    tf = team_form.copy()
-
-    # Standardize team column
-    if "team" not in tf.columns:
-        if "defteam" in tf.columns:
-            tf = tf.rename(columns={"defteam": "team"})
-        elif "posteam" in tf.columns:
-            tf = tf.rename(columns={"posteam": "team"})
-
-    if "team" not in tf.columns:
-        # give up but keep schema
-        tf["team"] = "UNK"
-
-    # Map proe_proxy -> proe if needed
-    if "proe" not in tf.columns and "proe_proxy" in tf.columns:
-        tf["proe"] = tf["proe_proxy"]
-    elif "proe" not in tf.columns:
-        tf["proe"] = 0.0
-
-    # Optional columns (coverage & box shares) — fill safe defaults
-    for col in ["man_rate_z", "zone_rate_z", "heavy_box_share", "light_box_share"]:
-        if col not in tf.columns:
-            tf[col] = 0.0
-
-    # Required numeric columns — if missing, create safe defaults
-    for col in ["pressure_rate", "pressure_z", "pass_epa_allowed", "pass_epa_z"]:
-        if col not in tf.columns:
-            tf[col] = 0.0
-
-    keep = ["team", "pressure_rate", "pressure_z",
-            "pass_epa_allowed", "pass_epa_z",
-            "proe", "man_rate_z", "zone_rate_z",
-            "heavy_box_share", "light_box_share"]
-    tf = tf[[c for c in keep if c in tf.columns]].drop_duplicates(subset=["team"])
-    return tf.reset_index(drop=True)
+    def safe_divide(a, b, default=0.0):
+        try:
+            return a / b if b else default
+        except Exception:
+            return default
 
 
+# --------------------------------
+# Odds API (required in our flow)
+# --------------------------------
+from scripts.odds_api import (
+    fetch_game_lines,
+    fetch_props_all_events,
+)
+
+# --------------------------------
+# Pricing core (required)
+# --------------------------------
+from scripts.model_core import price_props_for_events
+
+# --------------------------------
+# External features (optional)
+# --------------------------------
+try:
+    from scripts.features_external import merge_external_features
+    _HAS_MERGE_EXTERNAL = True
+except Exception:
+    _HAS_MERGE_EXTERNAL = False
+
+
+# --------------------------------
+# Rules engine – add compatibility
+# --------------------------------
+from scripts.rules_engine import apply_rules as _apply_rules
+
+def _apply_rules_compat(features: Dict[str, Any],
+                        side: str,
+                        mu: float,
+                        sigma: float) -> Tuple[float, float, str]:
+    """
+    Call scripts.rules_engine.apply_rules regardless of signature.
+    Supports:
+      - apply_rules(features) -> (mu, sigma, notes)
+      - apply_rules(side, mu, sigma, features) -> (mu, sigma, notes)
+      - apply_rules(side=..., mu=..., sigma=..., features=...) -> (mu, sigma, notes)
+    """
+    try:
+        return _apply_rules(features)  # new style
+    except TypeError:
+        try:
+            return _apply_rules(side, mu, sigma, features)  # old positional
+        except TypeError:
+            return _apply_rules(side=side, mu=mu, sigma=sigma, features=features)  # keyword
+
+
+# -------------------------------------------------
+# Utility: gentle downcast to keep CSV sizes small
+# -------------------------------------------------
 def _downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    for c in df.select_dtypes(include=["float64"]).columns:
-        df[c] = pd.to_numeric(df[c], downcast="float")
-    for c in df.select_dtypes(include=["int64"]).columns:
-        df[c] = pd.to_numeric(df[c], downcast="integer")
+    for col in df.columns:
+        if pd.api.types.is_float_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col], downcast="float")
+        elif pd.api.types.is_integer_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col], downcast="integer")
     return df
 
 
-# --------------------------------------------------------------------------------------
-# External features loader (resilient)
-# --------------------------------------------------------------------------------------
-
-def load_external_features(season: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+# -------------------------------------------------
+# Core pipeline
+# -------------------------------------------------
+def run_pipeline(target_date: str,
+                 season: int,
+                 out_dir: str = "outputs") -> None:
     """
-    Returns:
-      team_form (normalized),
-      player_form (raw),
-      id_map
+    End-to-end run:
+      1) Fetch game lines
+      2) Fetch all props/odds for events
+      3) Price with model_core
+      4) Merge external features (if available)
+      5) Apply elite rules (signature-agnostic)
+      6) Write CSV outputs
     """
-    team_form = safe_read_csv("metrics/team_form.csv")
-    if team_form.empty:
-        print("⚠️  team_form.csv is empty.")
-    else:
-        # display any missing optional columns
-        opt = ['heavy_box_share', 'light_box_share', 'man_rate_z', 'zone_rate_z', 'proe', 'proe_proxy']
-        missing = [c for c in opt if c not in team_form.columns]
-        if missing:
-            print(f"ℹ️  team_form.csv missing columns: {missing}")
-    team_form = _normalize_team_form(team_form)
+    # Log where we import this module from (helps in Actions logs)
+    _print(f"Loaded engine module from: {os.path.abspath(__file__)}")
 
-    player_form = safe_read_csv("metrics/player_form.csv")
-    if player_form.empty:
-        print("ℹ️  player_form.csv is empty.")
+    # Make dirs
+    ensure_dir(out_dir)
+    ensure_dir("metrics")
+    ensure_dir("inputs")
 
-    id_map = safe_read_csv("metrics/id_map.csv")
-    if id_map.empty:
-        print("ℹ️  id_map.csv is empty.")
+    # -------- external caches present? (informational) --------
+    team_form_path = os.path.join("metrics", "team_form.csv")
+    player_form_path = os.path.join("metrics", "player_form.csv")
+    id_map_path = os.path.join("metrics", "id_map.csv")
 
-    return team_form, player_form, id_map
+    # Fetch game lines
+    _print("Fetching game lines …")
+    game_df = fetch_game_lines()
+    if game_df is None or len(game_df) == 0:
+        _print("WARNING: game_df is empty – continuing but props may fail.")
 
+    # Fetch props for all events (Odds API)
+    _print("Fetching all props for events …")
+    props_df = fetch_props_all_events()
+    if props_df is None or len(props_df) == 0:
+        _print("WARNING: props_df is empty. Nothing to price.")
+        # Still write empty outputs to avoid failing downstream users
+        empty = pd.DataFrame()
+        empty.to_csv(os.path.join(out_dir, "props_priced.csv"), index=False)
+        return
 
-# --------------------------------------------------------------------------------------
-# Main pipeline
-# --------------------------------------------------------------------------------------
+    # Price with the model core
+    priced_df = price_props_for_events(props_df)
+    if priced_df is None or len(priced_df) == 0:
+        _print("WARNING: pricing produced no rows.")
+        priced_df = pd.DataFrame()
 
-def run_pipeline(target_date: str, season: int, out_dir: str = "outputs") -> None:
-    """
-    Full slate pipeline:
-      1) Fetch odds (games + props)
-      2) Load external features (team_form, player_form, id_map)
-      3) Build team aggregates from player form (resilient)
-      4) Merge features
-      5) Apply rules (elite rules engine)
-      6) Price props & write outputs
-    """
-    _ensure_dir(out_dir)
-
-    print(f"{season} done.")
-    print("Downcasting floats.")
-
-    # ----------------------------------------------------------------------------------
-    # 1) Fetch odds
-    # ----------------------------------------------------------------------------------
-    print("Fetching game lines …")
+    # Merge team/player external features (optional)
     try:
-        game_df = fetch_game_lines()
-    except Exception as e:
-        print(f"⚠️  fetch_game_lines() failed: {e}")
-        game_df = pd.DataFrame()
-
-    print("Fetching all props for events …")
-    try:
-        props_df = fetch_props_all_events()
-    except Exception as e:
-        print(f"⚠️  fetch_props_all_events() failed: {e}")
-        props_df = pd.DataFrame()
-
-    # ----------------------------------------------------------------------------------
-    # 2) External features
-    # ----------------------------------------------------------------------------------
-    team_form, player_form, id_map = load_external_features(season)
-
-    # ----------------------------------------------------------------------------------
-    # 3) Team aggregates from player_form (resilient)
-    # ----------------------------------------------------------------------------------
-    team_l4 = make_team_last4_from_player_form(player_form)
-
-    # ----------------------------------------------------------------------------------
-    # 4) Merge features (best-effort)
-    # ----------------------------------------------------------------------------------
-    # Example: if you have a helper to merge: merge_external_features()
-    # Otherwise, do light merges here.
-    try:
-        features = merge_external_features(game_df, team_form, team_l4, id_map)
-    except Exception as e:
-        print(f"ℹ️  merge_external_features unavailable or failed ({e}); using minimal features merge.")
-        # Minimal merge on team if possible
-        features = game_df.copy()
-        for side in ("home_team", "away_team"):
-            if side in features.columns and "team" in team_form.columns:
-                tf = team_form.add_prefix(f"{side}_")
-                features = features.merge(
-                    tf.rename(columns={f"{side}_team": side}),
-                    on=side, how="left"
-                )
-
-    # ----------------------------------------------------------------------------------
-    # 5) Apply elite rules (works on features/props)
-    # ----------------------------------------------------------------------------------
-    try:
-        mu, sigma, notes = rules_apply(features)  # Your rules_engine.apply_rules signature
-    except TypeError:
-        # Older signature fallback: rules_apply(features) -> (mu, sigma)
-        tmp = rules_apply(features)
-        if isinstance(tmp, tuple) and len(tmp) == 3:
-            mu, sigma, notes = tmp
+        if _HAS_MERGE_EXTERNAL:
+            priced_df = merge_external_features(priced_df)
         else:
-            mu, sigma = tmp
-            notes = pd.Series([""] * len(features))
-
-    # Attach model parameters
-    features["model_mu"] = mu
-    features["model_sigma"] = sigma
-    features["notes"] = notes
-
-    # ----------------------------------------------------------------------------------
-    # 6) Price props & write outputs
-    # ----------------------------------------------------------------------------------
-    try:
-        priced = price_props_for_events(features, props_df)
+            _print("merge_external_features unavailable or failed; using minimal features merge.")
     except Exception as e:
-        print(f"⚠️  price_props_for_events failed: {e}")
-        priced = pd.DataFrame()
+        _print(f"merge_external_features raised {type(e).__name__}: {e}; using minimal features merge.")
 
-    priced = _downcast_numeric(priced)
-    out_path = os.path.join(out_dir, "props_priced.csv")
-    priced.to_csv(out_path, index=False)
-    print(f"✅ Wrote {out_path} with {len(priced)} rows.")
+    # Info messages (to mirror your previous logs)
+    if not os.path.exists(team_form_path) or os.path.getsize(team_form_path) == 0:
+        _print("🛈  team_form.csv is empty.")
+    if not os.path.exists(player_form_path) or os.path.getsize(player_form_path) == 0:
+        _print("🛈  player_form.csv is empty.")
+    if not os.path.exists(id_map_path) or os.path.getsize(id_map_path) == 0:
+        _print("🛈  id_map.csv is empty.")
+
+    # Apply rules per row with signature-compatible wrapper
+    if len(priced_df) > 0:
+        _print("Applying elite rules …")
+        adj_mu = []
+        adj_sigma = []
+        notes = []
+
+        # Build features dict per row; keep whatever columns exist
+        feature_like_cols = set(priced_df.columns)
+
+        for _, row in priced_df.iterrows():
+            base_mu = float(row.get("mu", 0.0))
+            base_sigma = float(row.get("sigma", 0.0))
+            side = row.get("side", row.get("bet_side", "over"))
+
+            # You can curate which keys to send; for now send everything
+            fdict = {k: row[k] for k in feature_like_cols if k in row}
+
+            # Also include canonical fields
+            fdict.update({
+                "mu": base_mu,
+                "sigma": base_sigma,
+                "side": side,
+            })
+
+            mu1, sig1, note = _apply_rules_compat(fdict, side, base_mu, base_sigma)
+            adj_mu.append(mu1)
+            adj_sigma.append(sig1)
+            notes.append(note)
+
+        priced_df["mu"] = adj_mu
+        priced_df["sigma"] = adj_sigma
+        priced_df["rules_notes"] = notes
+
+    # Final housekeeping
+    _print("Downcasting floats.")
+    priced_df = _downcast_numeric(priced_df)
+
+    # Write outputs
+    ensure_dir(out_dir)
+    priced_path = os.path.join(out_dir, "props_priced.csv")
+    priced_df.to_csv(priced_path, index=False)
+    _print(f"Wrote {len(priced_df)} rows to {priced_path}")
+
+
+# -------------------------------------------------
+# Dev entry (local runs)
+# -------------------------------------------------
+if __name__ == "__main__":
+    # Defaults for quick local testing:
+    # python engine.py 2025-10-04 2025 outputs
+    date_arg = sys.argv[1] if len(sys.argv) > 1 else "today"
+    season_arg = int(sys.argv[2]) if len(sys.argv) > 2 else 2025
+    out_arg = sys.argv[3] if len(sys.argv) > 3 else "outputs"
+    run_pipeline(target_date=date_arg, season=season_arg, out_dir=out_arg)
