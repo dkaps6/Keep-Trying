@@ -72,34 +72,54 @@ def _load_id_map() -> pd.DataFrame:
     df = _maybe_csv("data/id_map.csv")
     if not df.empty:
         # normalize headers
-        cols = {c.lower(): c for c in df.columns}
-        # prefer canonical names
         ren = {}
-        for k in ["player_name","team","position","role"]:
-            if k in df.columns: ren[k] = k
-            else:
-                # try to find case-insensitive match
-                for c in df.columns:
-                    if c.lower() == k: ren[c] = k
+        for want in ["player_name","team","position","role"]:
+            for c in df.columns:
+                if c.lower() == want:
+                    ren[c] = want
         df = df.rename(columns=ren)
     return df
 
 def _load_injuries() -> pd.DataFrame:
     df = _maybe_csv("data/injuries.csv")
     if not df.empty:
-        df["status"] = df["status"].str.strip().str.title()
+        df["status"] = df["status"].astype(str).str.strip().str.title()
     return df
 
 def _load_roles() -> pd.DataFrame:
     df = _maybe_csv("data/roles.csv")
     if not df.empty:
-        df["role"] = df["role"].str.upper()
+        df["role"] = df["role"].astype(str).str.upper()
     return df
 
 def _load_coverage() -> pd.DataFrame:
     df = _maybe_csv("data/coverage.csv")
     if not df.empty:
-        df["tag"] = df["tag"].str.lower()
+        df["tag"] = df["tag"].astype(str).lower()
+    return df
+
+# NEW: CB assignment loader
+def _load_cb_assignments() -> pd.DataFrame:
+    df = _maybe_csv("data/cb_assignments.csv")
+    if df.empty: return df
+    # normalize headers
+    ren = {}
+    for want in ["defense_team","receiver","cb","quality","penalty"]:
+        for c in df.columns:
+            if c.lower() == want:
+                ren[c] = want
+    df = df.rename(columns=ren)
+    # canonical columns
+    if "penalty" not in df.columns: df["penalty"] = np.nan
+    if "quality" not in df.columns:  df["quality"]  = ""
+    # backfill penalty from quality when missing
+    qual_map = {"elite":0.08, "good":0.05, "avg":0.03}
+    df["penalty"] = df["penalty"].astype(float)
+    df.loc[df["penalty"].isna(), "penalty"] = df["quality"].astype(str).str.lower().map(qual_map)
+    # left-join key aliases
+    df = df.rename(columns={"defense_team":"opp_team","receiver":"player"})
+    # clip sanity
+    df["penalty"] = df["penalty"].fillna(0.06).clip(0.0, 0.25)
     return df
 
 def _load_calibration() -> Dict[str, Dict[str, float]]:
@@ -117,7 +137,6 @@ def qb_pressure_multiplier(opp_pressure_z: float, opp_pass_epa_z: float) -> floa
     return float(np.clip(m, 0.70, 1.10))
 
 def sack_to_attempt_multiplier(opp_sack_rate_z: float) -> float:
-    # assume z ~ 1.0 ≈ "above avg"
     above = max(0.0, (opp_sack_rate_z or 0.0))
     m = 1.0 - 0.15*above
     return float(np.clip(m, 0.80, 1.05))
@@ -157,40 +176,41 @@ def volatility_widening_factor(opp_pressure_z: float, qb_inconsistent: bool) -> 
     if qb_inconsistent: bump += 0.10
     return 1.0 + min(0.25, bump)
 
-# NEW: (4) Alpha-WR injury elasticity & redistribution (light-weight)
+# (4) Alpha-WR injury elasticity
 def injury_multiplier(status: str, role: str, market_key: str) -> float:
     if not status: return 1.0
-    s = status.lower()
-    # focus on WR receiving volume/efficiency
+    s = str(status).lower()
     if role in {"WR1","WR2","SLOT","TE"} and market_key in {"receptions","rec_yards","rush_rec_yards"}:
-        if s in {"out","doubtful"}:      return 0.78   # big cap
-        if s in {"questionable","limited"}: return 0.90
-        if s in {"probable"}:            return 0.97
+        if s in {"out","doubtful"}:          return 0.78
+        if s in {"questionable","limited"}:  return 0.90
+        if s in {"probable"}:                return 0.97
     return 1.0
 
-# NEW: (5) CB shadow / coverage boosts
+# (5) Generic coverage tags
 def coverage_multiplier(tags: set[str], role: str, market_key: str) -> float:
     if not tags: return 1.0
     t = set([x.lower() for x in tags])
     if ("top_shadow" in t or "heavy_man" in t) and role in {"WR1"} and market_key in {"receptions","rec_yards"}:
-        return 0.92  # -8% share/eff
+        return 0.92
     if "heavy_zone" in t and role in {"SLOT","TE"} and market_key in {"receptions","rec_yards"}:
-        return 1.05  # +5% vs zone
+        return 1.05
     return 1.0
 
-# NEW: (6) Air-yards sanity check (cap WR1 YPR if scheme is shallow)
+# (6) Air-yards sanity cap
 def air_yards_sanity_cap(role: str, market_key: str, ay_per_att_z: float) -> float:
-    if role == "WR1" and market_key in {"rec_yards"} and (ay_per_att_z or 0.0) <= -0.84:  # ~20th pct
+    if role == "WR1" and market_key in {"rec_yards"} and (ay_per_att_z or 0.0) <= -0.84:
         return 0.80
+    return 1.0
+
+# NEW: CB assignment multiplier (player-specific)
+def cb_assignment_multiplier(cb_penalty: float, market_key: str) -> float:
+    if pd.isna(cb_penalty): return 1.0
+    if market_key in {"receptions","rec_yards"}:
+        return float(1.0 - np.clip(cb_penalty, 0.0, 0.25))
     return 1.0
 
 # ---------- Main pricing ----------
 def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
-    """
-    Input from normalize(): player, market_key, line, price_over, price_under, book, event_id, home_team, away_team, commence_time
-    Optionally present from engine() merge: player_id, team
-    Uses optional context: outputs/game_lines.csv, metrics/team_form.csv, data/injuries.csv, data/roles.csv, data/coverage.csv, metrics/calibration.json
-    """
     df = df_in.copy()
 
     # implied & devigged market probs
@@ -199,14 +219,15 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
     df["p_over_fair_market"] = np.vectorize(devig_two_way)(df["p_over_imp"], df["p_under_imp"])
     df["p_over_fair_market"] = df["p_over_fair_market"].fillna(df["p_over_imp"])
 
-    # ---- Join ID map (team/position/role) if not already present ----
+    # ---- Join ID map (team/position/role) if needed ----
     if "team" not in df.columns or "role" not in df.columns or "position" not in df.columns:
         idm = _load_id_map()
         if not idm.empty:
             idm = idm.rename(columns={"player_name":"player"})
-            df = df.merge(idm[["player","team"] + [c for c in ["position","role"] if c in idm.columns]], on="player", how="left")
+            cols = ["player","team"] + [c for c in ["position","role"] if c in idm.columns]
+            df = df.merge(idm[cols], on="player", how="left")
 
-    # ---- Join roles override (if provided) ----
+    # ---- Roles override (optional) ----
     roles = _load_roles()
     if not roles.empty:
         roles = roles.rename(columns={"player":"player","team":"team","role":"role"})
@@ -214,7 +235,7 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
         df["role"] = df["role_role2"].combine_first(df["role"])
         df.drop(columns=[c for c in df.columns if c.endswith("_role2")], inplace=True)
 
-    # ---- Win probabilities (script escalators) ----
+    # ---- Win probabilities ----
     gl = _load_game_lines()
     if not gl.empty:
         gl_small = gl[["event_id","home_team","away_team","home_wp","away_wp"]].drop_duplicates("event_id")
@@ -228,18 +249,15 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
     else:
         df["win_prob"] = np.nan
 
-    # ---- Team metrics (pressure/funnels/boxes/pace & air-yards) ----
+    # ---- Team metrics ----
     tm = _load_team_metrics()
     if not tm.empty:
-        # attach opponent
         def _opp(row):
             if pd.isna(row.get("team")): return None
             if row["team"] == row["home_team"]: return row["away_team"]
             if row["team"] == row["away_team"]: return row["home_team"]
             return None
         df["opp_team"] = df.apply(_opp, axis=1)
-
-        # merge def metrics on opponent
         keep = ["team","def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z",
                 "light_box_rate_z","heavy_box_rate_z","def_sack_rate_z","ay_per_att_z"]
         tm2 = tm.rename(columns={"team":"opp_team"})
@@ -250,7 +268,7 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
         for c in ["def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z","light_box_rate_z","heavy_box_rate_z","def_sack_rate_z","ay_per_att_z"]:
             df[c] = np.nan
 
-    # ---- Injuries (alpha WR elasticity) ----
+    # ---- Injuries ----
     inj = _load_injuries()
     if not inj.empty:
         inj = inj.rename(columns={"player":"inj_player","team":"inj_team","status":"inj_status"})
@@ -258,7 +276,7 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
     else:
         df["inj_status"] = np.nan
 
-    # ---- Coverage tags (CB shadow / man / zone) per opponent defense ----
+    # ---- Coverage tags (generic) ----
     cov = _load_coverage()
     if not cov.empty:
         cov = cov.rename(columns={"defense_team":"opp_team"})
@@ -268,7 +286,16 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
     else:
         df["tag"] = [set()]*len(df)
 
-    # --- Baseline μ so that P(X>line)=p for Normal(μ,σ) ---
+    # ---- CB assignments (player-specific) ----
+    cb = _load_cb_assignments()
+    if not cb.empty:
+        df = df.merge(cb[["opp_team","player","cb","penalty"]], on=["opp_team","player"], how="left")
+        df.rename(columns={"penalty":"cb_penalty","cb":"cb_name"}, inplace=True)
+    else:
+        df["cb_penalty"] = np.nan
+        df["cb_name"] = np.nan
+
+    # --- Baseline μ so that P(X>line)=p ---
     def base_mu(row) -> float:
         mk = row["market_key"]
         sd = SD_DEFAULTS.get(mk, 25.0)
@@ -290,15 +317,18 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
         m_script = script_escalator(row.get("win_prob"), mk)
         m_pace   = pace_smoothing_multiplier(row.get("pace_z"), row.get("pace_z"))
 
-        # NEW: injuries / coverage / air-yards sanity
+        # injuries / coverage / AY sanity
         m_inj    = injury_multiplier(row.get("inj_status"), role, mk)
-        m_cov    = coverage_multiplier(row.get("tag"), role, mk)
+
+        # CB assignment (player-specific) — overrides generic coverage if present
+        m_cb     = cb_assignment_multiplier(row.get("cb_penalty"), mk)
+        m_cov    = 1.0 if not pd.isna(row.get("cb_penalty")) else coverage_multiplier(row.get("tag"), role, mk)
+
         m_aycap  = air_yards_sanity_cap(role, mk, row.get("ay_per_att_z"))
 
-        # Volatility widening
         sd_mult  = volatility_widening_factor(row.get("def_pressure_rate_z"), qb_inconsistent=False)
 
-        mu_mult = m_qb * m_sack * m_funnel * m_box * m_script * m_pace * m_inj * m_cov * m_aycap
+        mu_mult = m_qb * m_sack * m_funnel * m_box * m_script * m_pace * m_inj * m_cov * m_cb * m_aycap
         return mu_mult, sd_mult
 
     mu_mults, sd_mults = zip(*df.apply(row_multipliers, axis=1))
@@ -312,8 +342,8 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
         return 1.0 - norm_cdf((L - mu) / sd)
     df["p_over_model"] = df.apply(p_model_over, axis=1)
 
-    # --- Calibration shrinkage (rule 12) ---
-    cal = _load_calibration()  # e.g. {"pass_yards":{"shrink":0.90}, "receptions":{"shrink":0.95}}
+    # --- Calibration shrinkage (optional) ---
+    cal = _load_calibration()
     if cal:
         def _shrink(row):
             s = cal.get(row["market_key"], {}).get("shrink")
@@ -334,7 +364,7 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
         "player","team","role","market_key","line","book","event_id","home_team","away_team","commence_time",
         "price_over","price_under","p_over_imp","p_under_imp","p_over_fair_market",
         "p_over_model","p_over_blend","fair_over_odds","edge_pct","model_mean","model_sd",
-        "win_prob","def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z","inj_status"
+        "win_prob","def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z","inj_status","cb_name","cb_penalty"
     ]
     out = df[keep].copy()
 
