@@ -1,28 +1,48 @@
 # scripts/calibration.py
-import json, os
+from __future__ import annotations
+import json
+from pathlib import Path
+import pandas as pd
 import numpy as np
 
-CAL_PATH = "metrics/calibration.json"
+"""
+Usage:
+  python -m scripts.calibration --postgame metrics/postgame.csv
 
-def load_cal():
-    if os.path.exists(CAL_PATH):
-        with open(CAL_PATH,"r") as f: return json.load(f)
-    return {}
+postgame.csv expected columns (minimal):
+  player, market_key, line, result_value
+  # You can compute hit/miss yourself or provide result_value (stat achieved)
 
-def save_cal(obj):
-    os.makedirs("metrics", exist_ok=True)
-    with open(CAL_PATH,"w") as f: json.dump(obj, f, indent=2)
+This script computes per-market bias and writes metrics/calibration.json with a simple shrink parameter.
+"""
 
-def apply_shrinkage(market: str, mu: float):
-    cal = load_cal()
-    alpha = float(cal.get(market, 1.0))
-    return 0.9 * mu + 0.1 * alpha * mu
+def compute_shrink(df: pd.DataFrame) -> dict:
+    out = {}
+    for mk, g in df.groupby("market_key"):
+        # crude bias: compare share of results > line
+        if "hit" in g.columns:
+            over_rate = g["hit"].mean()
+        elif "result_value" in g.columns:
+            over_rate = (g["result_value"] > g["line"]).mean()
+        else:
+            continue
+        # target is 0.5; if model tends to overpredict overs, shrink more toward market
+        # map |over_rate-0.5| ∈ [0,0.2] → shrink ∈ [1.0, 0.85]
+        delta = abs(over_rate - 0.5)
+        shrink = max(0.85, 1.0 - delta)  # simple rule
+        out[mk] = {"shrink": round(float(shrink), 3)}
+    return out
 
-def update_after_week(market: str, model_mean: float, actual: float):
-    cal = load_cal()
-    alpha = float(cal.get(market, 1.0))
-    err = actual - model_mean
-    alpha *= (0.99 if err < 0 else 1.01)  # shrink if overshoot
-    cal[market] = float(np.clip(alpha, 0.85, 1.15))
-    save_cal(cal)
+def main(postgame_path: str):
+    df = pd.read_csv(postgame_path)
+    cal = compute_shrink(df)
+    Path("metrics").mkdir(exist_ok=True)
+    Path("metrics/calibration.json").write_text(json.dumps(cal, indent=2))
+    print("wrote metrics/calibration.json:", cal)
 
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--postgame", required=True)
+    args = p.parse_args()
+    main(args.postgame)
