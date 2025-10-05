@@ -1,116 +1,164 @@
 # scripts/odds_api.py
 from __future__ import annotations
 import os, time, requests, pandas as pd
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-BASE = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
+BASE = "https://api.the-odds-api.com/v4"
+SPORT = "americanfootball_nfl"
 
-# Map The Odds API market keys -> your unified market names
-MARKET_MAP = {
-    "player_receiving_yards": "receiving_yards",
-    "player_receptions": "receptions",
-    "player_rushing_yards": "rushing_yards",
-    "player_rushing_attempts": "rushing_attempts",
-    "player_passing_yards": "passing_yards",
-    "player_passing_tds": "passing_tds",
-    "player_rush_receive_yards": "rush_rec_yards",
-    "player_anytime_td": "anytime_td",
-}
+HEADERS = {"User-Agent": "keep-trying/props-pipeline (+github) python-requests"}
 
-DEFAULT_MARKETS = list(MARKET_MAP.keys())
-DEFAULT_BOOKS = ["draftkings","fanduel","betmgm","caesars","pointsbetus"]
+# ✅ Valid NFL player-prop market keys (docs list)
+# See: https://the-odds-api.com/sports-odds-data/betting-markets.html
+NFL_PROP_MARKETS = [
+    "player_pass_yds",
+    "player_pass_tds",
+    "player_rush_yds",
+    "player_rush_attempts",
+    "player_reception_yds",
+    "player_receptions",
+    "player_rush_reception_yds",
+    "player_anytime_td",
+]
 
-def _req(url: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    r = requests.get(url, params=params, timeout=30)
+# Reasonable US books; adjust if you prefer regions="us" instead
+DEFAULT_BOOKMAKERS = ["draftkings", "fanduel", "betmgm", "caesars", "pointsbetus"]
+
+def _req(url: str, params: Dict[str, Any]) -> Any:
+    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
     if r.status_code == 429:
-        raise RuntimeError("Rate limited by The Odds API (429).")
+        # gentle backoff to be polite; caller may retry
+        time.sleep(1.0)
     r.raise_for_status()
     return r.json()
 
-def _extract_event_rows(ev: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _get_api_key() -> str:
+    key = os.environ.get("ODDS_API_KEY", "")
+    if not key:
+        print("[odds_api] No ODDS_API_KEY set; returning empty props.")
+    return key
+
+def _list_events(api_key: str) -> List[Dict[str, Any]]:
+    """
+    Use the featured-odds endpoint with a single featured market (h2h)
+    to obtain the list of event ids without pulling huge payloads.
+    """
+    url = f"{BASE}/sports/{SPORT}/odds"
+    params = {
+        "apiKey": api_key,
+        "markets": "h2h",
+        "regions": "us",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+    try:
+        data = _req(url, params)
+        if not isinstance(data, list):
+            return []
+        return data
+    except requests.HTTPError as e:
+        print(f"[odds_api] events list failed: {e}")
+        return []
+
+def _event_props(api_key: str, event_id: str, bookmakers: List[str]) -> List[Dict[str, Any]]:
+    """
+    Pull player props for a single event using the event-odds endpoint.
+    This is REQUIRED for props; /odds only supports featured markets.
+    """
+    url = f"{BASE}/sports/{SPORT}/events/{event_id}/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": "us",                # can also use bookmakers= to filter
+        "bookmakers": ",".join(bookmakers),
+        "markets": ",".join(NFL_PROP_MARKETS),
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+    try:
+        j = _req(url, params)
+    except requests.HTTPError as e:
+        # common cause of 422 here is a bad market key; our list uses doc keys
+        print(f"[odds_api] event {event_id} props failed: {e}")
+        return []
     rows: List[Dict[str, Any]] = []
-    eid = ev.get("id")
-    home, away = ev.get("home_team"), ev.get("away_team")
-    commence = ev.get("commence_time")
-    for bm in ev.get("bookmakers", []):
+    for bm in j.get("bookmakers", []):
         book = bm.get("key")
         for mkt in bm.get("markets", []):
             mkey = mkt.get("key")
-            u_market = MARKET_MAP.get(mkey)
-            if not u_market:  # skip markets we don't support
+            if mkey not in NFL_PROP_MARKETS:
                 continue
             for oc in mkt.get("outcomes", []):
-                # For player props, outcomes usually have: name (player), description (Over/Under/Yes/No), price (American), point (line)
                 player = oc.get("name")
-                side = (oc.get("description") or "").lower()
-                line = oc.get("point")
-                price = oc.get("price")
+                desc = (oc.get("description") or "").lower()  # "over" | "under" | "yes" | "no"
+                line  = oc.get("point")
+                price = oc.get("price")  # American odds
                 if player is None or line is None or price is None:
                     continue
-                # keep Over/Yes rows as anchors for pricing Over probabilities
-                if side not in ("over", "yes", ""):
+                # keep Over/Yes legs as our "Over" anchor (your model prices Over prob)
+                if desc not in ("over", "yes", ""):
                     continue
                 rows.append({
-                    "event_id": eid,
-                    "home_team": home,
-                    "away_team": away,
-                    "commence_time": commence,
+                    "event_id": j.get("id"),
+                    "home_team": j.get("home_team"),
+                    "away_team": j.get("away_team"),
+                    "commence_time": j.get("commence_time"),
                     "book": book,
-                    "market_key": mkey,
-                    "market": u_market,
+                    "market": mkey,        # keep doc key; engine maps/can display as-is
                     "player": player,
-                    "line": line,
-                    "price": price,  # American odds
+                    "line": float(line),
+                    "price": float(price),
                 })
     return rows
 
-def fetch_props(*, date: str = "today", season: str = "2025",
-                markets: List[str] = DEFAULT_MARKETS,
-                books: List[str] = DEFAULT_BOOKS,
-                regions: str = "us") -> pd.DataFrame:
+def fetch_props(date: str = "today", season: str = "2025",
+                bookmakers: List[str] = DEFAULT_BOOKMAKERS) -> pd.DataFrame:
     """
     Returns a normalized DataFrame:
       [player, market, line, price, book, event_id, home_team, away_team, commence_time]
     """
-    api_key = os.environ.get("ODDS_API_KEY", "")
+    api_key = _get_api_key()
     if not api_key:
-        print("[odds_api] No ODDS_API_KEY set; returning empty.")
         return pd.DataFrame()
 
-    params = {
-        "apiKey": api_key,
-        "regions": regions,
-        "markets": ",".join(markets),
-        "oddsFormat": "american",
-        "dateFormat": "iso",
-        # Optional: "commenceTimeFrom": "...", "commenceTimeTo": "..."
-    }
-
-    try:
-        data = _req(BASE, params)
-    except Exception as e:
-        print(f"[odds_api] request failed: {e}")
+    events = _list_events(api_key)
+    if not events:
+        print("[odds_api] 0 events listed; returning empty props.")
         return pd.DataFrame()
 
     all_rows: List[Dict[str, Any]] = []
-    for ev in data:
-        all_rows.extend(_extract_event_rows(ev))
+    for ev in events:
+        eid = ev.get("id")
+        if not eid:
+            continue
+        # Optional: basic date windowing could be added here by checking ev["commence_time"]
+        rows = _event_props(api_key, eid, bookmakers)
+        if rows:
+            all_rows.extend(rows)
+        time.sleep(0.15)  # small pause to be a good citizen
 
     df = pd.DataFrame(all_rows)
     if df.empty:
-        print("[odds_api] 0 player-prop rows returned (check plan/markets/books/regions).")
+        print("[odds_api] 0 player-prop rows returned across all events.")
         return df
 
-    # Normalize columns for your engine
+    # Normalize to the columns your engine expects
     keep = ["player","market","line","price","book","event_id","home_team","away_team","commence_time"]
     for k in keep:
         if k not in df.columns:
             df[k] = None
     df = df[keep].copy()
+
+    # Debug snapshot so you can inspect the raw pull
+    try:
+        Path("outputs").mkdir(parents=True, exist_ok=True)
+        df.to_csv("outputs/props_raw.csv", index=False)
+    except Exception:
+        pass
+
+    print(f"[odds_api] assembled {len(df)} player-prop rows from {len(events)} events")
     return df
 
-# Backwards-compat names the engine will look for
+# Backwards-compat names used by fetch_all
 get_props = fetch_props
 build_props_frame = fetch_props
 load_props = fetch_props
-
