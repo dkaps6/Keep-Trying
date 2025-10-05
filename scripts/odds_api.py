@@ -16,7 +16,7 @@ HEADERS = {"User-Agent": "keep-trying/props-pipeline python-requests"}
 # ------- FULL SLATE DEFAULTS (override via env in workflow) -------------------
 EVENT_WINDOW_HOURS = int(os.environ.get("ODDS_API_EVENT_WINDOW_HOURS", "168"))  # 7 days
 MAX_EVENTS = int(os.environ.get("ODDS_API_MAX_EVENTS", "40"))                   # hard cap
-REGIONS = os.environ.get("ODDS_API_REGIONS", "us")                              # default to US only
+REGIONS = os.environ.get("ODDS_API_REGIONS", "us")                              # default US
 BOOKMAKERS = os.environ.get("ODDS_API_BOOKMAKERS", "").strip()                  # e.g. "draftkings,fanduel,betmgm,caesars,pointsbetus"
 # -----------------------------------------------------------------------------
 
@@ -26,14 +26,14 @@ CORE_MARKETS: List[str] = [
     "player_receptions", "player_reception_yds",
     "player_rush_reception_yds", "player_anytime_td",
 ]
-_POS_DESCS = {"over", "yes", ""}
+
+ANCHOR_OK = {"over", "yes"}               # keep only these sides
+DISCARD_SIDES = {"under", "no"}           # ignore these sides to avoid duplication
 
 def _key() -> str:
     k = os.environ.get("ODDS_API_KEY", "")
-    if not k:
-        print("[odds_api] ODDS_API_KEY missing")
-    else:
-        print(f"[odds_api] using key suffix ...{k[-4:]}")
+    if not k: print("[odds_api] ODDS_API_KEY missing")
+    else:     print(f"[odds_api] using key suffix ...{k[-4:]}")
     return k
 
 def _get(url: str, params: Dict[str, Any]) -> Any:
@@ -54,7 +54,8 @@ def _get(url: str, params: Dict[str, Any]) -> Any:
 def _list_events(key: str) -> List[Dict[str, Any]]:
     url = f"{BASE}/sports/{SPORT}/odds"
     params = dict(apiKey=key, markets="h2h", regions=REGIONS, oddsFormat="american", dateFormat="iso")
-    return _get(url, params) or []
+    data = _get(url, params)
+    return data if isinstance(data, list) else []
 
 def _parse_iso(ts: str):
     try:
@@ -83,21 +84,61 @@ def _event_props(key: str, event_id: str, markets: Iterable[str]) -> Dict[str, A
         dateFormat="iso",
     )
     if BOOKMAKERS:
-        params["bookmakers"] = BOOKMAKERS  # limit credits + ensure known books
+        params["bookmakers"] = BOOKMAKERS  # limit books (credit control + known coverage)
     return _get(url, params)
 
 def _rows_from_event_json(j: Dict[str, Any], allowed: Set[str]) -> List[Dict[str, Any]]:
+    """
+    Robust outcome parsing:
+      - Accept Over/Yes if it appears in *either* `name` or `description`.
+      - Map player name from whichever field is NOT Over/Under/Yes/No.
+      - Allow missing `point` for binary (anytime TD) → use 0.0.
+    """
     rows: List[Dict[str, Any]] = []
     for bm in j.get("bookmakers", []):
         book = bm.get("key")
         for mkt in bm.get("markets", []):
             mkey = mkt.get("key")
-            if mkey not in allowed: continue
+            if mkey not in allowed: 
+                continue
             for oc in mkt.get("outcomes", []):
-                desc = (oc.get("description") or "").lower()
-                if desc not in _POS_DESCS: continue
-                player = oc.get("name"); line = oc.get("point"); price = oc.get("price")
-                if player is None or line is None or price is None: continue
+                raw_name = (oc.get("name") or "").strip()
+                raw_desc = (oc.get("description") or "").strip()
+
+                lower = {raw_name.lower(), raw_desc.lower()}
+                # skip the opposite side to avoid duplicates
+                if lower & DISCARD_SIDES:
+                    continue
+                # require our anchor on either field
+                if not (lower & ANCHOR_OK):
+                    continue
+
+                # choose the player label from the non-anchor field
+                if raw_name.lower() in ANCHOR_OK | DISCARD_SIDES:
+                    player = raw_desc
+                elif raw_desc.lower() in ANCHOR_OK | DISCARD_SIDES:
+                    player = raw_name
+                else:
+                    # if neither field is an obvious side, prefer `name`
+                    player = raw_name or raw_desc
+
+                if not player:
+                    continue  # cannot label this outcome
+
+                price = oc.get("price", None)
+                line  = oc.get("point", None)
+                if line is None:
+                    # allow binary markets like anytime TD which have no 'point'
+                    line = 0.0
+                try:
+                    line = float(line)
+                except Exception:
+                    continue
+                try:
+                    price = float(price)
+                except Exception:
+                    continue
+
                 rows.append({
                     "event_id": j.get("id"),
                     "home_team": j.get("home_team"),
@@ -106,8 +147,8 @@ def _rows_from_event_json(j: Dict[str, Any], allowed: Set[str]) -> List[Dict[str
                     "book": book,
                     "market": mkey,
                     "player": player,
-                    "line": float(line),
-                    "price": float(price),
+                    "line": line,
+                    "price": price,
                 })
     return rows
 
@@ -121,9 +162,10 @@ def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
     evs_all = _list_events(key)
     evs = _filter_window(evs_all)
     if not evs:
-        print("[odds_api] no events within window"); return pd.DataFrame()
+        print("[odds_api] no events within window"); 
+        return pd.DataFrame()
 
-    # 2) discovery on first event
+    # 2) discovery on first event (single call)
     first_id = evs[0].get("id")
     j0 = _event_props(key, first_id, CORE_MARKETS)
     (DBG / f"event_{first_id}_discovery.json").write_text(json.dumps(j0, indent=2))
@@ -134,19 +176,21 @@ def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
         print("[odds_api] discovery returned no usable prop markets for this plan/region")
         return pd.DataFrame()
 
-    # 3) fetch loop (also dump first few raw payloads for inspection)
+    # 3) fetch loop (save first 3 payloads for inspection)
     all_rows: List[Dict[str, Any]] = []
     for idx, ev in enumerate(evs, start=1):
-        eid = ev.get("id"); 
-        if not eid: continue
+        eid = ev.get("id")
+        if not eid: 
+            continue
         jj = _event_props(key, eid, sorted(discovered))
-        # debug: save first 3 events raw
         if idx <= 3:
             (DBG / f"event_{eid}.json").write_text(json.dumps(jj, indent=2))
+
         bm_ct = len(jj.get("bookmakers", []))
-        m_ct = sum(len(bm.get("markets", [])) for bm in jj.get("bookmakers", []))
-        o_ct = sum(len(m.get("outcomes", [])) for bm in jj.get("bookmakers", []) for m in bm.get("markets", []))
+        m_ct  = sum(len(bm.get("markets", [])) for bm in jj.get("bookmakers", []))
+        o_ct  = sum(len(m.get("outcomes", [])) for bm in jj.get("bookmakers", []) for m in bm.get("markets", []))
         print(f"[odds_api] event {idx}/{len(evs)} {eid}: bookmakers={bm_ct} markets={m_ct} outcomes={o_ct}")
+
         rows = _rows_from_event_json(jj, discovered)
         all_rows.extend(rows)
         time.sleep(0.15)
@@ -167,3 +211,4 @@ def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
     return df
 
 get_props = build_props_frame = load_props = fetch_props
+
