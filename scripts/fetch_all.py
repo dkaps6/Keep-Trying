@@ -1,9 +1,9 @@
 # scripts/fetch_all.py
-# Free-data builder with robust fallbacks:
+# Free-data builder with robust fallbacks + stadium weather inference:
 # - Team + team-week context from nfl_data_py play-by-play
 # - Player usage (targets / rush share) derived from PBP
-# - ID map from nfl_data_py rosters; if empty → ESPN roster API fallback
-# - Optional PFR scraping is disabled (kept as comment)
+# - ID map from nfl_data_py rosters; if empty → ESPN roster API fallback (with espn_player_id)
+# - Stadium-based weather inference (uses inputs/stadiums.csv)
 # - Writes metrics/fetch_status.json with rowcounts + providers
 
 from __future__ import annotations
@@ -49,6 +49,19 @@ def _up(status: Dict[str, Any], name: str, rows: int, provider: str):
 
 def _empty_df(cols: List[str]) -> pd.DataFrame:
     return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+
+def _read_csv_safe(path: str, cols: List[str] | None = None) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return _empty_df(cols or [])
+    try:
+        df = pd.read_csv(path)
+        if cols:
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = pd.NA
+        return df
+    except Exception:
+        return _empty_df(cols or [])
 
 # ---------- nflverse: PBP + builders -----------------------------------------
 
@@ -160,21 +173,22 @@ def _build_player_form(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
 
 def _id_map_from_nflverse(season: int) -> Tuple[pd.DataFrame, str]:
     if nfl is None:
-        return _empty_df(["player","team","position"]), "nflverse:not_installed"
+        return _empty_df(["player","team","position","espn_player_id"]), "nflverse:not_installed"
     try:
         rost = nfl.import_rosters([season])
         if rost.empty:
-            return _empty_df(["player","team","position"]), "nflverse:empty"
+            return _empty_df(["player","team","position","espn_player_id"]), "nflverse:empty"
         df = rost.rename(columns={
             "recent_team": "team",
             "player_name": "player",
-            "position": "position"
-        })[["player","team","position"]].dropna(subset=["player","team"])
+            "position": "position",
+            "espn_id": "espn_player_id",
+        })[["player","team","position","espn_player_id"]].dropna(subset=["player","team"])
         return df.drop_duplicates(), "nflverse"
     except Exception:
-        return _empty_df(["player","team","position"]), "nflverse:error"
+        return _empty_df(["player","team","position","espn_player_id"]), "nflverse:error"
 
-# ---------- ESPN roster fallback ---------------------------------------------
+# ---------- ESPN roster fallback (with espn_player_id) ------------------------
 
 _ESPN_TEAMS = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
 _ESPN_TEAM_ROSTER = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{tid}?enable=roster"
@@ -185,7 +199,6 @@ def _req_json(url: str, tries: int = 3, timeout: int = 20) -> Dict[str, Any] | N
             r = requests.get(url, timeout=timeout)
             if r.status_code == 200:
                 return r.json()
-            # backoff on throttling
             if r.status_code in (429, 503):
                 time.sleep(1.5 * (i + 1))
             else:
@@ -195,20 +208,18 @@ def _req_json(url: str, tries: int = 3, timeout: int = 20) -> Dict[str, Any] | N
     return None
 
 def _id_map_from_espn() -> Tuple[pd.DataFrame, str]:
-    """
-    Builds (player, team, position) using ESPN public endpoints.
-    """
     base = _req_json(_ESPN_TEAMS)
     if not base:
-        return _empty_df(["player","team","position"]), "espn:error_teams"
+        return _empty_df(["player","team","position","espn_player_id"]), "espn:error_teams"
 
-    teams = []
+    teams: list[tuple[str,str]] = []
     try:
         for t in base["sports"][0]["leagues"][0]["teams"]:
             team = t["team"]
-            teams.append((team["id"], team.get("abbreviation") or team.get("shortDisplayName")))
+            abbr = team.get("abbreviation") or team.get("shortDisplayName")
+            teams.append((team["id"], abbr))
     except Exception:
-        return _empty_df(["player","team","position"]), "espn:parse_teams"
+        return _empty_df(["player","team","position","espn_player_id"]), "espn:parse_teams"
 
     rows = []
     for tid, abbr in teams:
@@ -223,16 +234,59 @@ def _id_map_from_espn() -> Tuple[pd.DataFrame, str]:
             pos = group.get("position", {}).get("abbreviation") or group.get("position", {}).get("name")
             for ath in group.get("items", []):
                 name = ath.get("fullName") or ath.get("displayName")
+                espn_pid = ath.get("id")  # ESPN athlete id (string)
                 if name and abbr:
-                    rows.append((name, abbr, pos))
-        # tiny politeness delay
-        time.sleep(0.1)
+                    rows.append((name, abbr, pos, espn_pid))
+        time.sleep(0.05)  # small courtesy pause
 
     if not rows:
-        return _empty_df(["player","team","position"]), "espn:empty"
+        return _empty_df(["player","team","position","espn_player_id"]), "espn:empty"
 
-    df = pd.DataFrame(rows, columns=["player","team","position"]).drop_duplicates()
+    df = pd.DataFrame(rows, columns=["player","team","position","espn_player_id"]).drop_duplicates()
     return df, "espn"
+
+# ---------- Stadium-based weather inference ----------------------------------
+
+STADIUM_COLS = ["team","abbr","stadium","city","state","roof","is_dome","surface","altitude_ft"]
+
+def _infer_weather_from_stadiums(stadiums: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-team baseline weather inference:
+      - dome/retractable: wind=0, temp=70F, precip=0
+      - outdoor: NaNs (to be filled by a live weather step later)
+    Carries surface + altitude to downstream features.
+    """
+    if stadiums.empty:
+        return _empty_df(["team","abbr","is_dome","surface","altitude_ft","temp_f","wind_mph","precip_in"])
+
+    df = stadiums.copy()
+    # normalize booleans
+    dome = df.get("is_dome")
+    if dome is None:
+        dome = df.get("roof", "").astype(str).str.contains("Fixed|Retractable", case=False, regex=True)
+    else:
+        dome = dome.astype(str).str.upper().isin(["TRUE","1","YES","Y"])
+
+    out = pd.DataFrame({
+        "team": df["team"].astype(str),
+        "abbr": df.get("abbr", df["team"]).astype(str),
+        "is_dome": dome,
+        "surface": df.get("surface", "Grass"),
+        "altitude_ft": pd.to_numeric(df.get("altitude_ft", 0), errors="coerce").fillna(0).astype(int),
+    })
+
+    # defaults
+    out["temp_f"] = None
+    out["wind_mph"] = None
+    out["precip_in"] = None
+
+    # dome/retractable inference
+    dome_mask = out["is_dome"] == True
+    out.loc[dome_mask, "temp_f"] = 70
+    out.loc[dome_mask, "wind_mph"] = 0
+    out.loc[dome_mask, "precip_in"] = 0.0
+
+    return out
 
 # ---------- main --------------------------------------------------------------
 
@@ -257,7 +311,7 @@ def main():
     player_form = _build_player_form(pbp, args.season)
     _up(status, "player_form.csv", _write_csv(player_form, os.path.join(METRICS_DIR,"player_form.csv")), "pbp-derived")
 
-    # 2) id_map: nflverse → fallback espn
+    # 2) id_map: nflverse → fallback espn (with espn_player_id)
     id_map, id_src = _id_map_from_nflverse(args.season)
     rows = _write_csv(id_map, os.path.join(INPUTS_DIR,"id_map.csv"))
     _up(status, "id_map.csv", rows, id_src)
@@ -269,12 +323,17 @@ def main():
         if rows2 == 0:
             status["notes"].append("Both nflverse and ESPN rosters empty; id_map.csv will be empty")
 
-    # 3) weather placeholder (kept empty by design here)
-    weather = _empty_df(["team","game_id","is_dome","temp_f","wind_mph"])
-    _up(status, "weather.csv", _write_csv(weather, os.path.join(INPUTS_DIR,"weather.csv")), "placeholder")
+    # 3) Stadium-based weather inference
+    stadiums = _read_csv_safe(os.path.join(INPUTS_DIR, "stadiums.csv"), STADIUM_COLS)
+    if stadiums.empty:
+        status["notes"].append("inputs/stadiums.csv not found or empty; weather inference skipped")
+        weather = _empty_df(["team","abbr","is_dome","surface","altitude_ft","temp_f","wind_mph","precip_in"])
+        provider = "placeholder"
+    else:
+        weather = _infer_weather_from_stadiums(stadiums)
+        provider = "stadium_inference"
 
-    # 4) (optional) PFR best-effort — disabled for now due to frequent 403s
-    # status["notes"].append("PFR scraping disabled; enable later if needed")
+    _up(status, "weather.csv", _write_csv(weather, os.path.join(INPUTS_DIR,"weather.csv")), provider)
 
     with open(os.path.join(METRICS_DIR,"fetch_status.json"), "w") as f:
         json.dump(status, f, indent=2)
