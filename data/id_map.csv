@@ -1,1 +1,6 @@
+data/id_map.csv            # REQUIRED columns: player_name, team
+                           # (optional) columns: position, role (WR1/WR2/SLOT/TE/RB/QB)
+data/injuries.csv          # player, team, status  (status ∈ {Out, Doubtful, Questionable, Limited, Probable})
+data/roles.csv             # player, team, role    (role ∈ {WR1, WR2, SLOT, TE, RB, QB})
+data/coverage.csv          # defense_team, tag     (tag ∈ {top_shadow, heavy_man, heavy_zone})
 
