@@ -2,36 +2,19 @@
 from __future__ import annotations
 from typing import Dict, Any, Tuple, Optional, List
 
-"""
-Compatibility wrapper for rules application.
-
-Supported call styles:
-
-NEW:
-    apply_rules(features_dict)
-    apply_rules(features_dict, side='over', mu=0.5, sigma=0.25, player=..., team_ctx=...)
-
-OLD (positional):
-    apply_rules(side, mu, sigma, player=..., team_ctx=...)
-
-In all cases, returns: (mu, sigma, notes)
-"""
-
 def apply_rules(*args, **kwargs) -> Tuple[float, float, str]:
-    # Detect NEW style: first arg is a dict of features
+    # NEW style: first arg = features dict
     if args and isinstance(args[0], dict):
         features: Dict[str, Any] = args[0] or {}
         side   = kwargs.get("side",   features.get("side"))
-        mu     = kwargs.get("mu",     features.get("mu_pred") or features.get("mu"))
+        mu     = kwargs.get("mu",     features.get("mu_pred") or features.get("mu") or 0.0)
         sigma  = kwargs.get("sigma",  features.get("sigma_pred") or features.get("sigma") or 0.25)
         player = kwargs.get("player", features.get("player"))
         team_ctx = kwargs.get("team_ctx", features.get("team_ctx"))
     else:
-        # OLD style: side, mu, sigma as positionals; features may be provided via kw
+        # OLD style: side, mu, sigma as positionals; features via kw
         if len(args) < 3:
-            raise TypeError(
-                "apply_rules() requires either (features_dict) or (side, mu, sigma, ...)"
-            )
+            raise TypeError("apply_rules() requires either (features_dict) or (side, mu, sigma, ...)")
         side, mu, sigma = args[:3]
         features: Dict[str, Any] = kwargs.get("features", {}) or {}
         player = kwargs.get("player")
@@ -58,39 +41,42 @@ def _apply_rules_core(
     features: Dict[str, Any],
 ) -> Tuple[float, float, str]:
     """
-    Put your real “elite” rules here. This starter keeps behavior stable but
-    also protects against bad inputs so the pipeline won’t crash.
+    Starter "elite rules" (safe by default). Uses external features if present.
     """
     notes: List[str] = []
 
-    # — Examples of gentle, safe adjustments —
-    # floor sigma to avoid over-confidence explosions
+    # Sigma floor
     if sigma < 0.05:
         sigma = 0.05
         notes.append("sigma_floor_0.05")
 
-    # optional: cap or backstop mu if missing
-    if mu is None:
+    # Pressure-adjusted QB baseline (if features present)
+    opp_press_z = features.get("opp_team_pressure_z") or features.get("opp_pressure_z") or 0.0
+    opp_pass_epa_z = features.get("opp_pass_epa_z") or 0.0
+    if "passing" in str(features.get("market", "")).lower():
+        adj = (1.0 - 0.35 * float(opp_press_z)) * (1.0 - 0.25 * float(opp_pass_epa_z))
+        if adj != 1.0:
+            mu *= max(0.80, min(1.20, adj))
+            notes.append("qb_pressure_epa_adj")
+
+    # Funnel nudges (if present)
+    run_funnel = features.get("opp_run_funnel", 0)
+    pass_funnel = features.get("opp_pass_funnel", 0)
+    if run_funnel and "rushing" in str(features.get("market", "")).lower():
+        mu *= 1.03
+        notes.append("run_funnel_+3%")
+    if pass_funnel and ("receiv" in str(features.get("market", "")).lower() or "passing" in str(features.get("market", "")).lower()):
+        mu *= 1.03
+        notes.append("pass_funnel_+3%")
+
+    # Volatility widening flags (if present)
+    if features.get("qb_volatility_flag") or features.get("protection_mismatch"):
+        sigma *= 1.15
+        notes.append("vol_widen_+15%")
+
+    # Cap absurd mu if piping weird data
+    if not (-1e6 < mu < 1e6):
         mu = 0.0
-        notes.append("mu_none_to_0")
-
-    # Example: light bump if team/form feature says “hot”
-    hot_form = features.get("team_form_hot") or features.get("form_hot")
-    if hot_form:
-        mu += 0.01
-        notes.append("bump_hot_form")
-
-    # Make sure outputs are clean floats
-    try:
-        mu = float(mu)
-    except Exception:
-        mu = 0.0
-        notes.append("mu_cast_fail_to_0")
-
-    try:
-        sigma = float(sigma)
-    except Exception:
-        sigma = 0.25
-        notes.append("sigma_cast_fail_to_0.25")
+        notes.append("mu_reset_out_of_bounds")
 
     return mu, sigma, "|".join(notes)
