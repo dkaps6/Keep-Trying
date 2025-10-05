@@ -1,6 +1,7 @@
 # scripts/fetch_all.py
 from __future__ import annotations
-import inspect, json
+import inspect
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -13,7 +14,7 @@ def _try_import(module: str):
     except Exception:
         return None
 
-# IMPORTANT: try both module locations so this works regardless of your layout
+# Try both locations so this works regardless of your layout
 _odds_api = _try_import("scripts.odds_api") or _try_import("odds_api")
 _dk = _try_import("scripts.providers.draftkings_free") or _try_import("scripts.draftkings_free") or _try_import("draftkings_free")
 _nflv = _try_import("scripts.providers.nflverse_free") or _try_import("scripts.nflverse_free") or _try_import("nflverse_free")
@@ -23,7 +24,8 @@ ROOT = Path(".").resolve()
 OUT_DIR = ROOT / "outputs"
 METRICS = ROOT / "metrics"
 INPUTS = ROOT / "inputs"
-for p in (OUT_DIR, METRICS, INPUTS): p.mkdir(parents=True, exist_ok=True)
+for p in (OUT_DIR, METRICS, INPUTS):
+    p.mkdir(parents=True, exist_ok=True)
 
 def _write_csv(df: pd.DataFrame, path: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -32,12 +34,13 @@ def _write_csv(df: pd.DataFrame, path: Path) -> int:
 
 def _read_csv(path: Path) -> pd.DataFrame:
     try:
-        if path.exists(): return pd.read_csv(path)
+        if path.exists():
+            return pd.read_csv(path)
     except Exception:
         pass
     return pd.DataFrame()
 
-# ---- flexible caller for odds_api functions -----------------------
+# Flexible caller (accepts alias kwarg names if your function differs)
 _ARG_ALIAS = {
     "date": ["date","target_date","slate_date"],
     "season": ["season","season_year","year"],
@@ -52,7 +55,7 @@ def _call_with_aliases(fn, date: str, season: str) -> Optional[pd.DataFrame]:
         combos.append({d: date})
     combos.append({})
     for kw in combos:
-        filtered = {k:v for k,v in kw.items() if k in sig.parameters}
+        filtered = {k: v for k, v in kw.items() if k in sig.parameters}
         try:
             df = fn(**filtered)
             if isinstance(df, pd.DataFrame):
@@ -63,30 +66,34 @@ def _call_with_aliases(fn, date: str, season: str) -> Optional[pd.DataFrame]:
     return None
 
 def _load_props(date: str, season: str) -> pd.DataFrame:
-    # 1) Try The Odds API first
+    # 1) The Odds API (preferred)
     if _odds_api:
         for name in ("fetch_props","get_props","build_props_frame","load_props"):
             fn = getattr(_odds_api, name, None)
             if callable(fn):
                 df = _call_with_aliases(fn, date, season)
                 if isinstance(df, pd.DataFrame) and not df.empty:
-                    _write_csv(df, OUT_DIR / "props_raw.csv")
+                    _write_csv(df, OUT_DIR / "props_raw.csv")  # debug snapshot
                     return df
-    # 2) Fallback to DraftKings free
+
+    # 2) DraftKings public JSON (fallback)
     if _dk and hasattr(_dk, "fetch_dk_props"):
         try:
             df = _dk.fetch_dk_props()
             if not df.empty:
                 print("[fetch_all] using DraftKings fallback")
+                _write_csv(df, OUT_DIR / "props_raw.csv")
                 return df
         except Exception as e:
             print(f"[fetch_all] draftkings_free.fetch_dk_props error: {e}")
+
     # 3) Manual local fallback
     for candidate in (OUT_DIR/"props_raw.csv", INPUTS/"props.csv", ROOT/"data"/"odds_sample.csv"):
         df = _read_csv(candidate)
         if not df.empty:
             print(f"[fetch_all] props from {candidate}: {len(df)} rows")
             return df
+
     print("[fetch_all] WARNING: no props found (API & DK & local fallbacks empty)")
     return pd.DataFrame()
 
@@ -107,7 +114,7 @@ def main(date: str = "today", season: str = "2025") -> pd.DataFrame:
     status["providers"]["props"] = ("odds_api" if _odds_api else "none") + "+dk+manual"
     status["rows"]["props"] = int(len(props))
 
-    # TEAM WEEK FORM (nflverse free helper if present)
+    # TEAM-WEEK FORM (from nflverse if available)
     tdf = pd.DataFrame()
     if _nflv:
         try:
@@ -147,7 +154,7 @@ def main(date: str = "today", season: str = "2025") -> pd.DataFrame:
         status["providers"]["id_map.csv"] = "espn:module-missing"
     status["rows"]["id_map.csv"] = _write_csv(idm, INPUTS / "player_id_cache.csv")
 
-    # WEATHER placeholder (safe)
+    # WEATHER placeholder
     wdf = pd.DataFrame()
     status["providers"]["weather.csv"] = "placeholder"
     status["rows"]["weather.csv"] = _write_csv(wdf, METRICS / "weather.csv")
