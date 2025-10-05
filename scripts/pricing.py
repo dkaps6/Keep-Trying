@@ -1,13 +1,13 @@
 # scripts/pricing.py
 from __future__ import annotations
-import math
+import json, math
 from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
 
-# ---------- Default SDs (can be tuned or replaced with per-player priors) ----------
+# ---------- Default SDs ----------
 SD_DEFAULTS = {
     "rec_yards": 26.0,
     "receptions": 1.8,
@@ -16,7 +16,7 @@ SD_DEFAULTS = {
     "pass_yards": 48.0,
     "pass_tds": 0.9,
     "rush_rec_yards": 30.0,
-    "anytime_td": 1.0,  # not used as Normal; left for completeness
+    "anytime_td": 1.0,  # placeholder
 }
 
 # ---------- Helpers ----------
@@ -39,7 +39,6 @@ def devig_two_way(p_over: float, p_under: float) -> float | None:
     return p_over/s
 
 def erfinv(x: float) -> float:
-    # Winitzki approx
     a = 0.147
     ln = np.log(1.0 - x*x)
     s = (2/(np.pi*a) + ln/2.0)
@@ -53,49 +52,79 @@ def norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z/np.sqrt(2.0)))
 
 # ---------- Context loaders ----------
+def _maybe_csv(path: str) -> pd.DataFrame:
+    p = Path(path)
+    return pd.read_csv(p) if p.exists() else pd.DataFrame()
+
 def _load_game_lines() -> pd.DataFrame:
-    p = Path("outputs/game_lines.csv")
-    if p.exists():
-        df = pd.read_csv(p)
-        # event_id, home_team, away_team, home_wp, away_wp
-        return df
-    return pd.DataFrame()
+    return _maybe_csv("outputs/game_lines.csv")
 
 def _load_team_metrics() -> pd.DataFrame:
-    """
-    Optional: metrics/team_form.csv with *defensive* fields; we z-score them.
-    Expect (best effort): team, def_pressure_rate, def_pass_epa, def_rush_epa,
-                          light_box_rate, heavy_box_rate, pace
-    Missing columns are safely ignored.
-    """
-    p = Path("metrics/team_form.csv")
-    if not p.exists(): 
-        return pd.DataFrame()
-    df = pd.read_csv(p)
-    # z-score available numeric columns
-    for col in ["def_pressure_rate","def_pass_epa","def_rush_epa","pace","light_box_rate","heavy_box_rate","def_sack_rate"]:
+    df = _maybe_csv("metrics/team_form.csv")
+    if df.empty: return df
+    for col in ["def_pressure_rate","def_pass_epa","def_rush_epa","pace","light_box_rate","heavy_box_rate","def_sack_rate","ay_per_att"]:
         if col in df.columns:
             s = df[col].astype(float)
             df[f"{col}_z"] = (s - s.mean()) / (s.std(ddof=0)+1e-9)
     return df
 
-# ---------- Post-mortem adjustment rules (functions return multipliers / sd bumps) ----------
+def _load_id_map() -> pd.DataFrame:
+    df = _maybe_csv("data/id_map.csv")
+    if not df.empty:
+        # normalize headers
+        cols = {c.lower(): c for c in df.columns}
+        # prefer canonical names
+        ren = {}
+        for k in ["player_name","team","position","role"]:
+            if k in df.columns: ren[k] = k
+            else:
+                # try to find case-insensitive match
+                for c in df.columns:
+                    if c.lower() == k: ren[c] = k
+        df = df.rename(columns=ren)
+    return df
+
+def _load_injuries() -> pd.DataFrame:
+    df = _maybe_csv("data/injuries.csv")
+    if not df.empty:
+        df["status"] = df["status"].str.strip().str.title()
+    return df
+
+def _load_roles() -> pd.DataFrame:
+    df = _maybe_csv("data/roles.csv")
+    if not df.empty:
+        df["role"] = df["role"].str.upper()
+    return df
+
+def _load_coverage() -> pd.DataFrame:
+    df = _maybe_csv("data/coverage.csv")
+    if not df.empty:
+        df["tag"] = df["tag"].str.lower()
+    return df
+
+def _load_calibration() -> Dict[str, Dict[str, float]]:
+    p = Path("metrics/calibration.json")
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {}
+
+# ---------- Post-mortem rule components ----------
 def qb_pressure_multiplier(opp_pressure_z: float, opp_pass_epa_z: float) -> float:
-    # 1) Pressure-adjusted QB baseline
-    m = (1.0 - 0.35*opp_pressure_z) * (1.0 - 0.25*opp_pass_epa_z)
+    m = (1.0 - 0.35*(opp_pressure_z or 0.0)) * (1.0 - 0.25*(opp_pass_epa_z or 0.0))
     return float(np.clip(m, 0.70, 1.10))
 
-def sack_to_attempt_multiplier(opp_sack_rate_above_avg: float) -> float:
-    # 2) Sack-to-attempt elasticity (volume)
-    m = 1.0 - 0.15*opp_sack_rate_above_avg
+def sack_to_attempt_multiplier(opp_sack_rate_z: float) -> float:
+    # assume z ~ 1.0 ≈ "above avg"
+    above = max(0.0, (opp_sack_rate_z or 0.0))
+    m = 1.0 - 0.15*above
     return float(np.clip(m, 0.80, 1.05))
 
 def funnel_multiplier(def_pass_epa_z: float, def_rush_epa_z: float, market_key: str) -> float:
-    # 3) Run/pass funnels
-    if pd.isna(def_pass_epa_z) or pd.isna(def_rush_epa_z):
-        return 1.0
-    run_funnel = (def_rush_epa_z >= 0.25) and (def_pass_epa_z <= -0.25)  # approx 60th/40th pct
-    pass_funnel = (def_pass_epa_z >= 0.25) and (def_rush_epa_z <= -0.25)
+    run_funnel  = (def_rush_epa_z or 0.0) >= 0.25 and (def_pass_epa_z or 0.0) <= -0.25
+    pass_funnel = (def_pass_epa_z or 0.0) >= 0.25 and (def_rush_epa_z or 0.0) <= -0.25
     if run_funnel:
         if market_key in {"rush_yards","rush_att","rush_rec_yards"}: return 1.05
         if market_key in {"pass_yards","receptions","rec_yards","pass_tds"}: return 0.96
@@ -104,178 +133,211 @@ def funnel_multiplier(def_pass_epa_z: float, def_rush_epa_z: float, market_key: 
         if market_key in {"pass_yards","receptions","rec_yards","pass_tds"}: return 1.04
     return 1.0
 
-def boxcount_multiplier(light_box_rate: float, heavy_box_rate: float, market_key: str) -> float:
-    # 7) Box-count leverage (RB YPC mod → affects rush yards more than attempts)
-    if market_key != "rush_yards": 
-        return 1.0
-    if not pd.isna(light_box_rate) and light_box_rate >= 0.60: 
-        return 1.07
-    if not pd.isna(heavy_box_rate) and heavy_box_rate >= 0.60:
-        return 0.94
+def boxcount_multiplier(light_box_rate_z: float, heavy_box_rate_z: float, market_key: str) -> float:
+    if market_key != "rush_yards": return 1.0
+    if (light_box_rate_z or 0.0) >= 0.6: return 1.07
+    if (heavy_box_rate_z or 0.0) >= 0.6: return 0.94
     return 1.0
 
 def script_escalator(win_prob: float, market_key: str) -> float:
-    # 8) Script escalators (favorite RB bump, modest QB/YAC downshift)
-    if pd.isna(win_prob): 
-        return 1.0
+    if pd.isna(win_prob): return 1.0
     if market_key in {"rush_att","rush_yards"} and win_prob >= 0.55:
-        # +2–4 attempts equivalent → ~6–10% volume bump
-        return 1.0 + min(0.10, (win_prob - 0.55) * 0.40 / 0.10)  # scale
+        return 1.0 + min(0.10, (win_prob - 0.55) * 0.40 / 0.10)
     if market_key in {"pass_yards","receptions","rec_yards"} and win_prob >= 0.60:
-        return 0.98  # tiny nudge down when heavily favored
+        return 0.98
     return 1.0
 
 def pace_smoothing_multiplier(off_pace_z: float, def_pace_z: float) -> float:
-    # 9) Pace smoothing (keep small; we don't have drive-based plays here)
     zsum = 0.5 * ((off_pace_z or 0.0) + (def_pace_z or 0.0))
     return float(1.0 + 0.03 * zsum)
 
 def volatility_widening_factor(opp_pressure_z: float, qb_inconsistent: bool) -> float:
-    # 10) widen SD if pressure mismatch high or QB inconsistency flagged
     bump = 0.0
-    if not pd.isna(opp_pressure_z) and opp_pressure_z >= 1.0:
-        bump += 0.15
-    if qb_inconsistent:
-        bump += 0.10
+    if (opp_pressure_z or 0.0) >= 1.0: bump += 0.15
+    if qb_inconsistent: bump += 0.10
     return 1.0 + min(0.25, bump)
+
+# NEW: (4) Alpha-WR injury elasticity & redistribution (light-weight)
+def injury_multiplier(status: str, role: str, market_key: str) -> float:
+    if not status: return 1.0
+    s = status.lower()
+    # focus on WR receiving volume/efficiency
+    if role in {"WR1","WR2","SLOT","TE"} and market_key in {"receptions","rec_yards","rush_rec_yards"}:
+        if s in {"out","doubtful"}:      return 0.78   # big cap
+        if s in {"questionable","limited"}: return 0.90
+        if s in {"probable"}:            return 0.97
+    return 1.0
+
+# NEW: (5) CB shadow / coverage boosts
+def coverage_multiplier(tags: set[str], role: str, market_key: str) -> float:
+    if not tags: return 1.0
+    t = set([x.lower() for x in tags])
+    if ("top_shadow" in t or "heavy_man" in t) and role in {"WR1"} and market_key in {"receptions","rec_yards"}:
+        return 0.92  # -8% share/eff
+    if "heavy_zone" in t and role in {"SLOT","TE"} and market_key in {"receptions","rec_yards"}:
+        return 1.05  # +5% vs zone
+    return 1.0
+
+# NEW: (6) Air-yards sanity check (cap WR1 YPR if scheme is shallow)
+def air_yards_sanity_cap(role: str, market_key: str, ay_per_att_z: float) -> float:
+    if role == "WR1" and market_key in {"rec_yards"} and (ay_per_att_z or 0.0) <= -0.84:  # ~20th pct
+        return 0.80
+    return 1.0
 
 # ---------- Main pricing ----------
 def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
     """
-    Input columns (from normalize):
-        player, market_key, line, book, event_id, home_team, away_team, commence_time,
-        price_over, price_under
-    Optional (from engine id_map merge):
-        player_id, team
-    Context files optionally read here:
-        outputs/game_lines.csv
-        metrics/team_form.csv
+    Input from normalize(): player, market_key, line, price_over, price_under, book, event_id, home_team, away_team, commence_time
+    Optionally present from engine() merge: player_id, team
+    Uses optional context: outputs/game_lines.csv, metrics/team_form.csv, data/injuries.csv, data/roles.csv, data/coverage.csv, metrics/calibration.json
     """
     df = df_in.copy()
 
-    # implied probs (book)
+    # implied & devigged market probs
     df["p_over_imp"] = df["price_over"].apply(american_to_prob)
     df["p_under_imp"] = df["price_under"].apply(american_to_prob)
     df["p_over_fair_market"] = np.vectorize(devig_two_way)(df["p_over_imp"], df["p_under_imp"])
     df["p_over_fair_market"] = df["p_over_fair_market"].fillna(df["p_over_imp"])
 
-    # load context
-    gl = _load_game_lines()           # event-level win probs
-    tm = _load_team_metrics()         # team-level defensive metrics
+    # ---- Join ID map (team/position/role) if not already present ----
+    if "team" not in df.columns or "role" not in df.columns or "position" not in df.columns:
+        idm = _load_id_map()
+        if not idm.empty:
+            idm = idm.rename(columns={"player_name":"player"})
+            df = df.merge(idm[["player","team"] + [c for c in ["position","role"] if c in idm.columns]], on="player", how="left")
 
-    # attach win prob for the player's team (needs 'team' from id_map to work perfectly)
-    if "team" in df.columns and not gl.empty:
+    # ---- Join roles override (if provided) ----
+    roles = _load_roles()
+    if not roles.empty:
+        roles = roles.rename(columns={"player":"player","team":"team","role":"role"})
+        df = df.merge(roles, on=["player","team"], how="left", suffixes=("","_role2"))
+        df["role"] = df["role_role2"].combine_first(df["role"])
+        df.drop(columns=[c for c in df.columns if c.endswith("_role2")], inplace=True)
+
+    # ---- Win probabilities (script escalators) ----
+    gl = _load_game_lines()
+    if not gl.empty:
         gl_small = gl[["event_id","home_team","away_team","home_wp","away_wp"]].drop_duplicates("event_id")
         df = df.merge(gl_small, on="event_id", how="left")
-        def _pick_wp(row):
+        def _wp(row):
             if pd.isna(row.get("home_wp")): return np.nan
             if row.get("team") == row.get("home_team"): return row.get("home_wp")
             if row.get("team") == row.get("away_team"): return row.get("away_wp")
-            # if we don't know team, split the difference to stay conservative
             return 0.5
-        df["win_prob"] = df.apply(_pick_wp, axis=1)
+        df["win_prob"] = df.apply(_wp, axis=1)
     else:
         df["win_prob"] = np.nan
 
-    # opponent map for team metrics
-    def _opp(row):
-        if "team" not in row or pd.isna(row["team"]): return None
-        if row["team"] == row["home_team"]: return row["away_team"]
-        if row["team"] == row["away_team"]: return row["home_team"]
-        return None
-    df["opp_team"] = df.apply(_opp, axis=1)
+    # ---- Team metrics (pressure/funnels/boxes/pace & air-yards) ----
+    tm = _load_team_metrics()
+    if not tm.empty:
+        # attach opponent
+        def _opp(row):
+            if pd.isna(row.get("team")): return None
+            if row["team"] == row["home_team"]: return row["away_team"]
+            if row["team"] == row["away_team"]: return row["home_team"]
+            return None
+        df["opp_team"] = df.apply(_opp, axis=1)
 
-    # attach defensive z-scores (pressure, EPA splits, boxes, pace)
-    if not tm.empty and "opp_team" in df.columns:
-        mcols = ["def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z",
-                 "light_box_rate_z","heavy_box_rate_z","pace_z","def_sack_rate_z"]
-        keep = ["team"] + mcols
+        # merge def metrics on opponent
+        keep = ["team","def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z",
+                "light_box_rate_z","heavy_box_rate_z","def_sack_rate_z","ay_per_att_z"]
         tm2 = tm.rename(columns={"team":"opp_team"})
-        for c in mcols:
+        for c in keep:
             if c not in tm2.columns: tm2[c] = np.nan
-        df = df.merge(tm2[["opp_team"]+mcols], on="opp_team", how="left")
+        df = df.merge(tm2[["opp_team"] + keep[1:]], on="opp_team", how="left")
     else:
-        for c in ["def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z",
-                  "light_box_rate_z","heavy_box_rate_z","pace_z","def_sack_rate_z"]:
+        for c in ["def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z","light_box_rate_z","heavy_box_rate_z","def_sack_rate_z","ay_per_att_z"]:
             df[c] = np.nan
 
-    # --- Baseline model: set μ so that P(X>line)=p (Normal with default σ) ---
+    # ---- Injuries (alpha WR elasticity) ----
+    inj = _load_injuries()
+    if not inj.empty:
+        inj = inj.rename(columns={"player":"inj_player","team":"inj_team","status":"inj_status"})
+        df = df.merge(inj, left_on=["player","team"], right_on=["inj_player","inj_team"], how="left")
+    else:
+        df["inj_status"] = np.nan
+
+    # ---- Coverage tags (CB shadow / man / zone) per opponent defense ----
+    cov = _load_coverage()
+    if not cov.empty:
+        cov = cov.rename(columns={"defense_team":"opp_team"})
+        cov_grp = cov.groupby("opp_team")["tag"].apply(lambda s: set(s.str.lower().tolist())).reset_index()
+        df = df.merge(cov_grp, on="opp_team", how="left")
+        df["tag"] = df["tag"].apply(lambda x: x if isinstance(x,set) else set())
+    else:
+        df["tag"] = [set()]*len(df)
+
+    # --- Baseline μ so that P(X>line)=p for Normal(μ,σ) ---
     def base_mu(row) -> float:
         mk = row["market_key"]
         sd = SD_DEFAULTS.get(mk, 25.0)
         p  = row["p_over_fair_market"]
-        if pd.isna(p) or sd <= 0: 
-            return np.nan
-        z = norm_inv(p)
-        return row["line"] + z * sd
+        if pd.isna(p) or sd <= 0: return np.nan
+        return row["line"] + norm_inv(p) * sd
     df["_mu0"] = df.apply(base_mu, axis=1)
     df["_sd0"] = df["market_key"].map(SD_DEFAULTS).fillna(25.0)
 
-    # --- Apply post-mortem rules (multipliers on μ; widening factor on σ) ---
+    # --- Multipliers for μ; widening for σ ---
     def row_multipliers(row) -> Tuple[float,float]:
-        mk = row["market_key"]
-        # 1) QB pressure + pass EPA (yards/TDs)
-        m_qb = 1.0
-        if mk in {"pass_yards","pass_tds"}:
-            m_qb = qb_pressure_multiplier(row["def_pressure_rate_z"], row["def_pass_epa_z"])
+        mk   = row["market_key"]
+        role = (row.get("role") or "").upper()
 
-        # 2) Sack -> attempts elasticity (pass volume proxy)
-        m_sack = 1.0
-        if mk in {"pass_yards","receptions","rec_yards"}:
-            m_sack = sack_to_attempt_multiplier((row.get("def_sack_rate_z") or 0.0))
-
-        # 3) Run/Pass funnels
-        m_funnel = funnel_multiplier(row["def_pass_epa_z"], row["def_rush_epa_z"], mk)
-
-        # 7) Box-count leverage (RB YPC)
-        m_box = boxcount_multiplier(row.get("light_box_rate_z"), row.get("heavy_box_rate_z"), mk)
-
-        # 8) Script escalators from win prob
+        m_qb     = qb_pressure_multiplier(row.get("def_pressure_rate_z"), row.get("def_pass_epa_z")) if mk in {"pass_yards","pass_tds"} else 1.0
+        m_sack   = sack_to_attempt_multiplier(row.get("def_sack_rate_z")) if mk in {"pass_yards","receptions","rec_yards"} else 1.0
+        m_funnel = funnel_multiplier(row.get("def_pass_epa_z"), row.get("def_rush_epa_z"), mk)
+        m_box    = boxcount_multiplier(row.get("light_box_rate_z"), row.get("heavy_box_rate_z"), mk)
         m_script = script_escalator(row.get("win_prob"), mk)
+        m_pace   = pace_smoothing_multiplier(row.get("pace_z"), row.get("pace_z"))
 
-        # 9) Pace smoothing (very gentle)
-        m_pace = pace_smoothing_multiplier(row.get("pace_z"), row.get("pace_z"))
+        # NEW: injuries / coverage / air-yards sanity
+        m_inj    = injury_multiplier(row.get("inj_status"), role, mk)
+        m_cov    = coverage_multiplier(row.get("tag"), role, mk)
+        m_aycap  = air_yards_sanity_cap(role, mk, row.get("ay_per_att_z"))
 
-        # 10) Volatility widening (σ multiplier)
-        sd_mult = volatility_widening_factor(row.get("def_pressure_rate_z"), qb_inconsistent=False)
+        # Volatility widening
+        sd_mult  = volatility_widening_factor(row.get("def_pressure_rate_z"), qb_inconsistent=False)
 
-        mu_mult = m_qb * m_sack * m_funnel * m_box * m_script * m_pace
+        mu_mult = m_qb * m_sack * m_funnel * m_box * m_script * m_pace * m_inj * m_cov * m_aycap
         return mu_mult, sd_mult
 
     mu_mults, sd_mults = zip(*df.apply(row_multipliers, axis=1))
     df["_mu_adj"] = df["_mu0"] * pd.Series(mu_mults).astype(float)
     df["_sd_adj"] = df["_sd0"] * pd.Series(sd_mults).astype(float)
 
-    # --- Model probability at the *book line* with adjusted μ,σ ---
+    # --- Model probability at the line with adjusted μ,σ ---
     def p_model_over(row) -> float:
         mu = row["_mu_adj"]; sd = row["_sd_adj"]; L = row["line"]
-        if sd <= 0 or pd.isna(mu) or pd.isna(sd) or pd.isna(L): 
-            return np.nan
-        z = (L - mu) / sd
-        return 1.0 - norm_cdf(z)
+        if sd <= 0 or pd.isna(mu) or pd.isna(sd) or pd.isna(L): return np.nan
+        return 1.0 - norm_cdf((L - mu) / sd)
     df["p_over_model"] = df.apply(p_model_over, axis=1)
 
-    # --- 65/35 blend w/ market anchor ---
+    # --- Calibration shrinkage (rule 12) ---
+    cal = _load_calibration()  # e.g. {"pass_yards":{"shrink":0.90}, "receptions":{"shrink":0.95}}
+    if cal:
+        def _shrink(row):
+            s = cal.get(row["market_key"], {}).get("shrink")
+            if not s: return row["p_over_model"]
+            return float(s)*row["p_over_model"] + (1.0-float(s))*row["p_over_fair_market"]
+        df["p_over_model"] = df.apply(_shrink, axis=1)
+
+    # --- 65/35 blend + fair odds + edge ---
     df["p_over_blend"] = 0.65*df["p_over_model"].fillna(df["p_over_fair_market"]) + 0.35*df["p_over_fair_market"]
     df["fair_over_odds"] = df["p_over_blend"].apply(prob_to_american)
-
-    # edge vs the posted Over price
     df["edge_pct"] = df["p_over_blend"] - df["p_over_imp"]
 
     # outputs
     df["model_mean"] = df["_mu_adj"]
     df["model_sd"]   = df["_sd_adj"]
 
-    # tidy
     keep = [
-        "player","team","market_key","line","book","event_id","home_team","away_team","commence_time",
+        "player","team","role","market_key","line","book","event_id","home_team","away_team","commence_time",
         "price_over","price_under","p_over_imp","p_under_imp","p_over_fair_market",
         "p_over_model","p_over_blend","fair_over_odds","edge_pct","model_mean","model_sd",
-        "win_prob","def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z"
+        "win_prob","def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z","inj_status"
     ]
     out = df[keep].copy()
 
-    # Tiering
     def tier(e):
         if pd.isna(e): return "NA"
         if e >= 0.06: return "ELITE"
@@ -287,10 +349,8 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
 
 def write_outputs(df: pd.DataFrame, outdir: Path) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
-    csvp = outdir / "props_priced.csv"
-    xlsx = outdir / "props_priced.xlsx"
-    df.to_csv(csvp, index=False)
+    (outdir / "props_priced.csv").write_text(df.to_csv(index=False))
     try:
-        df.to_excel(xlsx, index=False)
+        df.to_excel(outdir / "props_priced.xlsx", index=False)
     except Exception as e:
         print("[warn] xlsx export failed:", e)
