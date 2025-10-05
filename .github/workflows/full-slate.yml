@@ -2,120 +2,79 @@ name: "Full Slate: Lines + Features + Model"
 
 on:
   workflow_dispatch:
+    inputs:
+      prefer_source:
+        description: "Provider order (odds,dk | dk | odds)"
+        default: "odds,dk"
+      window_hours:
+        description: "Credit guard: only events starting in next N hours"
+        default: "24"
+      max_events:
+        description: "Credit guard: max events to fetch"
+        default: "6"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
-    # Expose the secret to all steps
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      PREFER_SOURCE: ${{ github.event.inputs.prefer_source }}
+      ODDS_API_EVENT_WINDOW_HOURS: ${{ github.event.inputs.window_hours }}
+      ODDS_API_MAX_EVENTS: ${{ github.event.inputs.max_events }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ Quota check: prints Remaining/Used/Limit; exports a flag for later steps
-      - name: "Check Odds API quota"
+      # Optional: show credits; DOES NOT run any props endpoints
+      - name: Check Odds API quota (optional)
+        if: contains(env.PREFER_SOURCE, 'odds')
         shell: bash
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python - <<'PY'
           import os, requests
-          key = os.environ.get("ODDS_API_KEY","")
-          if not key:
-              print("ODDS_API_HAS_CREDITS=false")
-              print("ODDS_API_SUFFIX=")
-              # Export for later steps
-              with open(os.environ['GITHUB_ENV'], 'a') as f:
-                  f.write("ODDS_API_HAS_CREDITS=false\n")
-                  f.write("ODDS_API_SUFFIX=\n")
-              raise SystemExit(0)
-
-          url = f"https://api.the-odds-api.com/v4/sports?apiKey={key}"
-          r = requests.get(url, timeout=20)
-          rem = r.headers.get("x-requests-remaining")
-          used = r.headers.get("x-requests-used")
-          lim  = r.headers.get("x-requests-limit")
-          print("HTTP", r.status_code)
-          print("Key suffix:", key[-4:])
-          print("Remaining:", rem, "Used:", used, "Limit:", lim)
-
-          has = (r.status_code == 200 and (rem is not None) and str(rem).isdigit() and int(rem) > 0)
-          # Export for later steps
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f"ODDS_API_HAS_CREDITS={'true' if has else 'false'}\n")
-              f.write(f"ODDS_API_SUFFIX={key[-4:]}\n")
-
-          if r.status_code != 200:
-              print("Body:", r.text[:400])
+          k = os.environ.get("ODDS_API_KEY","")
+          if not k: print("No ODDS_API_KEY set"); raise SystemExit(0)
+          r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={k}", timeout=20)
+          print("HTTP", r.status_code, "| suffix ...", k[-4:])
+          print("Remaining:", r.headers.get("x-requests-remaining"),
+                "Used:", r.headers.get("x-requests-used"),
+                "Limit:", r.headers.get("x-requests-limit"))
+          if r.status_code != 200: print(r.text[:400])
           PY
 
-      # (Optional) Quick endpoint pings — only if we have credits
-      - name: "Ping Odds API: featured odds (h2h)"
-        if: env.ODDS_API_HAS_CREDITS == 'true'
-        shell: bash
-        run: |
-          curl -sS "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?regions=us&markets=h2h&apiKey=${ODDS_API_KEY}" | head -c 400 || true
-
-      - name: "Ping Odds API: one event player props"
-        if: env.ODDS_API_HAS_CREDITS == 'true'
-        shell: bash
-        run: |
-          EID=$(curl -s "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?regions=us&markets=h2h&apiKey=${ODDS_API_KEY}" | python -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'] if d else '')")
-          echo "Event ID: ${EID}"
-          if [ -n "${EID}" ]; then
-            curl -sS "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/${EID}/odds?regions=us&markets=player_pass_yds,player_reception_yds&apiKey=${ODDS_API_KEY}" | head -c 400 || true
-          else
-            echo "Could not enumerate events (check the featured-odds ping above)."
-          fi
-
-      - name: Ensure dirs
-        run: |
-          mkdir -p metrics inputs outputs data
-          # Optional: keep a tiny manual fallback to guarantee non-empty output
-          if [ ! -f inputs/props.csv ]; then
-            cat > inputs/props.csv <<'CSV'
-          player,team,market,line,price,book,game_id,week
-          CeeDee Lamb,DAL,receiving_yards,73.5,-115,DraftKings,2025-GB-DAL,5
-          Tony Pollard,DAL,rushing_yards,62.5,-110,DraftKings,2025-GB-DAL,5
-          Jayden Reed,GB,receptions,4.5,+105,FanDuel,2025-GB-DAL,5
-          Jordan Love,GB,passing_yards,256.5,-110,BetMGM,2025-GB-DAL,5
-          CSV
-          fi
-
-      # Fetch metrics/props — we still run this even if credits are out,
-      # because your fetcher falls back to DK/inputs/props.csv.
-      - name: Fetch external metrics (free sources)
+      # FETCH: direct from provider(s); fails the job if no props were fetched
+      - name: Fetch props (providers only; no CSV fallback)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          PREFER_SOURCE: ${{ github.event.inputs.prefer_source }}
+          ODDS_API_EVENT_WINDOW_HOURS: ${{ github.event.inputs.window_hours }}
+          ODDS_API_MAX_EVENTS: ${{ github.event.inputs.max_events }}
         run: |
           python -m scripts.fetch_all --season 2025
 
-      # Peek whatever props we ended up with before pricing
-      - name: Peek props snapshot
+      # Assert we actually got props, otherwise stop here with a clear reason
+      - name: Assert props present
         shell: bash
         run: |
-          for p in outputs/props_raw.csv inputs/props.csv data/odds_sample.csv; do
-            if [ -f "$p" ]; then
-              rows=$(( $(wc -l < "$p") - 1 )); [ $rows -lt 0 ] && rows=0
-              echo "$p: ${rows} rows"
-              head -n 5 "$p" || true
-            fi
-          done
+          if [ ! -s outputs/props_raw.csv ]; then
+            echo "❌ No props fetched. Reason:"
+            test -f outputs/_NO_PROPS && cat outputs/_NO_PROPS || true
+            exit 1
+          fi
+          echo "✅ props_raw.csv present:"
+          head -n 10 outputs/props_raw.csv
 
+      # Price/model only if props exist
       - name: Run pipeline
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
