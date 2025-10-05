@@ -1,176 +1,139 @@
 # scripts/pricing.py
-# Pricing utilities used by engine.py
+# Robust pricing helpers for props: convert odds, compute probs, fair price, edge, and Kelly.
+# All functions are NaN-tolerant and safe for vectorized use.
+
 from __future__ import annotations
-
 import math
-from typing import Iterable, Union
-
 import numpy as np
 import pandas as pd
 
-ProbArray = Union[np.ndarray, pd.Series, Iterable[float]]
+# ---------- Odds / Probability conversions ----------
 
-# ----------------------------
-# 1) Model-side probability
-# ----------------------------
-def _model_prob(mu: ProbArray, sigma: ProbArray) -> np.ndarray:
+def american_to_decimal(american: float | int | str) -> float | float("nan"):
     """
-    Convert strength (mu / sigma) into a probability via a clipped logistic.
-    This does not require a market threshold, so it works even when lines are missing.
-
-    p = sigmoid( clip(mu/sigma, -6, 6) )
-
-    Returns np.ndarray in [0.01, 0.99] to avoid exact 0/1.
+    Convert American odds (e.g., -120, +115) to decimal odds.
+    Returns np.nan on invalid input.
     """
-    mu = np.asarray(mu, dtype=float)
-    sigma = np.asarray(sigma, dtype=float)
-    z = mu / np.maximum(sigma, 1e-6)
-    z = np.clip(z, -6.0, 6.0)
-    p = 1.0 / (1.0 + np.exp(-z))
-    # soften extremes slightly
-    return np.clip(p, 0.01, 0.99)
-
-
-# ----------------------------
-# 2) Market fair probability
-# ----------------------------
-def _american_to_prob(price: Union[float, int]) -> float:
-    """Implied probability from American odds (no vig)."""
     try:
-        price = float(price)
+        a = float(american)
     except Exception:
         return np.nan
-    if price > 0:
-        return 100.0 / (price + 100.0)
+    if a == 0:
+        return np.nan
+    if a > 0:
+        return 1.0 + (a / 100.0)
     else:
-        return (-price) / ((-price) + 100.0)
+        return 1.0 + (100.0 / abs(a))
 
-
-def _devig_pair(p_over: float, p_under: float) -> tuple[float, float]:
+def implied_prob_from_american(american: float | int | str) -> float | float("nan"):
     """
-    Simple two-way de-vig: scale so p_over + p_under = 1 when both sides present.
-    If either side is NaN, return inputs.
+    Convert American odds to implied probability (book, not de-vigged).
     """
-    if np.isnan(p_over) or np.isnan(p_under):
-        return p_over, p_under
-    s = p_over + p_under
-    if s <= 0:
-        return p_over, p_under
-    return p_over / s, p_under / s
+    d = american_to_decimal(american)
+    if not np.isfinite(d) or d <= 1.0:
+        return np.nan
+    return 1.0 / d
 
-
-def _market_fair_prob(df: pd.DataFrame) -> pd.Series:
+def prob_to_american(p: float | int | str) -> float | float("nan"):
     """
-    Compute market fair probability from 'price' (American odds).
-    If both sides are present within the same (event, market, player, line) group,
-    de-vig them so they sum to 1. Otherwise fall back to single side implied.
+    Convert probability in [0,1] to American odds.
     """
-    if df is None or len(df) == 0:
-        return pd.Series([], dtype=float)
-
-    # Try to identify the natural grouping keys present in your odds dataframe.
-    # We’ll include only keys that actually exist to stay robust.
-    candidate_keys = ["event_id", "market", "player", "team", "line"]
-    keys = [k for k in candidate_keys if k in df.columns]
-    if not keys:
-        # no grouping info; just single-side implied
-        return df.get("price", pd.Series(np.nan, index=df.index)).map(_american_to_prob)
-
-    work = df.copy()
-    work["side"] = work.get("side") if "side" in work.columns else ""
-
-    # implied single-side
-    work["imp"] = work["price"].map(_american_to_prob)
-
-    # Two-way de-vig when we can
-    def devig_grp(g: pd.DataFrame) -> pd.Series:
-        over_mask = g["side"].astype(str).str.lower().str.contains("over")
-        under_mask = g["side"].astype(str).str.lower().str.contains("under")
-        if over_mask.any() and under_mask.any():
-            p_over = g.loc[over_mask, "imp"].iloc[0]
-            p_under = g.loc[under_mask, "imp"].iloc[0]
-            p_over_fair, p_under_fair = _devig_pair(p_over, p_under)
-            fair = g["imp"].copy()
-            fair.loc[over_mask] = p_over_fair
-            fair.loc[under_mask] = p_under_fair
-            return fair
-        return g["imp"]
-
-    fair = work.groupby(keys, group_keys=False).apply(devig_grp)
-    fair.index = df.index  # align
-    return fair
-
-
-# ----------------------------
-# 3) Blend, edge, conversions
-# ----------------------------
-def _blend(model_prob: ProbArray, fair_prob: ProbArray, w: float = 0.5) -> np.ndarray:
-    """
-    Weighted blend of model and market (default 50/50).
-    """
-    mp = np.asarray(model_prob, dtype=float)
-    fp = np.asarray(fair_prob, dtype=float)
-    return np.clip(w * mp + (1.0 - w) * fp, 0.0, 1.0)
-
-
-def prob_to_american(p: ProbArray) -> np.ndarray:
-    """
-    Convert probability to American odds.
-    """
-    p = np.asarray(p, dtype=float)
-    p = np.clip(p, 1e-6, 1 - 1e-6)
-    out = np.where(
-        p >= 0.5,
-        - (p / (1.0 - p)) * 100.0,       # favorites (negative)
-        ((1.0 - p) / p) * 100.0          # underdogs (positive)
-    )
-    return np.round(out, 0)
-
-
-def _edge(model_prob: ProbArray, fair_prob: ProbArray) -> np.ndarray:
-    """
-    Edge as difference in probabilities (model - market fair).
-    Positive => model more bullish than market.
-    """
-    return np.asarray(model_prob, dtype=float) - np.asarray(fair_prob, dtype=float)
-
-
-# ----------------------------
-# 4) Kelly criterion (American odds)
-# ----------------------------
-def _american_to_decimal(price: Union[float, int]) -> float:
     try:
-        price = float(price)
+        p = float(p)
     except Exception:
         return np.nan
-    if price > 0:
-        return 1.0 + price / 100.0
+    if not (0.0 < p < 1.0):
+        return np.nan
+    # decimal odds first
+    d = 1.0 / p
+    # convert decimal to American style
+    if d >= 2.0:
+        # positive American
+        return (d - 1.0) * 100.0
     else:
-        return 1.0 + 100.0 / (-price)
+        # negative American
+        return -100.0 / (d - 1.0)
 
+# ---------- Kelly ----------
 
-def kelly(prob: ProbArray, price: ProbArray) -> np.ndarray:
+def kelly(prob: float | int | str, american_price: float | int | str, floor_zero: bool = True) -> float:
     """
-    Kelly fraction using probability 'prob' and American odds 'price'.
-    Returns fraction of bankroll to wager (clipped to [0, 1]).
-    If inputs are missing/invalid, returns 0.
+    Fractional Kelly on American odds.
+    If prob or price is invalid → returns 0.
     """
-    p = np.asarray(prob, dtype=float)
-    dec = np.asarray([_american_to_decimal(v) for v in np.asarray(price)], dtype=float)
-    b = dec - 1.0
-    q = 1.0 - p
-    with np.errstate(divide="ignore", invalid="ignore"):
-        f = (b * p - q) / b
-    f = np.where(~np.isfinite(f), 0.0, f)
-    return np.clip(f, 0.0, 1.0)
+    try:
+        p = float(prob)
+    except Exception:
+        return 0.0
+    if not (0.0 <= p <= 1.0):
+        return 0.0
 
+    d = american_to_decimal(american_price)
+    if not np.isfinite(d) or d <= 1.0:
+        return 0.0
 
-__all__ = [
-    "_model_prob",
-    "_market_fair_prob",
-    "_blend",
-    "prob_to_american",
-    "_edge",
-    "kelly",
-]
+    b = d - 1.0  # net decimal payout
+    f = (p * (b + 1.0) - 1.0) / b  # equivalent to (bp - q)/b with stake = 1
+    if floor_zero:
+        return float(max(0.0, f))
+    return float(f)
 
+# ---------- Pricing frame helpers ----------
+
+def compute_market_prob(series: pd.Series) -> pd.Series:
+    """
+    series: American odds (string/number). Returns implied probabilities.
+    """
+    return series.apply(implied_prob_from_american)
+
+def compute_fair_prob(model_prob: pd.Series) -> pd.Series:
+    """
+    For now, fair_prob = model_prob (you can adjust to incorporate sigma, correlation, etc.)
+    """
+    return model_prob.astype(float)
+
+def compute_edge(fair_prob: pd.Series, market_prob: pd.Series) -> pd.Series:
+    """
+    Simple probability edge: fair - market. Returns NaN where either is NaN.
+    """
+    fair = pd.to_numeric(fair_prob, errors="coerce")
+    mkt = pd.to_numeric(market_prob, errors="coerce")
+    out = fair - mkt
+    out[~np.isfinite(fair) | ~np.isfinite(mkt)] = np.nan
+    return out
+
+def compute_kelly_col(prob: pd.Series, american_price: pd.Series) -> pd.Series:
+    return pd.Series([
+        kelly(p, a) if (np.isfinite(p) and p >= 0.0 and p <= 1.0) else 0.0
+        for p, a in zip(pd.to_numeric(prob, errors="coerce"), american_price)
+    ], index=prob.index)
+
+def attach_pricing_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mutates and returns df with: market_prob, fair_prob, fair_american, edge, kelly.
+    Required columns:
+        - 'odds' (American)  → we’ll map from 'price' if needed in engine
+        - 'model_prob'       → from rules (mu/sigma → prob)
+    """
+    if "odds" not in df.columns and "price" in df.columns:
+        df["odds"] = df["price"]
+
+    # numeric conversions
+    if "model_prob" in df.columns:
+        df["model_prob"] = pd.to_numeric(df["model_prob"], errors="coerce")
+    if "odds" in df.columns:
+        # keep as string/number; conversions happen per-row
+        pass
+
+    # market & fair
+    df["market_prob"]   = compute_market_prob(df.get("odds", pd.Series(index=df.index)))
+    df["fair_prob"]     = compute_fair_prob(df.get("model_prob", pd.Series(index=df.index)))
+
+    # fair price in American
+    df["fair_american"] = df["fair_prob"].apply(prob_to_american)
+
+    # edge & kelly
+    df["edge"]  = compute_edge(df["fair_prob"], df["market_prob"])
+    df["kelly"] = compute_kelly_col(df["fair_prob"], df.get("odds", pd.Series(index=df.index)))
+
+    return df
