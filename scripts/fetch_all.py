@@ -13,10 +13,11 @@ def _try_import(module: str):
     except Exception:
         return None
 
-_odds_api = _try_import("scripts.odds_api")  # The Odds API (if it works for you)
-_dk = _try_import("scripts.providers.draftkings_free") or _try_import("scripts.draftkings_free")
-_nflv = _try_import("scripts.providers.nflverse_free") or _try_import("scripts.nflverse_free")
-_espn = _try_import("scripts.providers.espn_free") or _try_import("scripts.espn_free")
+# IMPORTANT: try both module locations so this works regardless of your layout
+_odds_api = _try_import("scripts.odds_api") or _try_import("odds_api")
+_dk = _try_import("scripts.providers.draftkings_free") or _try_import("scripts.draftkings_free") or _try_import("draftkings_free")
+_nflv = _try_import("scripts.providers.nflverse_free") or _try_import("scripts.nflverse_free") or _try_import("nflverse_free")
+_espn = _try_import("scripts.providers.espn_free") or _try_import("scripts.espn_free") or _try_import("espn_free")
 
 ROOT = Path(".").resolve()
 OUT_DIR = ROOT / "outputs"
@@ -31,12 +32,12 @@ def _write_csv(df: pd.DataFrame, path: Path) -> int:
 
 def _read_csv(path: Path) -> pd.DataFrame:
     try:
-        if path.exists():
-            return pd.read_csv(path)
+        if path.exists(): return pd.read_csv(path)
     except Exception:
         pass
     return pd.DataFrame()
 
+# ---- flexible caller for odds_api functions -----------------------
 _ARG_ALIAS = {
     "date": ["date","target_date","slate_date"],
     "season": ["season","season_year","year"],
@@ -62,7 +63,7 @@ def _call_with_aliases(fn, date: str, season: str) -> Optional[pd.DataFrame]:
     return None
 
 def _load_props(date: str, season: str) -> pd.DataFrame:
-    # 1) Try The Odds API first (if you have a plan with props)
+    # 1) Try The Odds API first
     if _odds_api:
         for name in ("fetch_props","get_props","build_props_frame","load_props"):
             fn = getattr(_odds_api, name, None)
@@ -76,10 +77,11 @@ def _load_props(date: str, season: str) -> pd.DataFrame:
         try:
             df = _dk.fetch_dk_props()
             if not df.empty:
+                print("[fetch_all] using DraftKings fallback")
                 return df
         except Exception as e:
             print(f"[fetch_all] draftkings_free.fetch_dk_props error: {e}")
-    # 3) Local manual fallback
+    # 3) Manual local fallback
     for candidate in (OUT_DIR/"props_raw.csv", INPUTS/"props.csv", ROOT/"data"/"odds_sample.csv"):
         df = _read_csv(candidate)
         if not df.empty:
@@ -102,10 +104,10 @@ def main(date: str = "today", season: str = "2025") -> pd.DataFrame:
 
     # PROPS
     props = _load_props(date, season)
-    status["providers"]["props"] = "odds_api/dk/manual"[0:0]  # filled below for human read
+    status["providers"]["props"] = ("odds_api" if _odds_api else "none") + "+dk+manual"
     status["rows"]["props"] = int(len(props))
 
-    # TEAM WEEK FORM (if you have nflverse free helper)
+    # TEAM WEEK FORM (nflverse free helper if present)
     tdf = pd.DataFrame()
     if _nflv:
         try:
@@ -121,7 +123,7 @@ def main(date: str = "today", season: str = "2025") -> pd.DataFrame:
         status["providers"]["team_week_form.csv"] = "nfl_data_py:missing"
     status["rows"]["team_week_form.csv"] = _write_csv(tdf, METRICS / "team_week_form.csv")
 
-    # PLAYER FORM (neutral)
+    # PLAYER FORM (neutral from props for now)
     pdf = pd.DataFrame()
     if not props.empty:
         base = props[["player","team"]].drop_duplicates().copy()
@@ -133,7 +135,7 @@ def main(date: str = "today", season: str = "2025") -> pd.DataFrame:
         status["providers"]["player_form.csv"] = "missing"
     status["rows"]["player_form.csv"] = _write_csv(pdf, METRICS / "player_form.csv")
 
-    # ID MAP (ESPN if available)
+    # ID MAP (ESPN roster best-effort)
     idm = pd.DataFrame()
     if _espn and hasattr(_espn, "build_id_map_from_espn"):
         try:
@@ -145,7 +147,7 @@ def main(date: str = "today", season: str = "2025") -> pd.DataFrame:
         status["providers"]["id_map.csv"] = "espn:module-missing"
     status["rows"]["id_map.csv"] = _write_csv(idm, INPUTS / "player_id_cache.csv")
 
-    # WEATHER placeholder
+    # WEATHER placeholder (safe)
     wdf = pd.DataFrame()
     status["providers"]["weather.csv"] = "placeholder"
     status["rows"]["weather.csv"] = _write_csv(wdf, METRICS / "weather.csv")
