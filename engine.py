@@ -1,10 +1,8 @@
 # engine.py
 # Drop-in replacement. Provides robust team handling and end-to-end pipeline.
-
 from __future__ import annotations
 
 import os
-import json
 from pathlib import Path
 from typing import Tuple, Dict, Any
 
@@ -35,7 +33,7 @@ try:
         _blend,            # blend model + market prob
         prob_to_american,  # prob -> American
         _edge,             # edge % vs fair
-        kelly,             # Kelly sizing
+        kelly,             # Kelly sizing (expects array-like of American odds)
     )
 except Exception:
     _model_prob = None
@@ -83,11 +81,7 @@ _TEAM_ALIAS = {
     "TENNESSEE": "TEN", "TITANS": "TEN", "TEN": "TEN",
     "WASHINGTON": "WAS", "WASHINGTON COMMANDERS": "WAS", "COMMANDERS": "WAS", "WSH": "WAS", "WAS": "WAS",
 }
-
-_VALID_ABBRS = {
-    "ARI","ATL","BAL","BUF","CAR","CHI","CIN","CLE","DAL","DEN","DET","GB","HOU","IND","JAX","KC","LV",
-    "LAR","LAC","MIA","MIN","NE","NO","NYG","NYJ","PHI","PIT","SF","SEA","TB","TEN","WAS"
-}
+_VALID_ABBRS = set(_TEAM_ALIAS.values())
 
 def _normalize_team(val: object) -> str:
     if val is None:
@@ -122,8 +116,6 @@ def _read_csv(path: str | Path) -> pd.DataFrame:
 def _merge_features(props_df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
     """
     Ensure a reliable 'team' and 'team_norm' exist in props_df.
-    If team-like column is missing, try to infer from id_map via 'player'.
-    Return (df_augmented, source, note).
     """
     note_bits: list[str] = []
     df = props_df.copy()
@@ -166,8 +158,7 @@ def _apply_rules_compat(features: Dict[str, Any]) -> Tuple[float, float, str]:
         mu, sigma, notes = apply_rules(features)
         return float(mu), float(sigma), str(notes)
     except TypeError:
-        # if someone changed rules signature, handle gracefully
-        out = apply_rules(features)  # any 2- or 3-tuple variant
+        out = apply_rules(features)
         if isinstance(out, tuple) and len(out) == 2:
             mu, sigma = out
             return float(mu), float(sigma), ""
@@ -208,13 +199,11 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + float(np.math.erf(x / np.sqrt(2.0))))
 
 def _fallback_model_prob(mu: float, sigma: float) -> float:
-    # z=0 threshold => prob(mu>0). Tweak as your threshold dictates.
     z = (mu - 0.0) / max(sigma, 1e-6)
     return float(_norm_cdf(z))
 
 def _fallback_edge(model_prob: float, market_prob: float) -> float:
-    # simple difference
-    return float(model_prob - market_prob) if market_prob is not None else float(model_prob)
+    return float(model_prob - market_prob) if market_prob is not None and not np.isnan(market_prob) else float(model_prob)
 
 def _prob_to_american(p: float) -> float:
     p = max(min(p, 0.999999), 1e-6)
@@ -223,8 +212,8 @@ def _prob_to_american(p: float) -> float:
     return 100.0 * (1.0 - p) / p
 
 def _fallback_kelly(edge: float, price_prob: float) -> float:
-    # Standard Kelly on probability edge, clipped
-    if price_prob is None:
+    # Standard Kelly on prob edge, clipped
+    if price_prob is None or np.isnan(price_prob):
         return 0.0
     b = (1.0 / max(price_prob, 1e-6)) - 1.0
     f = (b * edge) / max(b, 1e-6)
@@ -283,9 +272,20 @@ def _price_frame(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["edge"] = out.apply(lambda r: _fallback_edge(r["fair_prob"], r.get("market_prob", np.nan)), axis=1)
 
-    # Kelly
+    # Kelly (🔧 FIX: your pricing.kelly expects American odds array-like, not probability)
     if kelly is not None:
-        out["kelly"] = out.apply(lambda r: kelly(r["edge"], r.get("market_prob", np.nan)), axis=1)
+        def _kelly_apply(r):
+            try:
+                price = r.get("odds", np.nan)
+                # wrap scalar price as a list for your function, then unwrap
+                val = kelly(r["edge"], [price])
+                if isinstance(val, (list, tuple, np.ndarray)):
+                    return float(val[0])
+                return float(val)
+            except Exception:
+                # fall back to probability-based Kelly if custom function complains
+                return _fallback_kelly(r["edge"], r.get("market_prob", np.nan))
+        out["kelly"] = out.apply(_kelly_apply, axis=1)
     else:
         out["kelly"] = out.apply(lambda r: _fallback_kelly(r["edge"], r.get("market_prob", np.nan)), axis=1)
 
@@ -300,7 +300,6 @@ def _load_external_metrics() -> dict[str, pd.DataFrame]:
     team_week_form = _read_csv("metrics/team_week_form.csv")
     player_form = _read_csv("metrics/player_form.csv")
 
-    # normalize keys where helpful
     if not team_form.empty:
         if "team" in team_form.columns and "team_norm" not in team_form.columns:
             team_form["team_norm"] = team_form["team"].astype(str).map(_normalize_team)
@@ -308,11 +307,7 @@ def _load_external_metrics() -> dict[str, pd.DataFrame]:
         if "team" in team_week_form.columns and "team_norm" not in team_week_form.columns:
             team_week_form["team_norm"] = team_week_form["team"].astype(str).map(_normalize_team)
 
-    return {
-        "team_form": team_form,
-        "team_week_form": team_week_form,
-        "player_form": player_form,
-    }
+    return {"team_form": team_form, "team_week_form": team_week_form, "player_form": player_form}
 
 def _safe_fetch_props() -> pd.DataFrame:
     if fetch_props_all_events is None:
@@ -349,7 +344,6 @@ def run_pipeline(target_date: str = "today", season: int = 2025, out_dir: bool =
     for _, r in props_aug.iterrows():
         features = _make_features_row(r, team_form=team_form, player_form=player_form)
         mu, sigma, notes = _apply_rules_compat(features)
-        # accumulate
         rr = dict(r)
         rr["mu"] = mu
         rr["sigma"] = sigma
@@ -362,7 +356,6 @@ def run_pipeline(target_date: str = "today", season: int = 2025, out_dir: bool =
     if not priced_df.empty and {"mu", "sigma"} <= set(priced_df.columns):
         priced_df = _price_frame(priced_df)
     else:
-        # ensure columns exist
         for col in ["model_prob", "market_prob", "fair_prob", "fair_american", "edge", "kelly"]:
             if col not in priced_df.columns:
                 priced_df[col] = np.nan
@@ -377,5 +370,4 @@ def run_pipeline(target_date: str = "today", season: int = 2025, out_dir: bool =
 
 
 if __name__ == "__main__":
-    # quick local smoke-test
     run_pipeline(target_date="today", season=2025, out_dir=True)
