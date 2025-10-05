@@ -1,515 +1,250 @@
-# scripts/fetch_all.py
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """
-Fetch external features from free sources and write CSVs into metrics/ and inputs/.
-Also writes a JSON report summarizing which sources/metrics populated.
+fetch_all.py
+-----------
+Minimal, hardened external metrics fetcher (free sources) that:
+- pulls PBP from nfl_data_py
+- normalizes schema across version changes
+- creates robust pass/rush flags
+- builds team_week_form and team_form
+- writes a per-run status summary
 
-Outputs:
-  metrics/team_form.csv
-  metrics/team_week_form.csv
-  metrics/player_form.csv
-  inputs/id_map.csv
-  inputs/weather.csv      (optional; contains schedule-weather shells)
-  metrics/fetch_report.json (coverage + source status)
-
-This script is resilient to nflverse schema changes (e.g., drive_result) and logs what was/wasn't populated.
+Usage:
+  python -m scripts.fetch_all --season 2025
 """
-
-from __future__ import annotations
 
 import os
-import sys
 import json
-import time
-import math
-import typing as t
-from dataclasses import dataclass, asdict
+import argparse
+from datetime import datetime
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# Free HTTP fetch (for PFR; will gracefully handle 403 and mark unavailable)
-import requests
-
-# nflverse python client
 try:
     import nfl_data_py as nfl
 except Exception as e:
     nfl = None
 
-# ------------------------
-# Config / constants
-# ------------------------
 
-SEASON_DEFAULT = 2025
+# -------------------------
+# Utility & hardening helpers
+# -------------------------
 
-OUT_METRICS_DIR = "metrics"
-OUT_INPUTS_DIR = "inputs"
-REPORT_PATH = os.path.join(OUT_METRICS_DIR, "fetch_report.json")
+def _ensure_dirs():
+    os.makedirs("metrics", exist_ok=True)
+    os.makedirs("inputs", exist_ok=True)
+    os.makedirs("outputs", exist_ok=True)
+    os.makedirs("data", exist_ok=True)
 
-# "Explosive" thresholds used commonly in analytics
-EXPLOSIVE_PASS_YDS = 20
-EXPLOSIVE_RUSH_YDS = 15
 
-# Neutral situation definition
-NEUTRAL_SCORE_DIFF = 7
-NEUTRAL_QUARTERS = {1, 2, 3}
-EARLY_DOWNS = {1, 2}
+def _ensure_columns(df: pd.DataFrame, cols_with_defaults: dict) -> pd.DataFrame:
+    """Ensure columns exist; if missing, create with defaults."""
+    for c, default in cols_with_defaults.items():
+        if c not in df.columns:
+            df[c] = default
+    return df
 
-# PFR endpoints (often 403 from CI; we still try and record status)
-PFR_OPPONENT_URL = "https://www.pro-football-reference.com/years/{season}/opp.htm"
-PFR_DRIVES_URL = "https://www.pro-football-reference.com/years/{season}/drives.htm"
 
-# ------------------------
-# Utilities / helpers
-# ------------------------
-
-def mkdirs():
-    os.makedirs(OUT_METRICS_DIR, exist_ok=True)
-    os.makedirs(OUT_INPUTS_DIR, exist_ok=True)
-
-@dataclass
-class SourceStatus:
-    name: str
-    ok: bool
-    rows: int
-    detail: str = ""
-
-@dataclass
-class CoverageReport:
-    season: int
-    generated_at: str
-    sources: list[SourceStatus]
-    metrics_rows: dict
-    notes: list[str]
-
-    def to_json(self) -> str:
-        payload = dict(
-            season=self.season,
-            generated_at=self.generated_at,
-            sources=[asdict(s) for s in self.sources],
-            metrics_rows=self.metrics_rows,
-            notes=self.notes,
-        )
-        return json.dumps(payload, indent=2)
-
-def log(msg: str):
-    print(msg, flush=True)
-
-def safe_len(df: t.Optional[pd.DataFrame]) -> int:
-    try:
-        return 0 if df is None else int(df.shape[0])
-    except Exception:
-        return 0
-
-def _ensure_drive_result(pbp: pd.DataFrame) -> pd.DataFrame:
+def _bool_from_playtype(df: pd.DataFrame, playtype_col: str = "play_type") -> pd.DataFrame:
     """
-    Guarantee 'drive_result' on pbp. Map from 'drive_end_event' if available,
-    else create placeholder.
+    Create boolean pass_flag / rush_flag robustly across PBP schema variants.
+    - Prefer 'play_type' string if present.
+    - Fall back to 'pass' / 'rush' numeric columns if available.
+    - Else create False defaults.
     """
-    if 'drive_result' in pbp.columns:
-        return pbp
-    if 'drive_end_event' in pbp.columns:
-        map_ev = {
-            'Touchdown': 'Touchdown',
-            'Opp touchdown': 'Opp touchdown',
-            'Field goal': 'Field goal',
-            'Missed FG': 'Missed FG',
-            'Punt': 'Punt',
-            'Fumble': 'Fumble',
-            'Interception': 'Interception',
-            'Safety': 'Safety',
-            'End of half': 'End of half',
-            'End of game': 'End of game',
-            'Downs': 'Turnover on downs',
-            'Timeout': 'Timeout',
-        }
-        dr = pbp['drive_end_event'].fillna('Unknown').astype(str)
-        pbp['drive_result'] = dr.map(map_ev).fillna(dr)
-        return pbp
-    pbp['drive_result'] = 'Unknown'
-    return pbp
-
-def _neutral_mask(df: pd.DataFrame) -> pd.Series:
-    """Neutral game state mask."""
-    # score differential from offense perspective
-    # nflverse columns can be posteam_score/defteam_score or score_differential; support both
-    if 'score_differential' in df.columns:
-        diff = df['score_differential']
+    if playtype_col in df.columns:
+        s = df[playtype_col].astype(str).str.lower()
+        df["pass_flag"] = s.eq("pass")
+        df["rush_flag"] = s.eq("run")
     else:
-        if {'posteam_score', 'defteam_score'}.issubset(df.columns):
-            diff = df['posteam_score'] - df['defteam_score']
+        # Old / variant columns
+        if "pass" in df.columns:
+            df["pass_flag"] = df["pass"].fillna(0).astype(bool)
         else:
-            # no score info; mark all as False
-            return pd.Series([False]*len(df), index=df.index)
+            df["pass_flag"] = False
 
-    q_ok = df.get('qtr', 0).isin(NEUTRAL_QUARTERS)
-    down_ok = df.get('down', 0).isin(EARLY_DOWNS)
-    return (diff.abs() <= NEUTRAL_SCORE_DIFF) & q_ok & down_ok
+        if "rush" in df.columns:
+            df["rush_flag"] = df["rush"].fillna(0).astype(bool)
+        else:
+            df["rush_flag"] = False
 
-def _is_pass_play(df: pd.DataFrame) -> pd.Series:
-    # nflverse has 'pass' boolean for dropbacks; fallback to play_type
-    if 'pass' in df.columns:
-        return df['pass'] == 1
-    if 'play_type' in df.columns:
-        return df['play_type'].astype(str).str.lower().eq('pass')
-    # fallback: none
-    return pd.Series([False]*len(df), index=df.index)
+    df["pass_flag"] = df["pass_flag"].fillna(False).astype(bool)
+    df["rush_flag"] = df["rush_flag"].fillna(False).astype(bool)
+    return df
 
-def _is_rush_play(df: pd.DataFrame) -> pd.Series:
-    if 'rush' in df.columns:
-        return df['rush'] == 1
-    if 'play_type' in df.columns:
-        return df['play_type'].astype(str).str.lower().eq('run')
-    return pd.Series([False]*len(df), index=df.index)
 
-def _yards_gained(df: pd.DataFrame) -> pd.Series:
-    if 'yards_gained' in df.columns:
-        return pd.to_numeric(df['yards_gained'], errors='coerce').fillna(0)
-    return pd.Series([0]*len(df), index=df.index)
+class RunStatus:
+    """Collects per-artifact row counts + optional notes."""
+    def __init__(self):
+        self.items = []
 
-def _in_red_zone(df: pd.DataFrame) -> pd.Series:
-    """
-    Approximate: offense snaps with yards_to_goal <= 20. nflverse has 'yardline_100' or 'yardline' variants.
-    """
-    # yardline_100 is yards to opponent goal from offense perspective (0 at opp goal)
-    y100 = None
-    for cand in ['yardline_100', 'yardline_50_to_ydline', 'ydstogo100']:
-        if cand in df.columns:
-            y100 = pd.to_numeric(df[cand], errors='coerce')
-            break
-    # if not available, try yardline as numeric from own 0..50..opp 50..opp 0 is tricky; skip
-    if y100 is None:
-        return pd.Series([False]*len(df), index=df.index)
-    # inside opp 20 means y100 <= 20
-    return y100 <= 20
+    def add(self, name: str, rows: int, note: str = ""):
+        self.items.append({"name": name, "rows": int(rows), "note": note})
 
-def _rate(n: pd.Series, d: pd.Series) -> pd.Series:
-    d = d.replace(0, np.nan)
-    return (n / d).fillna(0.0)
+    def write(self, path="metrics/fetch_status.json"):
+        try:
+            with open(path, "w") as f:
+                json.dump(
+                    {
+                        "when": datetime.utcnow().isoformat() + "Z",
+                        "artifacts": self.items,
+                    },
+                    f,
+                    indent=2,
+                )
+            print(f"↳ Wrote {path}")
+        except Exception as e:
+            print(f"⚠️ Failed to write {path}: {e}")
 
-# ------------------------
-# Fetchers
-# ------------------------
 
-def fetch_pbp(season: int) -> tuple[pd.DataFrame|None, SourceStatus]:
-    """
-    Download season PBP from nflverse. (nfl_data_py)
-    """
-    if nfl is None:
-        return None, SourceStatus("nflverse_pbp", False, 0, "nfl_data_py not installed/imported")
-
-    try:
-        log(f"► Downloading play-by-play for season={season} …")
-        pbp = nfl.import_pbp_data([season], downcast=True)
-        log(f"✓ PBP rows: {pbp.shape[0]:,}")
-        return pbp, SourceStatus("nflverse_pbp", True, pbp.shape[0], "")
-    except Exception as e:
-        return None, SourceStatus("nflverse_pbp", False, 0, f"{type(e).__name__}: {e}")
-
-def fetch_id_map(season: int) -> tuple[pd.DataFrame|None, SourceStatus]:
-    """
-    Player id crosswalk (will be sparse out of season).
-    """
-    if nfl is None:
-        return None, SourceStatus("nflverse_ids", False, 0, "nfl_data_py not installed/imported")
-    try:
-        ids = nfl.import_ids()
-        # keep a small subset
-        keep = [c for c in ['gsis_id', 'pfr_id', 'pfr_player_id', 'player_name',
-                            'recent_team', 'position'] if c in ids.columns]
-        out = ids[keep].drop_duplicates()
-        return out, SourceStatus("nflverse_ids", True, out.shape[0], "")
-    except Exception as e:
-        return None, SourceStatus("nflverse_ids", False, 0, f"{type(e).__name__}: {e}")
-
-def try_fetch_pfr_csv(url: str, timeout: int = 20) -> tuple[pd.DataFrame|None, str]:
-    """
-    Attempt to fetch a PFR table via simple HTTP. Many CI environments hit 403.
-    Return (df, detail_message).
-    """
-    try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return None, f"HTTP {r.status_code}: Forbidden/blocked likely (url={url})"
-        # crude table read; PFR tables can be commented; let pandas try anyway
-        dfs = pd.read_html(r.text)
-        if not dfs:
-            return None, "No tables found"
-        # choose the largest table heuristic
-        df = max(dfs, key=lambda d: d.shape[0]*d.shape[1])
-        return df, "OK"
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
-
-def fetch_pfr_opp(season: int) -> tuple[pd.DataFrame|None, SourceStatus]:
-    url = PFR_OPPONENT_URL.format(season=season)
-    log(f"GET {url}")
-    df, detail = try_fetch_pfr_csv(url)
-    ok = df is not None
-    rows = 0 if df is None else df.shape[0]
-    return df, SourceStatus("pfr_opponent", ok, rows, detail)
-
-def fetch_pfr_drives(season: int) -> tuple[pd.DataFrame|None, SourceStatus]:
-    url = PFR_DRIVES_URL.format(season=season)
-    log(f"GET {url}")
-    df, detail = try_fetch_pfr_csv(url)
-    ok = df is not None
-    rows = 0 if df is None else df.shape[0]
-    return df, SourceStatus("pfr_drives", ok, rows, detail)
-
-# ------------------------
-# Feature builders
-# ------------------------
+# -------------------------
+# Builders
+# -------------------------
 
 def build_team_week_form(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
-    """
-    Weekly team features (explosive pass/rush rates, neutral pass rate, red-zone proxies).
-    One row per (season, week, team).
-    """
+    """Aggregate team form by week; robust to column differences."""
     df = pbp.copy()
 
-    # Basic filters: regular plays only
-    if 'play_type_nfl' in df.columns:
-        # exclude non-plays like 'no_play', etc.
-        mask_play = df['play_type_nfl'].notna()
-        df = df[mask_play]
+    # Ensure basics; harmless if already present
+    df = _ensure_columns(
+        df,
+        {
+            "posteam": "",
+            "defteam": "",
+            "week": 0,
+            "yards_gained": 0.0,
+            "play_id": 0,
+        },
+    )
+    df = _bool_from_playtype(df)
 
-    # group key
-    wk = df.get('week', np.nan)
-    team = df.get('posteam', df.get('pos_team', df.get('offense', np.nan)))
-    df = df.assign(_week=wk, _team=team)
+    # Keep only valid weeks (defensive)
+    if "week" in df.columns:
+        df = df[df["week"].notna()]
+    else:
+        df["week"] = 0
 
-    # Explosive flags
-    yds = _yards_gained(df)
-    pass_flag = _is_pass_play(df)
-    rush_flag = _is_rush_play(df)
-    exp_pass = (pass_flag) & (yds >= EXPLOSIVE_PASS_YDS)
-    exp_rush = (rush_flag) & (yds >= EXPLOSIVE_RUSH_YDS)
+    grp = (
+        df.groupby(["posteam", "week"], dropna=False)
+        .agg(
+            plays=("play_id", "count"),
+            pass_plays=("pass_flag", "sum"),
+            rush_plays=("rush_flag", "sum"),
+            total_yards=("yards_gained", "sum"),
+        )
+        .reset_index()
+    )
+    grp["season"] = int(season)
 
-    # Neutral situation + pass
-    neutral = _neutral_mask(df)
-    neutral_pass = neutral & pass_flag
+    # Simple rate proxies
+    grp["pass_rate"] = np.where(grp["plays"] > 0, grp["pass_plays"] / grp["plays"], 0.0)
+    grp["rush_rate"] = np.where(grp["plays"] > 0, grp["rush_plays"] / grp["plays"], 0.0)
+    return grp
 
-    # Red-zone flags
-    rz = _in_red_zone(df)
-    rz_pass = rz & pass_flag
-    rz_rush = rz & rush_flag
 
-    g = df.groupby(['_team', '_week'], dropna=False)
-    agg = pd.DataFrame({
-        'plays': g.size(),
-        'pass_plays': g[pass_flag].size(),
-        'rush_plays': g[rush_flag].size(),
-        'exp_pass_cnt': g[exp_pass].size(),
-        'exp_rush_cnt': g[exp_rush].size(),
-        'neutral_plays': g[neutral].size(),
-        'neutral_pass_plays': g[neutral_pass].size(),
-        'rz_plays': g[rz].size(),
-        'rz_pass_plays': g[rz_pass].size(),
-        'rz_rush_plays': g[rz_rush].size(),
-    }).reset_index().rename(columns={'_team': 'team', '_week':'week'})
-
-    # Rates
-    agg['exp_pass_rate'] = _rate(agg['exp_pass_cnt'], agg['pass_plays'])
-    agg['exp_rush_rate'] = _rate(agg['exp_rush_cnt'], agg['rush_plays'])
-    agg['neutral_pass_rate'] = _rate(agg['neutral_pass_plays'], agg['neutral_plays'])
-    agg['rz_pass_rate'] = _rate(agg['rz_pass_plays'], agg['rz_plays'])
-    agg['rz_rush_rate'] = _rate(agg['rz_rush_plays'], agg['rz_plays'])
-
-    agg.insert(0, 'season', season)
+def build_team_form(team_week: pd.DataFrame) -> pd.DataFrame:
+    """Season-to-date rollup per team (useful as a fallback)."""
+    if team_week.empty:
+        return pd.DataFrame(columns=["posteam", "season", "plays", "pass_rate", "rush_rate"])
+    agg = (
+        team_week.groupby(["posteam", "season"], dropna=False)
+        .agg(
+            plays=("plays", "sum"),
+            pass_plays=("pass_plays", "sum"),
+            rush_plays=("rush_plays", "sum"),
+            total_yards=("total_yards", "sum"),
+        )
+        .reset_index()
+    )
+    agg["pass_rate"] = np.where(agg["plays"] > 0, agg["pass_plays"] / agg["plays"], 0.0)
+    agg["rush_rate"] = np.where(agg["plays"] > 0, agg["rush_plays"] / agg["plays"], 0.0)
     return agg
 
-def build_team_form(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
-    """
-    Season-to-date team features (aggregate of week form).
-    """
-    week = build_team_week_form(pbp, season)
-    g = week.groupby(['season', 'team'], dropna=False)
-    out = g[['plays', 'pass_plays', 'rush_plays',
-             'exp_pass_cnt', 'exp_rush_cnt',
-             'neutral_plays', 'neutral_pass_plays',
-             'rz_plays', 'rz_pass_plays', 'rz_rush_plays']].sum().reset_index()
 
-    out['exp_pass_rate'] = _rate(out['exp_pass_cnt'], out['pass_plays'])
-    out['exp_rush_rate'] = _rate(out['exp_rush_cnt'], out['rush_plays'])
-    out['neutral_pass_rate'] = _rate(out['neutral_pass_plays'], out['neutral_plays'])
-    out['rz_pass_rate'] = _rate(out['rz_pass_plays'], out['rz_plays'])
-    out['rz_rush_rate'] = _rate(out['rz_rush_plays'], out['rz_plays'])
-    return out
+# -------------------------
+# Main flow
+# -------------------------
 
-def build_player_form(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
-    """
-    Lightweight per-player usage snapshot from pbp only (counts & proxies).
-    If actual snap routes/targets are needed, you'd merge in route/snap tables later.
+def fetch_pbp(season: int) -> pd.DataFrame:
+    """Fetch and normalize PBP for a season from nfl_data_py."""
+    if nfl is None:
+        print("⚠️ nfl_data_py not available; returning empty PBP")
+        return pd.DataFrame()
 
-    Output one row per (season, player_id/gsis, team, position) with:
-      pass_att, rush_att, targets (from pass attempts to player), rec (completions), air_yards if available, etc.
-    """
-    df = pbp.copy()
+    print(f"► Downloading play-by-play for season={season} …")
+    try:
+        pbp = nfl.import_pbp_data([season])  # already returns a DataFrame
+    except Exception as e:
+        print(f"⚠️ PBP fetch failed: {e}")
+        return pd.DataFrame()
 
-    posteam = df.get('posteam')
-    defenses = df.get('defteam')
+    print(f"✓ PBP rows: {len(pbp):,}")
 
-    # Identify skill involvement
-    is_pass = _is_pass_play(df)
-    is_rush = _is_rush_play(df)
-
-    # Player columns in nflverse:
-    pass_thrower = df.get('passer_id')
-    rusher = df.get('rusher_id')
-    receiver = df.get('receiver_id')
-    complete = df.get('complete_pass', pd.Series([0]*len(df), index=df.index)).fillna(0).astype(int)
-
-    # Build skinny event-level tables
-    rows = []
-    # Passing attempts by passer
-    if pass_thrower is not None:
-        gb = df[is_pass & pass_thrower.notna()].groupby([pass_thrower, posteam], dropna=False).size().reset_index(name="pass_att")
-        gb.rename(columns={pass_thrower.name: 'player_id', posteam.name: 'team'}, inplace=True)
-        gb['stat'] = 'pass_att'
-        rows.append(gb)
-
-    # Rush attempts by rusher
-    if rusher is not None:
-        gb = df[is_rush & rusher.notna()].groupby([rusher, posteam], dropna=False).size().reset_index(name="rush_att")
-        gb.rename(columns={rusher.name: 'player_id', posteam.name: 'team'}, inplace=True)
-        gb['stat'] = 'rush_att'
-        rows.append(gb)
-
-    # Targets & receptions by receiver
-    if receiver is not None:
-        tg = df[is_pass & receiver.notna()].groupby([receiver, posteam], dropna=False).size().reset_index(name="targets")
-        tg.rename(columns={receiver.name: 'player_id', posteam.name: 'team'}, inplace=True)
-        tg['stat'] = 'targets'
-        rows.append(tg)
-
-        rc = df[is_pass & receiver.notna()].groupby([receiver, posteam], dropna=False)['complete_pass'].sum().reset_index(name="receptions")
-        rc.rename(columns={receiver.name: 'player_id', posteam.name: 'team'}, inplace=True)
-        rc['stat'] = 'receptions'
-        rows.append(rc)
-
-    if not rows:
-        return pd.DataFrame(columns=['season','player_id','team','pass_att','rush_att','targets','receptions'])
-
-    tall = pd.concat(rows, ignore_index=True).fillna(0)
-    # pivot to wide
-    wide = tall.pivot_table(index=['player_id','team'], columns='stat', values=['pass_att','rush_att','targets','receptions'], aggfunc='sum', fill_value=0)
-    # flatten columns
-    wide.columns = [c[0] for c in wide.columns]
-    wide = wide.reset_index()
-    wide.insert(0, 'season', season)
-    return wide
-
-# ------------------------
-# main
-# ------------------------
-
-def main(argv=None):
-    import datetime as dt
-
-    season = SEASON_DEFAULT
-    if argv is None:
-        argv = sys.argv[1:]
-
-    # --season 2025
-    for i, a in enumerate(argv):
-        if a == "--season" and i+1 < len(argv):
-            try:
-                season = int(argv[i+1])
-            except:
-                pass
-
-    mkdirs()
-
-    sources: list[SourceStatus] = []
-    notes: list[str] = []
-    metrics_rows: dict[str, int] = {}
-
-    # 1) PBP (nflverse)
-    pbp, st = fetch_pbp(season)
-    sources.append(st)
-    if pbp is None or pbp.empty:
-        notes.append("pbp unavailable; all derived metrics will be empty.")
-        # still write empty outputs for consistency
-        team_week = pd.DataFrame()
-        team_form = pd.DataFrame()
-        player_form = pd.DataFrame()
-    else:
-        # schema guard
-        pbp = _ensure_drive_result(pbp)
-
-        # 2) team-week and team season
-        log("► Building team_week_form …")
-        team_week = build_team_week_form(pbp, season)
-        log(f"✓ Wrote metrics/team_week_form.csv ({team_week.shape[0]} rows)")
-        team_week.to_csv(os.path.join(OUT_METRICS_DIR, "team_week_form.csv"), index=False)
-        metrics_rows['team_week_form'] = int(team_week.shape[0])
-
-        log("► Building team_form …")
-        team_form = build_team_form(pbp, season)
-        log(f"✓ Wrote metrics/team_form.csv ({team_form.shape[0]} rows)")
-        team_form.to_csv(os.path.join(OUT_METRICS_DIR, "team_form.csv"), index=False)
-        metrics_rows['team_form'] = int(team_form.shape[0])
-
-        # 3) player_form (usage proxies from pbp)
-        log("► Building player_form …")
-        player_form = build_player_form(pbp, season)
-        log(f"✓ Wrote metrics/player_form.csv ({player_form.shape[0]} rows)")
-        player_form.to_csv(os.path.join(OUT_METRICS_DIR, "player_form.csv"), index=False)
-        metrics_rows['player_form'] = int(player_form.shape[0])
-
-    # 4) id map (nflverse)
-    ids, st_ids = fetch_id_map(season)
-    sources.append(st_ids)
-    if ids is None:
-        pd.DataFrame().to_csv(os.path.join(OUT_INPUTS_DIR, "id_map.csv"), index=False)
-        metrics_rows['id_map'] = 0
-    else:
-        ids.to_csv(os.path.join(OUT_INPUTS_DIR, "id_map.csv"), index=False)
-        metrics_rows['id_map'] = int(ids.shape[0])
-
-    # 5) Weather (optional stub; still write header)
-    weather_cols = ['game_id','stadium','roof','surface','temp','wind','precip']
-    pd.DataFrame(columns=weather_cols).to_csv(os.path.join(OUT_INPUTS_DIR, "weather.csv"), index=False)
-    metrics_rows['weather'] = 0
-
-    # 6) PFR (try; likely 403 in CI)
-    pfr_opp, st_opp = fetch_pfr_opp(season)
-    sources.append(st_opp)
-    if not st_opp.ok:
-        notes.append(f"PFR opponent table unavailable: {st_opp.detail}")
-
-    pfr_drives, st_drv = fetch_pfr_drives(season)
-    sources.append(st_drv)
-    if not st_drv.ok:
-        notes.append(f"PFR drives table unavailable: {st_drv.detail}")
-
-    # Summarize + write report
-    rep = CoverageReport(
-        season=season,
-        generated_at=dt.datetime.utcnow().isoformat() + "Z",
-        sources=sources,
-        metrics_rows=metrics_rows,
-        notes=notes,
+    # Normalize schema across versions
+    pbp = _ensure_columns(
+        pbp,
+        {
+            "play_type": "",
+            "yards_gained": 0.0,
+            "drive_result": "Unknown",  # fixes earlier KeyError on drive_result
+            "posteam": "",
+            "defteam": "",
+            "week": 0,
+            "play_id": 0,
+        },
     )
-    with open(REPORT_PATH, "w", encoding="utf-8") as f:
-        f.write(rep.to_json())
+    pbp = _bool_from_playtype(pbp)
+    return pbp
 
-    # Human-readable summary
-    print("\n===== External Metrics Fetch Summary =====")
-    for s in sources:
-        flag = "OK " if s.ok else "ERR"
-        print(f"[{flag}] {s.name:16} rows={s.rows}  {s.detail}")
-    print("---- Outputs ----")
-    for k, v in metrics_rows.items():
-        print(f"{k:18}: {v}")
-    if notes:
-        print("---- Notes ----")
-        for n in notes:
-            print("-", n)
-    print(f"Report written: {REPORT_PATH}")
-    print("=========================================\n")
+
+def main(season: int):
+    _ensure_dirs()
+    status = RunStatus()
+
+    # 1) PBP
+    pbp = fetch_pbp(season)
+
+    # 2) team_week_form
+    try:
+        team_week = build_team_week_form(pbp, season)
+        team_week.to_csv("metrics/team_week_form.csv", index=False)
+        print(f"Wrote metrics/team_week_form.csv ({len(team_week)} rows)")
+        status.add("team_week_form.csv", len(team_week))
+    except Exception as e:
+        print(f"⚠️ team_week_form failed: {e}")
+        pd.DataFrame().to_csv("metrics/team_week_form.csv", index=False)
+        status.add("team_week_form.csv", 0, note=str(e))
+
+    # 3) team_form (season rollup)
+    try:
+        team_form = build_team_form(team_week if 'team_week' in locals() else pd.DataFrame())
+        team_form.to_csv("metrics/team_form.csv", index=False)
+        print(f"Wrote metrics/team_form.csv ({len(team_form)} rows)")
+        status.add("team_form.csv", len(team_form))
+    except Exception as e:
+        print(f"⚠️ team_form failed: {e}")
+        pd.DataFrame().to_csv("metrics/team_form.csv", index=False)
+        status.add("team_form.csv", 0, note=str(e))
+
+    # 4) Placeholder outputs (keep pipeline happy if not wired yet)
+    #    If you already build these elsewhere, feel free to remove the placeholders.
+    if not os.path.exists("metrics/player_form.csv"):
+        pd.DataFrame().to_csv("metrics/player_form.csv", index=False)
+        status.add("player_form.csv", 0, note="placeholder")
+    if not os.path.exists("inputs/id_map.csv"):
+        pd.DataFrame().to_csv("inputs/id_map.csv", index=False)
+        status.add("id_map.csv", 0, note="placeholder")
+    if not os.path.exists("inputs/weather.csv"):
+        pd.DataFrame(columns=["game_id", "temp", "wind", "precip"]).to_csv("inputs/weather.csv", index=False)
+        status.add("weather.csv", 0, note="placeholder")
+
+    # 5) Status summary
+    status.write("metrics/fetch_status.json")
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--season", type=int, required=True, help="Season year, e.g., 2025")
+    args = parser.parse_args()
+    main(args.season)
