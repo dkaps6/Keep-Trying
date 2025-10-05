@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # ✅ Make the Odds API key available to ALL steps in this job
+    # Make the secret available to ALL steps in this job
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
 
@@ -21,110 +21,67 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 1) Install your normal requirements.txt
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 2) BEST-EFFORT backup install for sportsdataverse (won't fail the job)
-      - name: (Optional) Ensure sportsdataverse is available
-        continue-on-error: true
+      # Simple, YAML-safe check (no heredocs)
+      - name: "Check Odds API key presence"
         shell: bash
         run: |
-          set -euxo pipefail
-          python - <<'PY'
-          try:
-              import sportsdataverse as sdv
-              print("sportsdataverse already installed ✅", getattr(sdv, "__version__", "unknown"))
-              raise SystemExit(0)
-          except Exception:
-              pass
-          PY
-          # Try PyPI pre-release first (if ever published), then GitHub
-          pip install --pre sportsdataverse || \
-          pip install --no-deps "git+https://github.com/sportsdataverse/py-sportsdataverse.git@main#egg=sportsdataverse" || \
-          echo "sportsdataverse skipped (optional)"
-          python - <<'PY'
-          try:
-              import sportsdataverse as sdv
-              print("sportsdataverse available ✅", getattr(sdv, "__version__", "unknown"))
-          except Exception as e:
-              print("sportsdataverse unavailable (optional) ❌", e)
-          PY
+          if [ -z "${ODDS_API_KEY}" ]; then
+            echo "⚠️  ODDS_API_KEY not set (Odds API props will fail)."
+          else
+            echo "ODDS_API_KEY set (suffix ${ODDS_API_KEY: -4})"
+          fi
 
-      # 3) ✅ Sanity check: is the ODDS_API_KEY actually present in this runner?
-      - name: Check Odds API key presence
-        run: |
-          python - <<'PY'
-          import os
-          key = os.environ.get("ODDS_API_KEY","")
-          print("ODDS_API_KEY set? ", bool(key), "  suffix:", key[-4:] if key else "")
-          PY
-
-      # 3b) (Optional but helpful) Ping the two Odds API endpoints from the runner
-      - name: Ping Odds API: featured odds (h2h)
+      # Ping the two Odds API endpoints from the runner (no heredocs)
+      - name: "Ping Odds API: featured odds (h2h)"
+        shell: bash
         run: |
           curl -sS "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?regions=us&markets=h2h&apiKey=${ODDS_API_KEY}" | head -c 400 || true
 
-      - name: Ping Odds API: one event's player props
+      - name: "Ping Odds API: one event player props"
+        shell: bash
         run: |
-          EID=$(curl -s "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?regions=us&markets=h2h&apiKey=${ODDS_API_KEY}" | python - <<'PY'
-          import sys,json
-          try:
-              d=json.load(sys.stdin)
-              print(d[0]['id'] if d else "")
-          except Exception:
-              print("")
-          PY
-          )
-          echo "Event ID: $EID"
-          if [ -n "$EID" ]; then
-            curl -sS "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/$EID/odds?regions=us&markets=player_pass_yds,player_reception_yds&apiKey=${ODDS_API_KEY}" | head -c 400 || true
+          EID=$(curl -s "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?regions=us&markets=h2h&apiKey=${ODDS_API_KEY}" | python -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'] if d else '')")
+          echo "Event ID: ${EID}"
+          if [ -n "${EID}" ]; then
+            curl -sS "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/${EID}/odds?regions=us&markets=player_pass_yds,player_reception_yds&apiKey=${ODDS_API_KEY}" | head -c 400 || true
           else
-            echo "Could not enumerate events (check the previous step output)."
+            echo "Could not enumerate events (check the featured-odds ping above)."
           fi
 
-      # 4) Make sure output dirs exist
       - name: Ensure dirs
         run: |
           mkdir -p metrics inputs outputs data
 
-      # 5) Fetch external metrics (and props, if your fetcher grabs them)
-      #    ✅ Pass ODDS_API_KEY here too, in case scripts/fetch_all uses it
+      # Fetch metrics/props (your fetcher tries Odds API -> DK -> manual CSV)
       - name: Fetch external metrics (free sources)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
-          # If you adopted my fetch_all.py with CLI entrypoint, this works:
           python -m scripts.fetch_all --season 2025
-          # If you don't have a CLI entrypoint, use:
-          # python - <<'PY'
-          # import scripts.fetch_all as F
-          # F.main(season="2025")
-          # PY
 
-      # 5b) Quick peek at our props snapshot (if any) before pricing
+      # Quick peek so you can confirm props were ingested before pricing
       - name: Peek props snapshot
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, pandas as pd
-          for p in ("outputs/props_raw.csv","inputs/props.csv","data/odds_sample.csv"):
-              if os.path.exists(p):
-                  df = pd.read_csv(p)
-                  print(f"{p}: {len(df)} rows")
-                  print(df.head(5).to_string(index=False))
-          PY
+          for p in outputs/props_raw.csv inputs/props.csv data/odds_sample.csv; do
+            if [ -f "$p" ]; then
+              rows=$(( $(wc -l < "$p") - 1 )); [ $rows -lt 0 ] && rows=0
+              echo "$p: ${rows} rows"
+              head -n 5 "$p" || true
+            fi
+          done
 
-      # 6) Run the main pricing/model pipeline
-      #    ✅ Pass ODDS_API_KEY (engine may call fetch again)
       - name: Run pipeline
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python run_model.py --date today --season 2025 --write outputs
 
-      # 7) Upload all artifacts (outputs + the fetched metrics)
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
