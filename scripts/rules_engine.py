@@ -1,82 +1,123 @@
 # scripts/rules_engine.py
 from __future__ import annotations
-from typing import Dict, Any, Tuple, Optional, List
 
-def apply_rules(*args, **kwargs) -> Tuple[float, float, str]:
-    # NEW style: first arg = features dict
-    if args and isinstance(args[0], dict):
-        features: Dict[str, Any] = args[0] or {}
-        side   = kwargs.get("side",   features.get("side"))
-        mu     = kwargs.get("mu",     features.get("mu_pred") or features.get("mu") or 0.0)
-        sigma  = kwargs.get("sigma",  features.get("sigma_pred") or features.get("sigma") or 0.25)
-        player = kwargs.get("player", features.get("player"))
-        team_ctx = kwargs.get("team_ctx", features.get("team_ctx"))
-    else:
-        # OLD style: side, mu, sigma as positionals; features via kw
-        if len(args) < 3:
-            raise TypeError("apply_rules() requires either (features_dict) or (side, mu, sigma, ...)")
-        side, mu, sigma = args[:3]
-        features: Dict[str, Any] = kwargs.get("features", {}) or {}
-        player = kwargs.get("player")
-        team_ctx = kwargs.get("team_ctx")
+from typing import Dict, Tuple, List, Any
 
-    mu_adj, sigma_adj, notes = _apply_rules_core(
-        side=side,
-        mu=float(mu),
-        sigma=float(sigma),
-        player=player,
-        team_ctx=team_ctx,
-        features=features,
-    )
-    return mu_adj, sigma_adj, notes
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 
+def _clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-def _apply_rules_core(
-    *,
-    side: Optional[str],
-    mu: float,
-    sigma: float,
-    player: Optional[Dict[str, Any]],
-    team_ctx: Optional[Dict[str, Any]],
-    features: Dict[str, Any],
-) -> Tuple[float, float, str]:
+def _getz(d: Dict[str, Any], key: str, default: float = 0.0) -> float:
+    try:
+        v = float(d.get(key, default))
+        if v != v:  # NaN guard
+            return default
+        return v
+    except Exception:
+        return default
+
+def _lower(s: Any) -> str:
+    return str(s or "").lower()
+
+# ---------------------------------------------------------------------
+# Core public API (new style)
+# ---------------------------------------------------------------------
+def apply_rules(features: Dict[str, Any]) -> Tuple[float, float, List[str]]:
     """
-    Starter "elite rules" (safe by default). Uses external features if present.
+    Primary entrypoint. Expects a dict that *may* include:
+      - 'mu', 'sigma', 'side', 'prop_type', 'position'
+      - 'neutral_pass_rate_def_z', 'rz_trips_def_z',
+        'explosive_pass_z', 'explosive_rush_z'
+      - (optionally any of your older signals: 'opp_pressure_z', etc.)
+
+    Returns (mu, sigma, notes)
     """
     notes: List[str] = []
 
-    # Sigma floor
-    if sigma < 0.05:
-        sigma = 0.05
-        notes.append("sigma_floor_0.05")
+    mu = float(features.get("mu", 0.0))
+    sigma = float(features.get("sigma", max(1e-6, abs(mu) * 0.10)))  # safe default
 
-    # Pressure-adjusted QB baseline (if features present)
-    opp_press_z = features.get("opp_team_pressure_z") or features.get("opp_pressure_z") or 0.0
-    opp_pass_epa_z = features.get("opp_pass_epa_z") or 0.0
-    if "passing" in str(features.get("market", "")).lower():
-        adj = (1.0 - 0.35 * float(opp_press_z)) * (1.0 - 0.25 * float(opp_pass_epa_z))
-        if adj != 1.0:
-            mu *= max(0.80, min(1.20, adj))
-            notes.append("qb_pressure_epa_adj")
+    prop = _lower(features.get("prop_type"))
+    pos  = _lower(features.get("position"))
 
-    # Funnel nudges (if present)
-    run_funnel = features.get("opp_run_funnel", 0)
-    pass_funnel = features.get("opp_pass_funnel", 0)
-    if run_funnel and "rushing" in str(features.get("market", "")).lower():
-        mu *= 1.03
-        notes.append("run_funnel_+3%")
-    if pass_funnel and ("receiv" in str(features.get("market", "")).lower() or "passing" in str(features.get("market", "")).lower()):
-        mu *= 1.03
-        notes.append("pass_funnel_+3%")
+    # ----------------------------
+    # 1) Neutral pass rate (defense)
+    # ----------------------------
+    # Tilt pass-volume / receiving props when defense *faces* more passes in neutral situations.
+    npr_z = _getz(features, "neutral_pass_rate_def_z", 0.0)
+    if abs(npr_z) > 0 and (
+        any(k in prop for k in ["rec", "reception", "pass att", "attempt"]) or
+        pos in ["wr", "te", "qb"]
+    ):
+        # +3% mu per z (capped ±10%) — gentle, multiplicative
+        scale = 1.0 + _clip(0.03 * npr_z, -0.10, 0.10)
+        mu *= scale
+        notes.append(f"neutral_pass_rate_def_z {npr_z:+.2f} → mu x{scale:.3f}")
 
-    # Volatility widening flags (if present)
-    if features.get("qb_volatility_flag") or features.get("protection_mismatch"):
-        sigma *= 1.15
-        notes.append("vol_widen_+15%")
+    # ----------------------------
+    # 2) Red-zone proxies (defense)
+    # ----------------------------
+    # If opponent allows more scoring/drive → slightly boost anytime TD style props.
+    rz_def_z = _getz(features, "rz_trips_def_z", 0.0)
+    if abs(rz_def_z) > 0 and any(k in prop for k in ["anytime", "td", "touchdown"]):
+        scale = 1.0 + _clip(0.05 * rz_def_z, -0.15, 0.15)  # ±15% cap
+        mu *= scale
+        notes.append(f"rz_trips_def_z {rz_def_z:+.2f} → mu x{scale:.3f}")
 
-    # Cap absurd mu if piping weird data
-    if not (-1e6 < mu < 1e6):
-        mu = 0.0
-        notes.append("mu_reset_out_of_bounds")
+    # ----------------------------
+    # 3) Explosive splits → volatility (sigma)
+    # ----------------------------
+    exp_pass_z = _getz(features, "explosive_pass_z", 0.0)
+    exp_rush_z = _getz(features, "explosive_rush_z", 0.0)
 
-    return mu, sigma, "|".join(notes)
+    # Heuristic classification
+    is_receivingish = any(k in prop for k in ["rec", "reception", "receiving", "pass", "longest rec"])
+    is_rushingish   = any(k in prop for k in ["rush", "rushing", "longest rush"])
+
+    if abs(exp_pass_z) > 0 and (is_receivingish or pos in ["wr", "te", "qb"]):
+        vol_scale = 1.0 + _clip(0.05 * exp_pass_z, -0.20, 0.20)  # ±20% cap on sigma
+        sigma *= max(0.30, vol_scale)  # never let sigma collapse too far
+        notes.append(f"explosive_pass_z {exp_pass_z:+.2f} → sigma x{vol_scale:.3f}")
+
+    if abs(exp_rush_z) > 0 and (is_rushingish or pos in ["rb"]):
+        vol_scale = 1.0 + _clip(0.05 * exp_rush_z, -0.20, 0.20)
+        sigma *= max(0.30, vol_scale)
+        notes.append(f"explosive_rush_z {exp_rush_z:+.2f} → sigma x{vol_scale:.3f}")
+
+    # ----------------------------
+    # 4) (Optional) QB pressure / pass-epa stubs remain for future use
+    # ----------------------------
+    # If you already feed these in features, you can uncomment the nudges.
+    # opp_press = _getz(features, "opp_pressure_z", 0.0)
+    # opp_pass_epa = _getz(features, "opp_pass_epa_z", 0.0)
+    # if abs(opp_press) > 0 and any(k in prop for k in ["pass", "attempt", "passing"]):
+    #     scale = 1.0 + _clip(-0.02 * opp_press, -0.08, 0.08)
+    #     mu *= scale
+    #     notes.append(f"opp_pressure_z {opp_press:+.2f} → mu x{scale:.3f}")
+
+    # Safety floor for sigma
+    sigma = max(sigma, max(1e-6, abs(mu) * 0.02))
+    return mu, sigma, notes
+
+
+# ---------------------------------------------------------------------
+# Backward compatibility wrapper
+# Your engine has called this shape in some runs
+# ---------------------------------------------------------------------
+def apply_rules_compat(fdct: Dict[str, Any],
+                       side: str,
+                       base_mu: float,
+                       base_sigma: float) -> Tuple[float, float, List[str]]:
+    """
+    Legacy compatibility wrapper:
+      returns (mu, sigma, notes)
+    """
+    # Merge base values into a new features dict for the new apply_rules
+    features = dict(fdct or {})
+    features.setdefault("mu", base_mu)
+    features.setdefault("sigma", base_sigma)
+    features.setdefault("side", side)
+    return apply_rules(features)
