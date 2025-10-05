@@ -14,7 +14,7 @@ NEW:
 OLD (positional):
     apply_rules(side, mu, sigma, player=..., team_ctx=...)
 
-In all cases, returns: (mu, sigma, notes_str)
+In all cases, returns: (mu, sigma, notes)
 """
 
 def apply_rules(*args, **kwargs) -> Tuple[float, float, str]:
@@ -69,7 +69,7 @@ def _apply_rules_core(
         sigma = 0.05
         notes.append("sigma_floor_0.05")
 
-    # optional: cap absurd mus if any pre-rule generated them
+    # optional: cap or backstop mu if missing
     if mu is None:
         mu = 0.0
         notes.append("mu_none_to_0")
@@ -94,4 +94,3 @@ def _apply_rules_core(
         notes.append("sigma_cast_fail_to_0.25")
 
     return mu, sigma, "|".join(notes)
-
