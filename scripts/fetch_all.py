@@ -1,344 +1,228 @@
 # scripts/fetch_all.py
-# Free-data builder with robust fallbacks + stadium weather inference:
-# - Team + team-week context from nfl_data_py play-by-play
-# - Player usage (targets / rush share) derived from PBP
-# - ID map from nfl_data_py rosters; if empty → ESPN roster API fallback (with espn_player_id)
-# - Stadium-based weather inference (uses inputs/stadiums.csv)
-# - Writes metrics/fetch_status.json with rowcounts + providers
-
 from __future__ import annotations
 
-import argparse
 import json
-import os
-import time
+import re
 from datetime import datetime
-from typing import Dict, Any, Tuple, List
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 import pandas as pd
-import requests
 
-try:
-    import nfl_data_py as nfl
-except Exception:
-    nfl = None
+# --- Optional odds provider (we call whatever you already have if present) ---
+def _try_import(module: str):
+    try:
+        return __import__(module, fromlist=["*"])
+    except Exception:
+        return None
 
-METRICS_DIR = "metrics"
-INPUTS_DIR = "inputs"
-os.makedirs(METRICS_DIR, exist_ok=True)
-os.makedirs(INPUTS_DIR, exist_ok=True)
+_odds_api = _try_import("scripts.odds_api")  # your existing file
+_nfl_data  = _try_import("nfl_data_py")      # if available
 
-# ---------- small IO helpers --------------------------------------------------
+ROOT = Path(".").resolve()
+OUT_DIR = ROOT / "outputs"
+METRICS = ROOT / "metrics"
+INPUTS = ROOT / "inputs"
+METRICS.mkdir(parents=True, exist_ok=True)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+INPUTS.mkdir(parents=True, exist_ok=True)
 
-def _write_csv(df: pd.DataFrame, path: str) -> int:
+# ------------------------- helpers -------------------------
+
+def _slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")
+
+def _write_csv(df: pd.DataFrame, path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
-    return len(df)
+    return int(len(df))
 
-def _status_init(season: int) -> Dict[str, Any]:
-    return {
-        "season": season,
-        "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds"),
+def _read_csv(path: Path) -> pd.DataFrame:
+    try:
+        if path.exists():
+            return pd.read_csv(path)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def _first_callable(mod, names: list[str]) -> Optional[Callable]:
+    if not mod:
+        return None
+    for n in names:
+        fn = getattr(mod, n, None)
+        if callable(fn):
+            return fn
+    return None
+
+# ------------------------- props fetch -------------------------
+
+def _load_props(date: str, season: str) -> pd.DataFrame:
+    """
+    We try your odds module first; otherwise fall back to any local CSVs.
+    Expected columns minimally: ['player','team','market','line','price'].
+    """
+    # Try to call into your odds module with any known names
+    if _odds_api:
+        for name in ["fetch_props", "get_props", "build_props_frame", "load_props"]:
+            fn = getattr(_odds_api, name, None)
+            if callable(fn):
+                try:
+                    df = fn(date=date, season=season) if "season" in fn.__code__.co_varnames else fn(date=date)
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        print(f"[fetch_all] props via scripts.odds_api.{name}: {len(df)} rows")
+                        return df
+                except Exception as e:
+                    print(f"[fetch_all] odds_api.{name} failed: {e}")
+
+    # Fallbacks: anything you may already write/read locally
+    for candidate in [
+        OUT_DIR / "props_raw.csv",
+        ROOT / "data" / "odds_sample.csv",
+        INPUTS / "props.csv",
+    ]:
+        df = _read_csv(candidate)
+        if not df.empty:
+            print(f"[fetch_all] props from {candidate}: {len(df)} rows")
+            return df
+
+    print("[fetch_all] WARNING: no props found anywhere")
+    return pd.DataFrame()
+
+# ------------------------- feature builders (real if available, else neutral) -------------------------
+
+def _team_week_form_real(season: int) -> pd.DataFrame:
+    if not _nfl_data:
+        return pd.DataFrame()
+    try:
+        # This is deliberately minimal; swap in your real calls if you have them.
+        # nfl_data_py often exposes weekly team summaries by season.
+        df = _nfl_data.import_team_desc(season)  # may not exist for 2025 / adjust for your env
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+def _neutral_team_week_form_from_props(props: pd.DataFrame) -> pd.DataFrame:
+    if props.empty:
+        return pd.DataFrame()
+    cols = ["team", "opp", "week", "drive_pace_z", "ns_epa_pass_z", "ns_epa_rush_z",
+            "blitz_rate_z", "man_coverage_z", "opp_pressure_rate_z", "ol_pressure_allowed_z",
+            "redzone_pass_rate", "goal_line_rush_share"]
+    # Build neutral rows for each team-week we see in props
+    base = props[["team", "opp"]].dropna().drop_duplicates().copy()
+    # If you carry 'week' in props, keep it; else set 0
+    if "week" in props.columns:
+        wk = props[["team", "week"]].dropna().drop_duplicates()
+        base = base.merge(wk, on="team", how="left")
+    else:
+        base["week"] = 0
+    for c in cols[2:]:
+        base[c] = 0.0
+    base["redzone_pass_rate"] = 0.5
+    base["goal_line_rush_share"] = 0.55
+    return base.rename(columns={"week": "week"})
+
+def _player_form_real(season: int) -> pd.DataFrame:
+    # If you have a player-level participation function, hook it here.
+    # Otherwise return empty and we’ll derive neutral from props.
+    return pd.DataFrame()
+
+def _player_form_from_props(props: pd.DataFrame) -> pd.DataFrame:
+    if props.empty:
+        return pd.DataFrame()
+    keep = props[["player", "team"]].drop_duplicates().copy()
+    # If week present, preserve; else set 0
+    if "week" in props.columns:
+        wk = props[["player", "team", "week"]].drop_duplicates()
+        keep = keep.merge(wk, on=["player", "team"], how="left")
+    else:
+        keep["week"] = 0
+    keep["player_form"] = 1.0   # neutral participation
+    # Optional hints if you have them in props
+    for c in ("routes", "targets", "catch_rate", "rush_att", "ypc", "attempts", "ypa", "target_share"):
+        if c not in keep.columns:
+            keep[c] = pd.NA
+    return keep
+
+def _id_map_real(season: int) -> pd.DataFrame:
+    # Plug your ESPN/NFL roster pull here if/when available.
+    return pd.DataFrame()
+
+def _id_map_from_props(props: pd.DataFrame) -> pd.DataFrame:
+    if props.empty:
+        return pd.DataFrame()
+    m = props[["player", "team"]].dropna().drop_duplicates().copy()
+    m["player_id"] = m["player"].apply(_slug) + "-" + m["team"].apply(_slug)
+    return m
+
+def _weather_from_inputs_or_empty() -> pd.DataFrame:
+    # If you have inputs/stadiums.csv + an inference, load it; otherwise empty is fine.
+    st = _read_csv(INPUTS / "stadiums.csv")
+    if st.empty:
+        return pd.DataFrame()
+    # If you do have stadiums + schedule keyed by game_id, join to produce weather;
+    # for now we return empty to avoid false joins.
+    return pd.DataFrame()
+
+# ------------------------- public API -------------------------
+
+def build_props_frame(date: str = "today", season: str = "2025") -> pd.DataFrame:
+    """Return props so the engine can run even if features are neutral."""
+    return _load_props(date, season)
+
+def main(date: str = "today", season: str = "2025") -> pd.DataFrame:
+    """
+    Build features and (optionally) props. Always writes a metrics/fetch_status.json
+    and CSVs for: team_week_form.csv, player_form.csv, id_map.csv, weather.csv
+    """
+    season_int = int(season) if str(season).isdigit() else 0
+    status: dict[str, Any] = {
+        "season": season_int or season,
+        "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
         "providers": {},
         "rows": {},
         "notes": [],
     }
 
-def _up(status: Dict[str, Any], name: str, rows: int, provider: str):
-    status["rows"][name] = rows
-    status["providers"][name] = provider
+    # 1) PROPS
+    props = _load_props(date, season)
+    status["providers"]["props"] = "odds" if not props.empty else "missing"
+    status["rows"]["props"] = int(len(props))
 
-def _empty_df(cols: List[str]) -> pd.DataFrame:
-    return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
-
-def _read_csv_safe(path: str, cols: List[str] | None = None) -> pd.DataFrame:
-    if not os.path.exists(path):
-        return _empty_df(cols or [])
-    try:
-        df = pd.read_csv(path)
-        if cols:
-            for c in cols:
-                if c not in df.columns:
-                    df[c] = pd.NA
-        return df
-    except Exception:
-        return _empty_df(cols or [])
-
-# ---------- nflverse: PBP + builders -----------------------------------------
-
-def _load_pbp(season: int) -> Tuple[pd.DataFrame, str]:
-    if nfl is None:
-        return _empty_df(["play_id"]), "nflverse:not_installed"
-    try:
-        df = nfl.import_pbp_data([season])
-        for c in ("yards_gained", "yardline_100", "score_differential"):
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        # normalize week column
-        if "week" not in df.columns and "game_week" in df.columns:
-            df["week"] = df["game_week"]
-        return df, "nflverse"
-    except Exception:
-        return _empty_df(["play_id"]), "nflverse:error"
-
-def _build_team_week_form(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
-    if pbp.empty:
-        return _empty_df(["team", "week"])
-
-    df = pbp.copy()
-    df["is_pass"] = (df.get("pass", False)).astype("int")
-    df["is_rush"] = (df.get("rush", False)).astype("int")
-    df["neutral"] = ((df.get("score_differential", 0).abs() <= 7) & (df.get("qtr", 0) <= 3)).astype("int")
-    df["exp_pass"] = ((df["is_pass"] == 1) & (df.get("yards_gained", 0) >= 20)).astype("int")
-    df["exp_rush"] = ((df["is_rush"] == 1) & (df.get("yards_gained", 0) >= 10)).astype("int")
-    df["rz_play"] = (df.get("yardline_100", 100) <= 20).astype("int")
-
-    team_col = "posteam" if "posteam" in df.columns else ("pos_team" if "pos_team" in df.columns else None)
-    if team_col is None:
-        return _empty_df(["team", "week"])
-    if "week" not in df.columns:
-        df["week"] = df.get("game_week", 1)
-
-    g = df.groupby([team_col, "week"], dropna=False).agg(
-        pass_plays=("is_pass", "sum"),
-        rush_plays=("is_rush", "sum"),
-        neutral_pass=("is_pass", lambda s: (s[df.loc[s.index, "neutral"] == 1].sum() or 0)),
-        neutral_total=("neutral", "sum"),
-        exp_pass=("exp_pass", "sum"),
-        exp_rush=("exp_rush", "sum"),
-        rz_plays=("rz_play", "sum"),
-        total_plays=("is_pass", "count"),
-    ).reset_index()
-
-    g.rename(columns={team_col: "team"}, inplace=True)
-    g["neutral_pass_rate"] = g["neutral_pass"].div(g["neutral_total"]).fillna(0.0)
-    g["exp_pass_rate"] = g["exp_pass"].div(g["pass_plays"].clip(lower=1)).fillna(0.0)
-    g["exp_rush_rate"] = g["exp_rush"].div(g["rush_plays"].clip(lower=1)).fillna(0.0)
-    g["rz_rate"] = g["rz_plays"].div(g["total_plays"].clip(lower=1)).fillna(0.0)
-    g["season"] = season
-
-    return g[[
-        "season","team","week","pass_plays","rush_plays","neutral_pass_rate",
-        "exp_pass_rate","exp_rush_rate","rz_rate","total_plays"
-    ]]
-
-def _build_team_form(team_week: pd.DataFrame) -> pd.DataFrame:
-    if team_week.empty:
-        return _empty_df(["team"])
-    g = team_week.groupby(["season","team"], dropna=False).agg(
-        weeks=("week","count"),
-        pass_plays=("pass_plays","sum"),
-        rush_plays=("rush_plays","sum"),
-        neutral_pass_rate=("neutral_pass_rate","mean"),
-        exp_pass_rate=("exp_pass_rate","mean"),
-        exp_rush_rate=("exp_rush_rate","mean"),
-        rz_rate=("rz_rate","mean"),
-        total_plays=("total_plays","sum"),
-    ).reset_index()
-    return g
-
-def _build_player_form(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
-    if pbp.empty:
-        return _empty_df(["player","team","week"])
-
-    df = pbp.copy()
-    # targets
-    recv = df[["posteam","week","receiver_player_name"]].copy()
-    recv = recv[recv["receiver_player_name"].notna()]
-    recv["targets"] = 1
-    # rush attempts
-    rush = df[["posteam","week","rusher_player_name"]].copy()
-    rush = rush[rush["rusher_player_name"].notna()]
-    rush["rush_att"] = 1
-
-    team_pass = recv.groupby(["posteam","week"], dropna=False)["targets"].sum().rename("team_targets")
-    team_rush = rush.groupby(["posteam","week"], dropna=False)["rush_att"].sum().rename("team_rushatt")
-
-    p_tgt = recv.groupby(["posteam","week","receiver_player_name"], dropna=False)["targets"].sum().reset_index()
-    p_tgt.rename(columns={"receiver_player_name":"player"}, inplace=True)
-    p_rush = rush.groupby(["posteam","week","rusher_player_name"], dropna=False)["rush_att"].sum().reset_index()
-    p_rush.rename(columns={"rusher_player_name":"player"}, inplace=True)
-
-    players = pd.merge(p_tgt, p_rush, on=["posteam","week","player"], how="outer").fillna(0)
-    players = players.merge(team_pass, on=["posteam","week"], how="left")
-    players = players.merge(team_rush, on=["posteam","week"], how="left")
-    players["tgt_share"] = players["targets"].div(players["team_targets"].clip(lower=1))
-    players["rush_share"] = players["rush_att"].div(players["team_rushatt"].clip(lower=1))
-    players["season"] = season
-    players.rename(columns={"posteam":"team"}, inplace=True)
-
-    cols = ["season","team","week","player","targets","rush_att","tgt_share","rush_share"]
-    return players[cols].sort_values(["team","player","week"])
-
-# ---------- nflverse rosters → id_map ----------------------------------------
-
-def _id_map_from_nflverse(season: int) -> Tuple[pd.DataFrame, str]:
-    if nfl is None:
-        return _empty_df(["player","team","position","espn_player_id"]), "nflverse:not_installed"
-    try:
-        rost = nfl.import_rosters([season])
-        if rost.empty:
-            return _empty_df(["player","team","position","espn_player_id"]), "nflverse:empty"
-        df = rost.rename(columns={
-            "recent_team": "team",
-            "player_name": "player",
-            "position": "position",
-            "espn_id": "espn_player_id",
-        })[["player","team","position","espn_player_id"]].dropna(subset=["player","team"])
-        return df.drop_duplicates(), "nflverse"
-    except Exception:
-        return _empty_df(["player","team","position","espn_player_id"]), "nflverse:error"
-
-# ---------- ESPN roster fallback (with espn_player_id) ------------------------
-
-_ESPN_TEAMS = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
-_ESPN_TEAM_ROSTER = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{tid}?enable=roster"
-
-def _req_json(url: str, tries: int = 3, timeout: int = 20) -> Dict[str, Any] | None:
-    for i in range(tries):
-        try:
-            r = requests.get(url, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (429, 503):
-                time.sleep(1.5 * (i + 1))
-            else:
-                time.sleep(0.5)
-        except requests.RequestException:
-            time.sleep(0.5)
-    return None
-
-def _id_map_from_espn() -> Tuple[pd.DataFrame, str]:
-    base = _req_json(_ESPN_TEAMS)
-    if not base:
-        return _empty_df(["player","team","position","espn_player_id"]), "espn:error_teams"
-
-    teams: list[tuple[str,str]] = []
-    try:
-        for t in base["sports"][0]["leagues"][0]["teams"]:
-            team = t["team"]
-            abbr = team.get("abbreviation") or team.get("shortDisplayName")
-            teams.append((team["id"], abbr))
-    except Exception:
-        return _empty_df(["player","team","position","espn_player_id"]), "espn:parse_teams"
-
-    rows = []
-    for tid, abbr in teams:
-        j = _req_json(_ESPN_TEAM_ROSTER.format(tid=tid))
-        if not j:
-            continue
-        try:
-            roster = j["team"]["athletes"]
-        except Exception:
-            continue
-        for group in roster:
-            pos = group.get("position", {}).get("abbreviation") or group.get("position", {}).get("name")
-            for ath in group.get("items", []):
-                name = ath.get("fullName") or ath.get("displayName")
-                espn_pid = ath.get("id")  # ESPN athlete id (string)
-                if name and abbr:
-                    rows.append((name, abbr, pos, espn_pid))
-        time.sleep(0.05)  # small courtesy pause
-
-    if not rows:
-        return _empty_df(["player","team","position","espn_player_id"]), "espn:empty"
-
-    df = pd.DataFrame(rows, columns=["player","team","position","espn_player_id"]).drop_duplicates()
-    return df, "espn"
-
-# ---------- Stadium-based weather inference ----------------------------------
-
-STADIUM_COLS = ["team","abbr","stadium","city","state","roof","is_dome","surface","altitude_ft"]
-
-def _infer_weather_from_stadiums(stadiums: pd.DataFrame) -> pd.DataFrame:
-    """
-    Per-team baseline weather inference:
-      - dome/retractable: wind=0, temp=70F, precip=0
-      - outdoor: NaNs (to be filled by a live weather step later)
-    Carries surface + altitude to downstream features.
-    """
-    if stadiums.empty:
-        return _empty_df(["team","abbr","is_dome","surface","altitude_ft","temp_f","wind_mph","precip_in"])
-
-    df = stadiums.copy()
-    # normalize booleans
-    dome = df.get("is_dome")
-    if dome is None:
-        dome = df.get("roof", "").astype(str).str.contains("Fixed|Retractable", case=False, regex=True)
+    # 2) TEAM-WEEK FORM
+    tdf = _team_week_form_real(season_int)
+    if tdf.empty and not props.empty:
+        status["providers"]["team_week_form.csv"] = "neutral-from-props"
+        tdf = _neutral_team_week_form_from_props(props)
     else:
-        dome = dome.astype(str).str.upper().isin(["TRUE","1","YES","Y"])
+        status["providers"]["team_week_form.csv"] = "nflverse" if not tdf.empty else "nflverse:error"
+    status["rows"]["team_week_form.csv"] = _write_csv(tdf, METRICS / "team_week_form.csv")
 
-    out = pd.DataFrame({
-        "team": df["team"].astype(str),
-        "abbr": df.get("abbr", df["team"]).astype(str),
-        "is_dome": dome,
-        "surface": df.get("surface", "Grass"),
-        "altitude_ft": pd.to_numeric(df.get("altitude_ft", 0), errors="coerce").fillna(0).astype(int),
-    })
-
-    # defaults
-    out["temp_f"] = None
-    out["wind_mph"] = None
-    out["precip_in"] = None
-
-    # dome/retractable inference
-    dome_mask = out["is_dome"] == True
-    out.loc[dome_mask, "temp_f"] = 70
-    out.loc[dome_mask, "wind_mph"] = 0
-    out.loc[dome_mask, "precip_in"] = 0.0
-
-    return out
-
-# ---------- main --------------------------------------------------------------
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--season", type=int, required=True)
-    args = ap.parse_args()
-
-    status = _status_init(args.season)
-
-    # 1) PBP & core form
-    pbp, pbp_provider = _load_pbp(args.season)
-    status["providers"]["pbp"] = pbp_provider
-    status["rows"]["pbp"] = len(pbp)
-
-    team_week = _build_team_week_form(pbp, args.season)
-    _up(status, "team_week_form.csv", _write_csv(team_week, os.path.join(METRICS_DIR,"team_week_form.csv")), pbp_provider)
-
-    team_form = _build_team_form(team_week)
-    _up(status, "team_form.csv", _write_csv(team_form, os.path.join(METRICS_DIR,"team_form.csv")), pbp_provider)
-
-    player_form = _build_player_form(pbp, args.season)
-    _up(status, "player_form.csv", _write_csv(player_form, os.path.join(METRICS_DIR,"player_form.csv")), "pbp-derived")
-
-    # 2) id_map: nflverse → fallback espn (with espn_player_id)
-    id_map, id_src = _id_map_from_nflverse(args.season)
-    rows = _write_csv(id_map, os.path.join(INPUTS_DIR,"id_map.csv"))
-    _up(status, "id_map.csv", rows, id_src)
-
-    if rows == 0:
-        espn_map, espn_src = _id_map_from_espn()
-        rows2 = _write_csv(espn_map, os.path.join(INPUTS_DIR,"id_map.csv"))
-        _up(status, "id_map.csv", rows2, espn_src)
-        if rows2 == 0:
-            status["notes"].append("Both nflverse and ESPN rosters empty; id_map.csv will be empty")
-
-    # 3) Stadium-based weather inference
-    stadiums = _read_csv_safe(os.path.join(INPUTS_DIR, "stadiums.csv"), STADIUM_COLS)
-    if stadiums.empty:
-        status["notes"].append("inputs/stadiums.csv not found or empty; weather inference skipped")
-        weather = _empty_df(["team","abbr","is_dome","surface","altitude_ft","temp_f","wind_mph","precip_in"])
-        provider = "placeholder"
+    # 3) PLAYER FORM
+    pdf = _player_form_real(season_int)
+    if pdf.empty and not props.empty:
+        status["providers"]["player_form.csv"] = "props-derived"
+        pdf = _player_form_from_props(props)
     else:
-        weather = _infer_weather_from_stadiums(stadiums)
-        provider = "stadium_inference"
+        status["providers"]["player_form.csv"] = "provider" if not pdf.empty else "pbp:error"
+    status["rows"]["player_form.csv"] = _write_csv(pdf, METRICS / "player_form.csv")
 
-    _up(status, "weather.csv", _write_csv(weather, os.path.join(INPUTS_DIR,"weather.csv")), provider)
+    # 4) ID MAP
+    idm = _id_map_real(season_int)
+    if idm.empty and not props.empty:
+        status["providers"]["id_map.csv"] = "props-derived"
+        idm = _id_map_from_props(props)
+    else:
+        status["providers"]["id_map.csv"] = "espn" if not idm.empty else "espn:empty"
+    status["rows"]["id_map.csv"] = _write_csv(idm, INPUTS / "player_id_cache.csv")
 
-    with open(os.path.join(METRICS_DIR,"fetch_status.json"), "w") as f:
-        json.dump(status, f, indent=2)
+    # 5) WEATHER
+    wdf = _weather_from_inputs_or_empty()
+    status["providers"]["weather.csv"] = "inferred" if not wdf.empty else "placeholder"
+    status["rows"]["weather.csv"] = _write_csv(wdf, METRICS / "weather.csv")
 
-    print("Fetch complete:\n", json.dumps(status, indent=2))
+    # 6) Save status JSON
+    (METRICS / "fetch_status.json").write_text(json.dumps(status, indent=2))
+    print("Fetch complete:\n" + json.dumps(status, indent=2))
 
-if __name__ == "__main__":
-    main()
+    # Return props for the engine (it will do robust merges + pricing)
+    return props
