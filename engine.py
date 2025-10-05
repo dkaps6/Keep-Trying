@@ -1,223 +1,301 @@
 # engine.py
-# Turn-key pipeline driver for pricing + rules + outputs
-# Robust to optional modules, tuple returns, and rules signature changes.
-
 from __future__ import annotations
 
-import os
-import sys
-from typing import Any, Dict, Tuple
+import importlib
+import json
+import math
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, List
 
+import numpy as np
 import pandas as pd
 
+# --- Odds fetchers (these already exist in your repo) ---
+from scripts.odds_api import fetch_game_lines, fetch_props_all_events
 
-# -----------------------------
-# Small utils
-# -----------------------------
-def _print(msg: str) -> None:
-    print(msg, flush=True)
+# --- Rules (new flexible signature we shipped) ---
+from scripts.rules_engine import apply_rules
 
-
-def ensure_dir(path: str) -> None:
-    if path and not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-
-
-def _downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    for col in df.columns:
-        if pd.api.types.is_float_dtype(df[col]):
-            df[col] = pd.to_numeric(df[col], downcast="float")
-        elif pd.api.types.is_integer_dtype(df[col]):
-            df[col] = pd.to_numeric(df[col], downcast="integer")
-    return df
-
-
-def _as_df(obj: Any, label: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Normalize function results that may be either:
-      - DataFrame
-      - (DataFrame, meta_dict)
-      - None
-    Returns (df, meta).
-    """
-    meta: Dict[str, Any] = {}
-    if obj is None:
-        return pd.DataFrame(), meta
-    if isinstance(obj, pd.DataFrame):
-        return obj, meta
-    if isinstance(obj, tuple):
-        head = obj[0] if len(obj) > 0 else None
-        if isinstance(head, pd.DataFrame):
-            meta = obj[1] if len(obj) > 1 and isinstance(obj[1], dict) else {}
-            return head, meta
-    # last resort: empty df and a note
-    _print(f"WARNING: {label} returned unexpected type {type(obj).__name__}; using empty DataFrame.")
-    return pd.DataFrame(), meta
-
-
-# --------------------------------
-# Optional helpers
-# --------------------------------
-try:
-    from scripts.engine_helpers import (
-        make_team_last4_from_player_form,
-        safe_divide,
-    )
-except Exception:
-    def make_team_last4_from_player_form(_: pd.DataFrame) -> pd.DataFrame:
-        return pd.DataFrame()
-
-    def safe_divide(a, b, default=0.0):
-        try:
-            return a / b if b else default
-        except Exception:
-            return default
-
-
-# --------------------------------
-# Odds API (required in our flow)
-# --------------------------------
-from scripts.odds_api import (
-    fetch_game_lines,
-    fetch_props_all_events,
+# --- Pricing helpers (this is the “tiny nudge” import) ---
+from scripts.pricing import (
+    _model_prob,
+    _market_fair_prob,
+    _blend,
+    prob_to_american,
+    _edge,
+    kelly_fraction,
 )
 
-# --------------------------------
-# Pricing core (required)
-# --------------------------------
-from scripts.model_core import price_props_for_events
-
-# --------------------------------
-# External features (optional)
-# --------------------------------
+# Optional external merge (OK if missing)
 try:
-    from scripts.features_external import merge_external_features
-    _HAS_MERGE_EXTERNAL = True
+    from scripts.features_external import merge_external_features  # optional
+    HAS_MERGE_EXTERNAL = True
 except Exception:
-    _HAS_MERGE_EXTERNAL = False
+    HAS_MERGE_EXTERNAL = False
 
 
-# --------------------------------
-# Rules engine – compatibility
-# --------------------------------
-from scripts.rules_engine import apply_rules as _apply_rules
+# -------------------------
+# Utility / safe operations
+# -------------------------
+def _norm(s: Any) -> str:
+    if s is None:
+        return ""
+    return str(s).strip()
 
-def _apply_rules_compat(features: Dict[str, Any],
-                        side: str,
-                        mu: float,
-                        sigma: float) -> Tuple[float, float, str]:
-    """
-    Call scripts.rules_engine.apply_rules regardless of signature.
-    Supports:
-      - apply_rules(features)
-      - apply_rules(side, mu, sigma, features)
-      - apply_rules(side=..., mu=..., sigma=..., features=...)
-    """
+def _safe_float(x: Any, default: float = np.nan) -> float:
     try:
-        return _apply_rules(features)  # new style
-    except TypeError:
-        try:
-            return _apply_rules(side, mu, sigma, features)  # old positional
-        except TypeError:
-            return _apply_rules(side=side, mu=mu, sigma=sigma, features=features)  # keyword
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
-# -------------------------------------------------
-# Core pipeline
-# -------------------------------------------------
-def run_pipeline(target_date: str,
-                 season: int,
-                 out_dir: str = "outputs") -> None:
-    _print(f"Loaded engine module from: {os.path.abspath(__file__)}")
+# -------------------------------------
+# External files (optional, non-fatal)
+# -------------------------------------
+def build_external(season: int) -> Dict[str, pd.DataFrame]:
+    """
+    Tries to read optional external CSVs (team_form, player_form, id_map, weather).
+    Returns empty/tiny frames if not found so the pipeline keeps running.
+    """
+    base = Path("metrics")
+    inputs = Path("inputs")
+    base.mkdir(parents=True, exist_ok=True)
+    inputs.mkdir(parents=True, exist_ok=True)
 
-    ensure_dir(out_dir)
-    ensure_dir("metrics")
-    ensure_dir("inputs")
+    def _read_csv(p: Path, cols: Optional[List[str]] = None) -> pd.DataFrame:
+        if p.exists():
+            try:
+                df = pd.read_csv(p)
+                if cols:
+                    for c in cols:
+                        if c not in df.columns:
+                            df[c] = np.nan
+                return df
+            except Exception:
+                pass
+        # minimal empty frame
+        return pd.DataFrame(columns=cols or [])
 
-    team_form_path = os.path.join("metrics", "team_form.csv")
-    player_form_path = os.path.join("metrics", "player_form.csv")
-    id_map_path = os.path.join("metrics", "id_map.csv")
+    team_form = _read_csv(
+        base / "team_form.csv",
+        cols=[
+            "team", "week",
+            "pressure_z", "pass_epa_z",
+            "run_funnel", "pass_funnel"
+        ],
+    )
+    player_form = _read_csv(
+        base / "player_form.csv",
+        cols=[
+            "gsis_id", "week",
+            "usage_routes", "usage_targets", "usage_carries",
+            "mu_pred", "sigma_pred"
+        ],
+    )
+    id_map = _read_csv(
+        inputs / "id_map.csv",
+        cols=["player_name", "gsis_id", "recent_team", "position"],
+    )
+    weather = _read_csv(
+        inputs / "weather.csv",
+        cols=["game_id", "wind_mph", "temp_f"],
+    )
 
-    # 1) Lines
-    _print("Fetching game lines …")
-    game_raw = fetch_game_lines()
-    game_df, _ = _as_df(game_raw, "fetch_game_lines")
-    if game_df.empty:
-        _print("WARNING: game_df is empty – continuing but props may fail.")
+    return dict(
+        team_form=team_form,
+        player_form=player_form,
+        id_map=id_map,
+        weather=weather,
+    )
 
-    # 2) Props/odds
-    _print("Fetching all props for events …")
+
+# --------------------
+# Feature construction
+# --------------------
+def _sigma_default_for_market(market: str) -> float:
+    m = market.lower()
+    if "reception" in m and "yard" not in m:
+        return 1.8
+    if "receiving" in m:
+        return 26.0
+    if "rushing" in m and "attempt" not in m:
+        return 22.0
+    if "attempt" in m:
+        return 4.0
+    if "passing yard" in m:
+        return 48.0
+    if "passing td" in m:
+        return 0.9
+    if "rush+rec" in m:
+        return 28.0
+    return 20.0
+
+
+def _make_features_row(row: pd.Series, ext: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    """
+    Build a features dict that the rules engine can use.
+    Works fine if external data are empty — everything defaults gracefully.
+    """
+    market = _norm(row.get("market"))
+    side = _norm(row.get("outcome") or row.get("side") or "over")
+    point = row.get("point", np.nan)
+
+    # map ids if available (non-fatal)
+    id_map = ext.get("id_map", pd.DataFrame())
+    player_name = _norm(row.get("player"))
+    gsis_id = None
+    if not id_map.empty and player_name:
+        m = id_map[id_map["player_name"].str.lower() == player_name.lower()]
+        if not m.empty:
+            gsis_id = m.iloc[0].get("gsis_id")
+
+    # pull a few team/defense features if available
+    team_form = ext.get("team_form", pd.DataFrame())
+    opp_team = _norm(row.get("away_team" if _norm(row.get("team")) == _norm(row.get("home_team")) else "home_team"))
+    tf_row = pd.Series({})
+    if not team_form.empty and opp_team:
+        tf = team_form[team_form["team"].str.upper() == opp_team.upper()]
+        if not tf.empty:
+            tf_row = tf.iloc[-1]  # latest
+
+    return dict(
+        market=market,
+        side=side,
+        point=_safe_float(point, np.nan),
+        player=player_name,
+        player_id=gsis_id,
+        team_ctx=dict(
+            opp_team=opp_team,
+        ),
+        # optional metrics (rules will use when present)
+        opp_team_pressure_z=_safe_float(tf_row.get("pressure_z"), 0.0),
+        opp_pass_epa_z=_safe_float(tf_row.get("pass_epa_z"), 0.0),
+        opp_run_funnel=int(_safe_float(tf_row.get("run_funnel"), 0.0) > 0.5),
+        opp_pass_funnel=int(_safe_float(tf_row.get("pass_funnel"), 0.0) > 0.5),
+    )
+
+
+def _initial_mu_sigma(row: pd.Series) -> Tuple[float, float]:
+    """
+    Neutral starting point if no player-form projection:
+      - mu starts at the book line (so raw model P≈0.5)
+      - sigma is market-based default
+    Rules then nudge mu/sigma from features/context.
+    """
+    market = _norm(row.get("market"))
+    mu0 = _safe_float(row.get("point"), 0.0)
+    sigma0 = _sigma_default_for_market(market)
+    return mu0, sigma0
+
+
+# --------------
+# Main pipeline
+# --------------
+def run_pipeline(
+    target_date: str = "today",
+    season: int = 2025,
+    out_dir: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    1) Fetch game lines + player props
+    2) Optionally merge external features
+    3) Apply rules → mu, sigma, notes
+    4) Price: model prob, fair odds, edge, Kelly
+    5) Write outputs (props_priced.csv) if out_dir provided
+    """
+    if out_dir is None:
+        out_dir = "outputs"
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    # 1) Fetch lines/props
+    print("Fetching game lines …")
+    _ = fetch_game_lines()  # not used yet in pricing, but kept for completeness
+
+    print("Fetching all props for events …")
     props_raw = fetch_props_all_events()
-    props_df, _ = _as_df(props_raw, "fetch_props_all_events")
+    if props_raw is None or len(props_raw) == 0:
+        print("No props returned from odds API.")
+        props_raw = []
+
+    props_df = pd.DataFrame(props_raw)
     if props_df.empty:
-        _print("WARNING: props_df is empty. Nothing to price.")
-        pd.DataFrame().to_csv(os.path.join(out_dir, "props_priced.csv"), index=False)
-        return
+        print("No props available after normalization.")
+        priced_df = pd.DataFrame(columns=[
+            "event_id","player","market","outcome","point","price",
+            "mu","sigma","notes",
+            "model_prob","market_fair_prob","blended_prob","fair_odds","edge","kelly_cap_5pct"
+        ])
+        priced_df.to_csv(Path(out_dir) / "props_priced.csv", index=False)
+        return priced_df
 
-    # 3) Pricing
-    priced_raw = price_props_for_events(props_df)
-    priced_df, priced_meta = _as_df(priced_raw, "price_props_for_events")
-    if priced_df.empty:
-        _print("WARNING: pricing produced no rows.")
-        pd.DataFrame().to_csv(os.path.join(out_dir, "props_priced.csv"), index=False)
-        return
+    # Ensure canonical columns exist
+    for c in ["event_id","player","market","outcome","side","point","price","home_team","away_team","team"]:
+        if c not in props_df.columns:
+            props_df[c] = np.nan
 
-    # 4) External features (optional)
-    try:
-        if _HAS_MERGE_EXTERNAL:
-            merged_raw = merge_external_features(priced_df)
-            priced_df, _ = _as_df(merged_raw, "merge_external_features")
-        else:
-            _print("merge_external_features unavailable or failed; using minimal features merge.")
-    except Exception as e:
-        _print(f"merge_external_features raised {type(e).__name__}: {e}; using minimal features merge.")
+    # 2) External metrics (optional)
+    ext = build_external(season)
+    if HAS_MERGE_EXTERNAL:
+        try:
+            props_df = merge_external_features(props_df, ext)  # non-fatal if it raises, we catch below
+        except Exception as e:
+            print(f"merge_external_features unavailable or failed: {e}; using minimal features.")
+    else:
+        print("merge_external_features not present; using minimal features.")
 
-    # Info messages to mirror earlier logs
-    if not os.path.exists(team_form_path) or os.path.getsize(team_form_path) == 0:
-        _print("🛈  team_form.csv is empty.")
-    if not os.path.exists(player_form_path) or os.path.getsize(player_form_path) == 0:
-        _print("🛈  player_form.csv is empty.")
-    if not os.path.exists(id_map_path) or os.path.getsize(id_map_path) == 0:
-        _print("🛈  id_map.csv is empty.")
+    # 3) Apply rules → mu, sigma, notes
+    mu_list, sigma_list, notes_list = [], [], []
+    for _, row in props_df.iterrows():
+        # baseline
+        mu0, sigma0 = _initial_mu_sigma(row)
+        features = _make_features_row(row, ext)
+        # Allow rules to adjust baseline (new style signature)
+        mu1, sig1, note = apply_rules(dict(
+            side=features["side"],
+            mu=mu0,
+            sigma=sigma0,
+            player=row.get("player"),
+            team_ctx=features.get("team_ctx"),
+            market=features.get("market"),
+            opp_pressure_z=features.get("opp_team_pressure_z"),
+            opp_pass_epa_z=features.get("opp_pass_epa_z"),
+            opp_run_funnel=features.get("opp_run_funnel"),
+            opp_pass_funnel=features.get("opp_pass_funnel"),
+        ))
+        mu_list.append(mu1)
+        sigma_list.append(sig1)
+        notes_list.append(note)
 
-    # 5) Apply rules
-    _print("Applying elite rules …")
-    if not priced_df.empty:
-        adj_mu, adj_sigma, notes = [], [], []
-        feature_like_cols = set(priced_df.columns)
+    priced_df = props_df.copy()
+    priced_df["mu"] = mu_list
+    priced_df["sigma"] = sigma_list
+    priced_df["notes"] = notes_list
 
-        for _, row in priced_df.iterrows():
-            base_mu = float(row.get("mu", 0.0))
-            base_sigma = float(row.get("sigma", 0.0))
-            side = row.get("side", row.get("bet_side", "over"))
+    # 4) Pricing block (the “nudge” to write meaningful numbers)
+    model_p   = priced_df.apply(_model_prob, axis=1)
+    market_p  = priced_df.apply(_market_fair_prob, axis=1)
+    blend_p   = [_blend(mp, bp, 0.65) for mp, bp in zip(model_p, market_p)]
+    fair_odds = [prob_to_american(p) for p in blend_p]
+    edge_val  = [_edge(bp, mp) for bp, mp in zip(blend_p, market_p)]
+    kelly     = [kelly_fraction(bp, pr) for bp, pr in zip(blend_p, priced_df["price"])]
 
-            fdict: Dict[str, Any] = {k: row[k] for k in feature_like_cols if k in row}
-            fdict.update({"mu": base_mu, "sigma": base_sigma, "side": side})
+    priced_df["model_prob"] = model_p
+    priced_df["market_fair_prob"] = market_p
+    priced_df["blended_prob"] = blend_p
+    priced_df["fair_odds"] = fair_odds
+    priced_df["edge"] = edge_val
+    priced_df["kelly_cap_5pct"] = kelly
 
-            mu1, sig1, note = _apply_rules_compat(fdict, side, base_mu, base_sigma)
-            adj_mu.append(mu1)
-            adj_sigma.append(sig1)
-            notes.append(note)
-
-        priced_df["mu"] = adj_mu
-        priced_df["sigma"] = adj_sigma
-        priced_df["rules_notes"] = notes
-
-    # 6) Save
-    _print("Downcasting floats.")
-    priced_df = _downcast_numeric(priced_df)
-
-    ensure_dir(out_dir)
-    out_path = os.path.join(out_dir, "props_priced.csv")
+    # 5) Write outputs
+    out_path = Path(out_dir) / "props_priced.csv"
     priced_df.to_csv(out_path, index=False)
-    _print(f"Wrote {len(priced_df)} rows to {out_path}")
+    print(f"Wrote {out_path} rows={len(priced_df)}")
+
+    return priced_df
 
 
-# -------------------------------------------------
-# Dev entry (local runs)
-# -------------------------------------------------
+# Allow CLI execution like: python engine.py
 if __name__ == "__main__":
-    date_arg = sys.argv[1] if len(sys.argv) > 1 else "today"
-    season_arg = int(sys.argv[2]) if len(sys.argv) > 2 else 2025
-    out_arg = sys.argv[3] if len(sys.argv) > 3 else "outputs"
-    run_pipeline(target_date=date_arg, season=season_arg, out_dir=out_arg)
+    run_pipeline(target_date="today", season=2025, out_dir="outputs")
