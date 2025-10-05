@@ -16,7 +16,7 @@ SD_DEFAULTS = {
     "pass_yards": 48.0,
     "pass_tds": 0.9,
     "rush_rec_yards": 30.0,
-    "anytime_td": 1.0,  # placeholder
+    "anytime_td": 1.0,
 }
 
 # ---------- Helpers ----------
@@ -71,7 +71,6 @@ def _load_team_metrics() -> pd.DataFrame:
 def _load_id_map() -> pd.DataFrame:
     df = _maybe_csv("data/id_map.csv")
     if not df.empty:
-        # normalize headers
         ren = {}
         for want in ["player_name","team","position","role"]:
             for c in df.columns:
@@ -98,27 +97,21 @@ def _load_coverage() -> pd.DataFrame:
         df["tag"] = df["tag"].astype(str).lower()
     return df
 
-# NEW: CB assignment loader
 def _load_cb_assignments() -> pd.DataFrame:
     df = _maybe_csv("data/cb_assignments.csv")
     if df.empty: return df
-    # normalize headers
     ren = {}
     for want in ["defense_team","receiver","cb","quality","penalty"]:
         for c in df.columns:
             if c.lower() == want:
                 ren[c] = want
     df = df.rename(columns=ren)
-    # canonical columns
     if "penalty" not in df.columns: df["penalty"] = np.nan
     if "quality" not in df.columns:  df["quality"]  = ""
-    # backfill penalty from quality when missing
     qual_map = {"elite":0.08, "good":0.05, "avg":0.03}
     df["penalty"] = df["penalty"].astype(float)
     df.loc[df["penalty"].isna(), "penalty"] = df["quality"].astype(str).str.lower().map(qual_map)
-    # left-join key aliases
     df = df.rename(columns={"defense_team":"opp_team","receiver":"player"})
-    # clip sanity
     df["penalty"] = df["penalty"].fillna(0.06).clip(0.0, 0.25)
     return df
 
@@ -202,7 +195,7 @@ def air_yards_sanity_cap(role: str, market_key: str, ay_per_att_z: float) -> flo
         return 0.80
     return 1.0
 
-# NEW: CB assignment multiplier (player-specific)
+# CB assignment multiplier (player-specific)
 def cb_assignment_multiplier(cb_penalty: float, market_key: str) -> float:
     if pd.isna(cb_penalty): return 1.0
     if market_key in {"receptions","rec_yards"}:
@@ -320,7 +313,7 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
         # injuries / coverage / AY sanity
         m_inj    = injury_multiplier(row.get("inj_status"), role, mk)
 
-        # CB assignment (player-specific) — overrides generic coverage if present
+        # CB assignment overrides generic coverage if present
         m_cb     = cb_assignment_multiplier(row.get("cb_penalty"), mk)
         m_cov    = 1.0 if not pd.isna(row.get("cb_penalty")) else coverage_multiplier(row.get("tag"), role, mk)
 
@@ -334,6 +327,46 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
     mu_mults, sd_mults = zip(*df.apply(row_multipliers, axis=1))
     df["_mu_adj"] = df["_mu0"] * pd.Series(mu_mults).astype(float)
     df["_sd_adj"] = df["_sd0"] * pd.Series(sd_mults).astype(float)
+
+    # --- REDISTRIBUTION: when WR1 is capped, boost WR2/SLOT/TE in same team & game ---
+    recv_mask = df["market_key"].isin({"receptions","rec_yards","rush_rec_yards"})
+    df["redist_boost"] = 1.0  # default
+
+    def est_share_mult(row) -> float:
+        mk   = row["market_key"]; role = (row.get("role") or "").upper()
+        if mk not in {"receptions","rec_yards","rush_rec_yards"}: return 1.0
+        inj_m = injury_multiplier(row.get("inj_status"), role, mk)
+        if not pd.isna(row.get("cb_penalty")):
+            cov_m = 1.0
+            cb_m  = cb_assignment_multiplier(row.get("cb_penalty"), mk)
+            return inj_m * cb_m
+        cov_m = coverage_multiplier(row.get("tag"), role, mk)
+        return inj_m * cov_m
+
+    df["_share_mult_est"] = df.apply(est_share_mult, axis=1)
+    df["_alpha_pen_share"] = 0.0
+    wr1_mask = (df["role"].str.upper() == "WR1") & recv_mask
+    df.loc[wr1_mask, "_alpha_pen_share"] = (1.0 - df.loc[wr1_mask, "_share_mult_est"]).clip(lower=0.0)
+
+    def apply_redist(g: pd.DataFrame) -> pd.DataFrame:
+        pen = float(g.loc[(g["role"].str.upper()=="WR1") & recv_mask, "_alpha_pen_share"].sum())
+        if pen <= 0: 
+            g["redist_boost"] = 1.0
+            return g
+        # weights: WR2 60%, SLOT 30%, TE 10%
+        for role, w in [("WR2",0.60),("SLOT",0.30),("TE",0.10)]:
+            m = (g["role"].str.upper()==role) & recv_mask
+            if m.any():
+                g.loc[m,"redist_boost"] = np.clip(1.0 + w*pen, 1.0, 1.15)
+        return g
+
+    if {"event_id","team"}.issubset(df.columns):
+        df = df.groupby(["event_id","team"], group_keys=False).apply(apply_redist)
+    else:
+        # safe fallback: no team grouping available
+        pass
+
+    df["_mu_adj"] *= df["redist_boost"]
 
     # --- Model probability at the line with adjusted μ,σ ---
     def p_model_over(row) -> float:
@@ -364,7 +397,8 @@ def price_props(df_in: pd.DataFrame) -> pd.DataFrame:
         "player","team","role","market_key","line","book","event_id","home_team","away_team","commence_time",
         "price_over","price_under","p_over_imp","p_under_imp","p_over_fair_market",
         "p_over_model","p_over_blend","fair_over_odds","edge_pct","model_mean","model_sd",
-        "win_prob","def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z","inj_status","cb_name","cb_penalty"
+        "win_prob","def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","pace_z",
+        "inj_status","cb_name","cb_penalty","redist_boost"
     ]
     out = df[keep].copy()
 
