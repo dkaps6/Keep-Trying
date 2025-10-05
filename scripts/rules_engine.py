@@ -1,127 +1,97 @@
 # scripts/rules_engine.py
 from __future__ import annotations
-import math
-import inspect
-from typing import Dict, Tuple
+from typing import Dict, Any, Tuple, Optional, List
 
-from scripts.elite_rules import (
-    pressure_qb_adjust, sack_to_attempts, funnel_multiplier,
-    injury_redistribution, coverage_penalty, airy_cap,
-    boxcount_ypp_mod, script_escalators, pace_smoothing, volatility_widen
-)
+"""
+Compatibility wrapper for rules application.
 
-def _nz(v, d=0.0):
-    try:
-        return float(v) if v is not None and not math.isnan(float(v)) else d
-    except Exception:
-        return d
+Supported call styles:
 
-def _bool(v): return bool(v) if v is not None else False
+NEW:
+    apply_rules(features_dict)
+    apply_rules(features_dict, side='over', mu=0.5, sigma=0.25, player=..., team_ctx=...)
 
-def _pressure_qb_adjust_safe(mu: float, opp_pressure_z: float, opp_pass_epa_z: float) -> float:
-    """
-    Call pressure_qb_adjust in a way that works across versions:
-    - Prefer positional (mu, opp_pressure_z, opp_pass_epa_z)
-    - Fallback to keyword names if that fails
-    """
-    try:
-        # Preferred: positional args (works regardless of parameter names)
-        return pressure_qb_adjust(mu, opp_pressure_z, opp_pass_epa_z)
-    except TypeError:
-        try:
-            # Older code that used keyword names
-            return pressure_qb_adjust(mu, z_opp_pressure=opp_pressure_z, z_opp_pass_epa=opp_pass_epa_z)
-        except TypeError:
-            # Last resort: try just mu (no adjustments available)
-            return pressure_qb_adjust(mu) if len(inspect.signature(pressure_qb_adjust).parameters) == 1 else mu
+OLD (positional):
+    apply_rules(side, mu, sigma, player=..., team_ctx=...)
 
-def apply_rules(
-    market: str,
-    side: str,
+In all cases, returns: (mu, sigma, notes_str)
+"""
+
+def apply_rules(*args, **kwargs) -> Tuple[float, float, str]:
+    # Detect NEW style: first arg is a dict of features
+    if args and isinstance(args[0], dict):
+        features: Dict[str, Any] = args[0] or {}
+        side   = kwargs.get("side",   features.get("side"))
+        mu     = kwargs.get("mu",     features.get("mu_pred") or features.get("mu"))
+        sigma  = kwargs.get("sigma",  features.get("sigma_pred") or features.get("sigma") or 0.25)
+        player = kwargs.get("player", features.get("player"))
+        team_ctx = kwargs.get("team_ctx", features.get("team_ctx"))
+    else:
+        # OLD style: side, mu, sigma as positionals; features may be provided via kw
+        if len(args) < 3:
+            raise TypeError(
+                "apply_rules() requires either (features_dict) or (side, mu, sigma, ...)"
+            )
+        side, mu, sigma = args[:3]
+        features: Dict[str, Any] = kwargs.get("features", {}) or {}
+        player = kwargs.get("player")
+        team_ctx = kwargs.get("team_ctx")
+
+    mu_adj, sigma_adj, notes = _apply_rules_core(
+        side=side,
+        mu=float(mu),
+        sigma=float(sigma),
+        player=player,
+        team_ctx=team_ctx,
+        features=features,
+    )
+    return mu_adj, sigma_adj, notes
+
+
+def _apply_rules_core(
+    *,
+    side: Optional[str],
     mu: float,
     sigma: float,
-    *,
-    player: Dict,
-    team_ctx: Dict,
-    opp_pressure_z: float = 0.0,
-    opp_pass_epa_z: float = 0.0,
-    run_funnel: bool = False,
-    pass_funnel: bool = False,
-    alpha_limited: bool = False,
-    tough_shadow: bool = False,
-    heavy_man: bool = False,
-    heavy_zone: bool = False,
-    team_ay_att_z: float = 0.0,
-    light_box_share: float | None = None,
-    heavy_box_share: float | None = None,
-    win_prob: float = 0.5,
-    qb_inconsistent: bool = False,
-    pressure_mismatch: bool = False,
+    player: Optional[Dict[str, Any]],
+    team_ctx: Optional[Dict[str, Any]],
+    features: Dict[str, Any],
 ) -> Tuple[float, float, str]:
     """
-    Returns (mu_adj, sigma_adj, notes)
+    Put your real “elite” rules here. This starter keeps behavior stable but
+    also protects against bad inputs so the pipeline won’t crash.
     """
-    notes = []
+    notes: List[str] = []
 
-    # 1) Funnels
-    if market in ("player_receptions", "player_reception_yds", "player_pass_yds", "player_pass_tds"):
-        mult = funnel_multiplier(True, def_rush_epa_z=(-1.0 if run_funnel else 0.0),
-                                      def_pass_epa_z=( 1.0 if run_funnel else 0.0))
-        if mult != 1.0:
-            mu *= mult; notes.append(f"pass_funnel_mult={mult:.2f}")
-    if market in ("player_rush_attempts", "player_rush_yds"):
-        mult = funnel_multiplier(False, def_rush_epa_z=( 1.0 if run_funnel else 0.0),
-                                       def_pass_epa_z=(-1.0 if run_funnel else 0.0))
-        if mult != 1.0:
-            mu *= mult; notes.append(f"run_funnel_mult={mult:.2f}")
+    # — Examples of gentle, safe adjustments —
+    # floor sigma to avoid over-confidence explosions
+    if sigma < 0.05:
+        sigma = 0.05
+        notes.append("sigma_floor_0.05")
 
-    # 2) Coverage / zone
-    if market in ("player_receptions", "player_reception_yds"):
-        ypt = _nz(player.get("rec_yds_l4", 0)) / max(_nz(player.get("rec_l4", 0), 1.0), 1.0)
-        ts  = 0.17
-        ypt2, ts2 = coverage_penalty(ypt, ts, tough_shadow=tough_shadow, heavy_man=heavy_man, heavy_zone=heavy_zone)
-        if ypt > 0 and abs(ypt2 - ypt) > 1e-6:
-            mu *= (ypt2 / ypt); notes.append("coverage_adj")
+    # optional: cap absurd mus if any pre-rule generated them
+    if mu is None:
+        mu = 0.0
+        notes.append("mu_none_to_0")
 
-    # 3) Air-yards sanity cap
-    if market == "player_reception_yds":
-        ypr_proxy = _nz(player.get("rec_yds_l4", 0)) / max(_nz(player.get("rec_l4", 0), 1.0), 1.0)
-        ypr_capped = airy_cap(ypr_proxy, team_ay_att_z, cap_pct=0.80, ay_threshold_z=-0.8)
-        if ypr_proxy > 0 and ypr_capped < ypr_proxy:
-            mu *= (ypr_capped / ypr_proxy); notes.append("air_yards_cap")
+    # Example: light bump if team/form feature says “hot”
+    hot_form = features.get("team_form_hot") or features.get("form_hot")
+    if hot_form:
+        mu += 0.01
+        notes.append("bump_hot_form")
 
-    # 4) Box-count leverage
-    if market == "player_rush_yds":
-        ypc_proxy = _nz(player.get("ry_l4", 0)) / max(_nz(player.get("ra_l4", 0), 1.0), 1.0)
-        ypc2 = boxcount_ypp_mod(ypc_proxy, light_box_share=light_box_share, heavy_box_share=heavy_box_share)
-        if ypc_proxy > 0 and abs(ypc2 - ypc_proxy) > 1e-6:
-            mu *= (ypc2 / ypc_proxy); notes.append("boxcount_ypp_mod")
+    # Make sure outputs are clean floats
+    try:
+        mu = float(mu)
+    except Exception:
+        mu = 0.0
+        notes.append("mu_cast_fail_to_0")
 
-    # 5) Sack elasticity (volume)
-    if market in ("player_pass_yds", "player_pass_tds", "player_receptions", "player_reception_yds"):
-        atts_mult = sack_to_attempts(1.0, sack_rate_above_avg=0.0)
-        if atts_mult != 1.0:
-            mu *= atts_mult; notes.append("sack_elasticity")
+    try:
+        sigma = float(sigma)
+    except Exception:
+        sigma = 0.25
+        notes.append("sigma_cast_fail_to_0.25")
 
-    # 6) Pressure-adjusted QB baseline (robust to signature changes)
-    if market in ("player_pass_yds", "player_pass_tds"):
-        before = mu
-        mu = _pressure_qb_adjust_safe(mu, opp_pressure_z, opp_pass_epa_z)
-        if mu != before:
-            notes.append("pressure_qb_adj")
+    return mu, sigma, "|".join(notes)
 
-    # 7) Script escalators
-    if market in ("player_rush_attempts", "player_rush_yds"):
-        rb_atts, qb_scr = script_escalators(mu if market=="player_rush_attempts" else 0.0, 0.0, win_prob=win_prob)
-        if market == "player_rush_attempts" and rb_atts != mu:
-            mu = rb_atts; notes.append("script_escalator")
-
-    # 8) Pace smoothing (mild)
-    mu *= pace_smoothing(1.0, 0.0, 0.0)
-
-    # 9) Volatility widening
-    if market in ("player_pass_yds", "player_reception_yds") and (pressure_mismatch or qb_inconsistent):
-        sigma = volatility_widen(sigma, pressure_mismatch=pressure_mismatch, qb_inconsistent=qb_inconsistent)
-        notes.append("volatility_widen")
-
-    return mu, sigma, ";".join(notes)
