@@ -8,6 +8,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # ✅ Make the Odds API key available to ALL steps in this job
+    env:
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,7 +28,6 @@ jobs:
           pip install -r requirements.txt
 
       # 2) BEST-EFFORT backup install for sportsdataverse (won't fail the job)
-      #    If it's already installed from requirements.txt, this is a no-op.
       - name: (Optional) Ensure sportsdataverse is available
         continue-on-error: true
         shell: bash
@@ -50,35 +53,71 @@ jobs:
               print("sportsdataverse unavailable (optional) ❌", e)
           PY
 
-      # 3) Sanity check Odds API key (won't fail build if missing)
-      - name: Sanity check Odds API key
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      # 3) ✅ Sanity check: is the ODDS_API_KEY actually present in this runner?
+      - name: Check Odds API key presence
         run: |
           python - <<'PY'
-          import os, requests
-          key = os.environ.get("ODDS_API_KEY", "")
-          if not key:
-              print("⚠️  No ODDS_API_KEY set; game/props fetch will fail.")
-          else:
-              r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={key}", timeout=20)
-              print("Status:", r.status_code)
-              print("Remaining credits:", r.headers.get("x-requests-remaining"))
-              if r.status_code != 200:
-                  print("Notice:", r.text)
+          import os
+          key = os.environ.get("ODDS_API_KEY","")
+          print("ODDS_API_KEY set? ", bool(key), "  suffix:", key[-4:] if key else "")
           PY
+
+      # 3b) (Optional but helpful) Ping the two Odds API endpoints from the runner
+      - name: Ping Odds API: featured odds (h2h)
+        run: |
+          curl -sS "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?regions=us&markets=h2h&apiKey=${ODDS_API_KEY}" | head -c 400 || true
+
+      - name: Ping Odds API: one event's player props
+        run: |
+          EID=$(curl -s "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?regions=us&markets=h2h&apiKey=${ODDS_API_KEY}" | python - <<'PY'
+          import sys,json
+          try:
+              d=json.load(sys.stdin)
+              print(d[0]['id'] if d else "")
+          except Exception:
+              print("")
+          PY
+          )
+          echo "Event ID: $EID"
+          if [ -n "$EID" ]; then
+            curl -sS "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/$EID/odds?regions=us&markets=player_pass_yds,player_reception_yds&apiKey=${ODDS_API_KEY}" | head -c 400 || true
+          else
+            echo "Could not enumerate events (check the previous step output)."
+          fi
 
       # 4) Make sure output dirs exist
       - name: Ensure dirs
         run: |
           mkdir -p metrics inputs outputs data
 
-      # 5) Fetch external metrics (nflverse → espn → pfr fallbacks inside the script)
+      # 5) Fetch external metrics (and props, if your fetcher grabs them)
+      #    ✅ Pass ODDS_API_KEY here too, in case scripts/fetch_all uses it
       - name: Fetch external metrics (free sources)
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
+          # If you adopted my fetch_all.py with CLI entrypoint, this works:
           python -m scripts.fetch_all --season 2025
+          # If you don't have a CLI entrypoint, use:
+          # python - <<'PY'
+          # import scripts.fetch_all as F
+          # F.main(season="2025")
+          # PY
+
+      # 5b) Quick peek at our props snapshot (if any) before pricing
+      - name: Peek props snapshot
+        run: |
+          python - <<'PY'
+          import os, pandas as pd
+          for p in ("outputs/props_raw.csv","inputs/props.csv","data/odds_sample.csv"):
+              if os.path.exists(p):
+                  df = pd.read_csv(p)
+                  print(f"{p}: {len(df)} rows")
+                  print(df.head(5).to_string(index=False))
+          PY
 
       # 6) Run the main pricing/model pipeline
+      #    ✅ Pass ODDS_API_KEY (engine may call fetch again)
       - name: Run pipeline
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
