@@ -8,18 +8,13 @@ def _norm_str(s: pd.Series) -> pd.Series:
 def safe_merge_id_map(props: pd.DataFrame, id_map: pd.DataFrame) -> pd.DataFrame:
     """
     Left-join props to id_map so missing mappings don't nuke the slate.
-    Writes metrics/needs_mapping.csv with (player, team) pairs that need attention.
-    Expected keys: ['player','team'] or ['player_name'].
-    Ensures 'player_id' column exists even if id_map is empty.
+    Writes metrics/needs_mapping.csv for your review.
     """
     props = props.copy()
-
-    # Ensure expected text keys are normalized for matching
     for c in ("player", "team"):
         if c in props.columns:
             props[c] = _norm_str(props[c])
 
-    # If id_map missing or empty, keep rows and flag missing mappings
     if id_map is None or len(id_map) == 0:
         if "player_id" not in props.columns:
             props["player_id"] = pd.NA
@@ -32,14 +27,12 @@ def safe_merge_id_map(props: pd.DataFrame, id_map: pd.DataFrame) -> pd.DataFrame
         if c in id_map.columns:
             id_map[c] = _norm_str(id_map[c])
 
-    # Choose a join key
     if all(c in id_map.columns for c in ("player","team")) and all(c in props.columns for c in ("player","team")):
         on = ["player", "team"]
     elif "player_name" in id_map.columns and "player" in props.columns:
         id_map = id_map.rename(columns={"player_name": "player"})
         on = ["player"]
     else:
-        # No usable keys—create empty player_id and report
         if "player_id" not in props.columns:
             props["player_id"] = pd.NA
         _write_needs_mapping(props, on_cols=[c for c in ("player","team") if c in props.columns])
@@ -57,9 +50,6 @@ def safe_merge_id_map(props: pd.DataFrame, id_map: pd.DataFrame) -> pd.DataFrame
     return merged
 
 def safe_merge_weather(df: pd.DataFrame, weather: pd.DataFrame, key_cols=("game_id",)) -> pd.DataFrame:
-    """
-    Left-join weather if available. If empty/missing, skip without dropping rows.
-    """
     if weather is None or len(weather) == 0:
         print("[info] weather empty; skipping weather join")
         return df
@@ -73,5 +63,7 @@ def _write_needs_mapping(df: pd.DataFrame, on_cols: list[str]) -> None:
     cols = [c for c in on_cols if c in df.columns]
     if not cols:
         return
-    path = "metrics/needs_mapping.csv"
-    df[cols].drop_duplicates().to_csv(path, index=False)
+    Path = __import__("pathlib").Path
+    p = Path("metrics"); p.mkdir(parents=True, exist_ok=True)
+    (p / "needs_mapping.csv").write_text(df[cols].drop_duplicates().to_csv(index=False))
+
