@@ -1,7 +1,11 @@
 # scripts/odds_api.py
 from __future__ import annotations
-import os, time, requests, pandas as pd
+import os
+import time
 from typing import Any, Dict, List
+
+import pandas as pd
+import requests
 
 BASE = "https://api.the-odds-api.com/v4"
 SPORT = "americanfootball_nfl"
@@ -27,11 +31,19 @@ def _key() -> str:
 
 def _get(url: str, params: Dict[str, Any]) -> Any:
     r = requests.get(url, params=params, headers=HEADERS, timeout=30)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        # Make the failure obvious in logs without crashing the whole run
+        print(f"[odds_api] {url} -> HTTP {r.status_code}: {r.text[:200]}")
+        raise
     return r.json()
 
 def _list_events(key: str) -> List[Dict[str, Any]]:
-    # enumerate events cheaply via featured market (h2h)
+    """
+    Enumerate events cheaply via a featured market (h2h).
+    This endpoint is widely available across plans.
+    """
     url = f"{BASE}/sports/{SPORT}/odds"
     params = dict(apiKey=key, markets="h2h", regions="us", oddsFormat="american", dateFormat="iso")
     try:
@@ -41,8 +53,11 @@ def _list_events(key: str) -> List[Dict[str, Any]]:
         print(f"[odds_api] events list failed: {e}")
         return []
 
-def _event_props(key: str, event_id: string) -> List[Dict[str, Any]]:
-    # IMPORTANT: no 'bookmakers=' filter (some plans block it)
+def _event_props(key: str, event_id: str) -> List[Dict[str, Any]]:
+    """
+    Player props must be fetched from the per-event endpoint.
+    IMPORTANT: we do NOT pass `bookmakers=` to avoid plan/entitlement 401s.
+    """
     url = f"{BASE}/sports/{SPORT}/events/{event_id}/odds"
     params = dict(
         apiKey=key,
@@ -66,7 +81,8 @@ def _event_props(key: str, event_id: string) -> List[Dict[str, Any]]:
                 continue
             for oc in mkt.get("outcomes", []):
                 desc = (oc.get("description") or "").lower()  # "over"/"under"/"yes"/"no"
-                if desc not in ("over", "yes", ""):  # keep Over/Yes as Over anchors
+                # Keep Over/Yes rows as anchors for Over probability
+                if desc not in ("over", "yes", ""):
                     continue
                 player = oc.get("name")
                 line   = oc.get("point")
@@ -87,21 +103,27 @@ def _event_props(key: str, event_id: string) -> List[Dict[str, Any]]:
     return rows
 
 def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
+    """
+    Returns a normalized DataFrame:
+      [player, market, line, price, book, event_id, home_team, away_team, commence_time]
+    Also writes outputs/props_raw.csv for debugging/inspection.
+    """
     key = _key()
     if not key:
         return pd.DataFrame()
-    evs = _list_events(key)
-    if not evs:
+
+    events = _list_events(key)
+    if not events:
         print("[odds_api] 0 events listed")
         return pd.DataFrame()
 
     all_rows: List[Dict[str, Any]] = []
-    for ev in evs:
+    for ev in events:
         eid = ev.get("id")
         if not eid:
             continue
         all_rows.extend(_event_props(key, eid))
-        time.sleep(0.12)
+        time.sleep(0.12)  # polite rate spacing
 
     df = pd.DataFrame(all_rows)
     if df.empty:
@@ -110,7 +132,8 @@ def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
 
     keep = ["player","market","line","price","book","event_id","home_team","away_team","commence_time"]
     for k in keep:
-        if k not in df.columns: df[k] = None
+        if k not in df.columns:
+            df[k] = None
     df = df[keep].copy()
 
     try:
@@ -122,6 +145,5 @@ def fetch_props(date: str = "today", season: str = "2025") -> pd.DataFrame:
     print(f"[odds_api] assembled {len(df)} rows")
     return df
 
-# Backwards-compat names for your fetcher
+# Backwards-compat function names your fetcher might look for
 get_props = build_props_frame = load_props = fetch_props
-
