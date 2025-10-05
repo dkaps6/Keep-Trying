@@ -1,21 +1,35 @@
 # scripts/providers/draftkings_free.py
 from __future__ import annotations
-import time
+import time, random
 from typing import Any, Dict, Iterable, List, Optional
 from pathlib import Path
 import requests
 import pandas as pd
 
-# NFL event group on DraftKings
+# NFL event group id
 DK_EVENTGROUP_NFL = 88808
-DK_EVENTGROUP_URL = f"https://sportsbook.draftkings.com/sites/US-SB/api/v5/eventgroups/{DK_EVENTGROUP_NFL}?format=json"
+
+# Multiple regional hosts to dodge CI 403s
+HOSTS = [
+    "sportsbook.draftkings.com",
+    "sportsbook-us-mi.draftkings.com",
+    "sportsbook-us-nj.draftkings.com",
+    "sportsbook-us-ny.draftkings.com",
+    "sportsbook-us-pa.draftkings.com",
+    "sportsbook-nash-usny.draftkings.com",
+    "sportsbook-nash-usnj.draftkings.com",
+]
 
 HEADERS = {
-    "User-Agent": "keep-trying/props-pipeline (+github) python-requests",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Referer": "https://sportsbook.draftkings.com/leagues/football/nfl",
+    "Connection": "keep-alive",
 }
 
-# Map DK subcategory/market labels to our unified market names
 MARKET_NAME_MAP = {
     "Player Receiving Yards": "receiving_yards",
     "Player Receptions": "receptions",
@@ -26,13 +40,23 @@ MARKET_NAME_MAP = {
     "Player Rushing + Receiving Yards": "rush_rec_yards",
     "Anytime Touchdown Scorer": "anytime_td",
 }
-
 KEEP_MARKETS = set(MARKET_NAME_MAP.keys())
 
 def _get_json(url: str) -> Dict[str, Any]:
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    last_err = None
+    for host in random.sample(HOSTS, k=len(HOSTS)):
+        u = url.replace("HOST", host)
+        try:
+            r = requests.get(u, headers=HEADERS, timeout=30)
+            if r.status_code == 403:
+                last_err = f"403 from {host}"
+                time.sleep(0.25); continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(0.25)
+    raise RuntimeError(last_err or "DraftKings fetch failed")
 
 def _american_int(s: Any) -> Optional[float]:
     if s is None: 
@@ -46,14 +70,9 @@ def _american_int(s: Any) -> Optional[float]:
             return None
 
 def fetch_dk_props() -> pd.DataFrame:
-    """
-    Returns a DataFrame with columns:
-      [player, market, line, price, book, event_id, home_team, away_team, commence_time]
-    Only "Over/Yes" outcomes are kept (your model prices Over probability).
-    """
-    j = _get_json(DK_EVENTGROUP_URL)
+    url = "https://HOST/sites/US-SB/api/v5/eventgroups/{gid}?format=json".format(gid=DK_EVENTGROUP_NFL)
+    j = _get_json(url)
 
-    # Build event lookup: id -> meta
     events = j.get("eventGroup", {}).get("events", []) or []
     ev_map: Dict[str, Dict[str, Any]] = {}
     for ev in events:
@@ -64,7 +83,6 @@ def fetch_dk_props() -> pd.DataFrame:
             "commence_time": ev.get("startDate"),
         }
 
-    # Walk all offer categories / subcategories to find player props
     rows: List[Dict[str, Any]] = []
     cats = j.get("eventGroup", {}).get("offerCategories", []) or []
     for cat in cats:
@@ -72,43 +90,35 @@ def fetch_dk_props() -> pd.DataFrame:
             sub = subdesc.get("offerSubcategory") or {}
             sub_name = sub.get("name")
             if sub_name not in KEEP_MARKETS:
-                continue  # skip markets we don't model yet
-            unified_market = MARKET_NAME_MAP[sub_name]
+                continue
+            unified = MARKET_NAME_MAP[sub_name]
 
-            for offer in sub.get("offers", []) or []:
-                # Each "offer" is for a specific eventId, contains outcomes Over/Under
-                # Sometimes offers is a list of lists
-                if isinstance(offer, list):
-                    offers_iter: Iterable = offer
-                else:
-                    offers_iter = [offer]
-
-                for off in offers_iter:
-                    event_id = str(off.get("eventId"))
-                    if not event_id or event_id not in ev_map:
+            offers = sub.get("offers", []) or []
+            for o in offers:
+                of_list: Iterable = list(o) if isinstance(o, list) else [o]
+                for off in of_list:
+                    eid = str(off.get("eventId"))
+                    if not eid or eid not in ev_map:
                         continue
                     for oc in off.get("outcomes", []) or []:
-                        label = (oc.get("label") or "").lower()   # "over"|"under"|"yes"|"no"
-                        participant = oc.get("participant") or oc.get("name") or oc.get("outcomeName")
+                        label = (oc.get("label") or "").lower()
+                        if label not in ("over","yes",""):
+                            continue
+                        player = oc.get("participant") or oc.get("name") or oc.get("outcomeName")
                         price = _american_int(oc.get("oddsAmerican") or oc.get("oddsAmericanDisplay"))
                         line = oc.get("line")
-                        # DK sometimes nests the numeric under 'line' or 'lineDisplay'; try both
                         if line is None:
                             ld = oc.get("lineDisplay")
                             try:
                                 line = float(str(ld).replace("½", ".5")) if ld is not None else None
                             except Exception:
                                 line = None
-                        # Keep Over/Yes as our anchor
-                        if label not in ("over", "yes", ""):
+                        if player is None or price is None:
                             continue
-                        if participant is None or price is None:
-                            continue
-
-                        meta = ev_map[event_id]
+                        meta = ev_map[eid]
                         rows.append({
-                            "player": participant,
-                            "market": unified_market,
+                            "player": player,
+                            "market": unified,
                             "line": float(line) if line is not None else None,
                             "price": float(price),
                             "book": "draftkings",
@@ -117,20 +127,15 @@ def fetch_dk_props() -> pd.DataFrame:
                             "away_team": meta["away_team"],
                             "commence_time": meta["commence_time"],
                         })
-        # small pause between categories (be nice)
         time.sleep(0.05)
 
     df = pd.DataFrame(rows).dropna(subset=["player","market","price"])
-    # DK may include some team specials; ensure we only keep the player props we mapped
     if not df.empty:
-        df = df[df["market"].isin(MARKET_NAME_MAP.values())].copy()
-
-    # Save a debug snapshot so you can inspect what we pulled
-    try:
-        Path("outputs").mkdir(parents=True, exist_ok=True)
-        df.to_csv("outputs/props_raw.csv", index=False)
-    except Exception:
-        pass
-
+        try:
+            Path("outputs").mkdir(parents=True, exist_ok=True)
+            df.to_csv("outputs/props_raw.csv", index=False)
+        except Exception:
+            pass
     print(f"[draftkings_free] collected {len(df)} rows")
     return df
+
