@@ -1,33 +1,30 @@
-name: "Full Slate: Odds API only (manual, fail-fast)"
+name: "Full Slate (Odds API only, fail-fast)"
 
 on:
-  workflow_dispatch:  # manual only; never auto-runs
+  workflow_dispatch:  # manual only
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
-    # ✅ fixed config (edit these numbers in the file if you want different caps)
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-      PREFER_SOURCE: "odds"          # odds only; no DK, no CSV
-      ODDS_API_EVENT_WINDOW_HOURS: "24"  # call games starting in next 24h
-      ODDS_API_MAX_EVENTS: "8"           # hard cap on event calls
+      # full-slate guards; edit here if you want a different span
+      ODDS_API_EVENT_WINDOW_HOURS: "168"   # 7 days
+      ODDS_API_MAX_EVENTS: "40"            # hard cap
+      ODDS_API_REGIONS: "us,us2"
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # show credits without touching player-prop endpoints
+      # show credits (free call that does not hit props endpoints)
       - name: Check Odds API quota
         shell: bash
         run: |
@@ -44,15 +41,12 @@ jobs:
           if r.status_code != 200: print(r.text[:400])
           PY
 
-      # 🚨 DIRECT PULL (providers only; no CSV fallback)
-      - name: Fetch props (Odds API only)
+      - name: Fetch props (Odds API only; no CSV fallback)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          PREFER_SOURCE: "odds"   # enforce odds only
         run: |
           python -m scripts.fetch_all --season 2025
 
-      # assert props exist; otherwise fail with the reason
       - name: Assert props present
         shell: bash
         run: |
@@ -61,14 +55,26 @@ jobs:
             test -f outputs/_NO_PROPS && cat outputs/_NO_PROPS || true
             exit 1
           fi
-          echo "✅ props_raw.csv present:"
+          echo "✅ props_raw.csv present (sample):"
           head -n 10 outputs/props_raw.csv
 
-      - name: Run pipeline
+      - name: Run pricing/model
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python run_model.py --date today --season 2025 --write outputs
+
+      - name: Show remaining credits
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, requests
+          k = os.environ.get("ODDS_API_KEY","")
+          if not k: raise SystemExit(0)
+          r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={k}", timeout=20)
+          print("Post-run Remaining:", r.headers.get("x-requests-remaining"),
+                "Used:", r.headers.get("x-requests-used"))
+          PY
 
       - name: Upload artifacts
         if: always()
