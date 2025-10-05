@@ -1,27 +1,19 @@
-name: "Full Slate: Lines + Features + Model"
+name: "Full Slate: Odds API only (manual, fail-fast)"
 
 on:
-  workflow_dispatch:
-    inputs:
-      prefer_source:
-        description: "Provider order (odds,dk | dk | odds)"
-        default: "odds,dk"
-      window_hours:
-        description: "Credit guard: only events starting in next N hours"
-        default: "24"
-      max_events:
-        description: "Credit guard: max events to fetch"
-        default: "6"
+  workflow_dispatch:  # manual only; never auto-runs
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
+    # ✅ fixed config (edit these numbers in the file if you want different caps)
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-      PREFER_SOURCE: ${{ github.event.inputs.prefer_source }}
-      ODDS_API_EVENT_WINDOW_HOURS: ${{ github.event.inputs.window_hours }}
-      ODDS_API_MAX_EVENTS: ${{ github.event.inputs.max_events }}
+      PREFER_SOURCE: "odds"          # odds only; no DK, no CSV
+      ODDS_API_EVENT_WINDOW_HOURS: "24"  # call games starting in next 24h
+      ODDS_API_MAX_EVENTS: "8"           # hard cap on event calls
 
     steps:
       - uses: actions/checkout@v4
@@ -35,34 +27,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Optional: show credits; DOES NOT run any props endpoints
-      - name: Check Odds API quota (optional)
-        if: contains(env.PREFER_SOURCE, 'odds')
+      # show credits without touching player-prop endpoints
+      - name: Check Odds API quota
         shell: bash
         run: |
           python - <<'PY'
           import os, requests
           k = os.environ.get("ODDS_API_KEY","")
-          if not k: print("No ODDS_API_KEY set"); raise SystemExit(0)
+          if not k: 
+              print("No ODDS_API_KEY set."); raise SystemExit(0)
           r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={k}", timeout=20)
-          print("HTTP", r.status_code, "| suffix ...", k[-4:])
+          print("HTTP", r.status_code, "| key suffix ...", k[-4:])
           print("Remaining:", r.headers.get("x-requests-remaining"),
                 "Used:", r.headers.get("x-requests-used"),
                 "Limit:", r.headers.get("x-requests-limit"))
           if r.status_code != 200: print(r.text[:400])
           PY
 
-      # FETCH: direct from provider(s); fails the job if no props were fetched
-      - name: Fetch props (providers only; no CSV fallback)
+      # 🚨 DIRECT PULL (providers only; no CSV fallback)
+      - name: Fetch props (Odds API only)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          PREFER_SOURCE: ${{ github.event.inputs.prefer_source }}
-          ODDS_API_EVENT_WINDOW_HOURS: ${{ github.event.inputs.window_hours }}
-          ODDS_API_MAX_EVENTS: ${{ github.event.inputs.max_events }}
+          PREFER_SOURCE: "odds"   # enforce odds only
         run: |
           python -m scripts.fetch_all --season 2025
 
-      # Assert we actually got props, otherwise stop here with a clear reason
+      # assert props exist; otherwise fail with the reason
       - name: Assert props present
         shell: bash
         run: |
@@ -74,14 +64,13 @@ jobs:
           echo "✅ props_raw.csv present:"
           head -n 10 outputs/props_raw.csv
 
-      # Price/model only if props exist
       - name: Run pipeline
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python run_model.py --date today --season 2025 --write outputs
 
-      - name: Upload results
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
