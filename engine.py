@@ -1,55 +1,34 @@
+# engine.py
 from __future__ import annotations
 
-import os
-import sys
 import traceback
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-import importlib
-import inspect
+import importlib, inspect
 import pandas as pd
 
-# =====================================================
-# IMPORTS
-# =====================================================
-from scripts.odds_api_v4 import get_props as odds_get_props
+def _log(msg: str) -> None:
+    print(f"[engine] {msg}")
 
-
-# =====================================================
-# HELPERS
-# =====================================================
 def _to_list_if_csv(s: Optional[str]) -> Optional[List[str]]:
-    if s is None:
-        return None
-    if isinstance(s, list):
-        return s
+    if s is None: return None
+    if isinstance(s, list): return s
     s = str(s).strip()
-    if not s or s.lower() in {"all", "none", "null"}:
-        return None
+    if not s or s.lower() in {"all", "none", "null"}: return None
     return [x.strip() for x in s.split(",") if x.strip()]
 
-
 def _none_if_blank(x: Optional[str]) -> Optional[str]:
-    if x is None:
-        return None
+    if x is None: return None
     s = str(x).strip()
     return None if s == "" else s
 
-
 def _parse_window_to_hours(w: Optional[str | int]) -> Optional[int]:
-    if w is None:
-        return None
-    if isinstance(w, int):
-        return w
+    if w is None: return None
+    if isinstance(w, int): return w
     s = str(w).strip().lower()
-    if s.endswith("h"):
-        s = s[:-1]
-    try:
-        return int(float(s))
-    except Exception:
-        return None
-
+    if s.endswith("h"): s = s[:-1]
+    try: return int(float(s))
+    except Exception: return None
 
 def _coerce_args(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(kwargs)
@@ -67,145 +46,73 @@ def _coerce_args(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     out.setdefault("basename", None)
     return out
 
-
-def _log(msg: str) -> None:
-    print(f"[engine] {msg}")
-
-
-# =====================================================
-# DYNAMIC IMPORTS
-# =====================================================
 def _import_odds_fetcher():
-    from scripts.props_hybrid import get_props as fn  # use hybrid fetcher
+    from scripts.props_hybrid import get_props as fn  # type: ignore
     return fn
 
-
 def _import_normalizer():
-    err = None
+    # Your existing normalizer—leave as-is.
     try:
-        from scripts.normalize_props import normalize_props as fn
+        from scripts.normalize_props import normalize_props as fn  # type: ignore
         return fn
-    except Exception as e:
-        err = e
+    except Exception:
+        pass
     try:
-        from scripts.normalize_props import normalize as fn
+        from scripts.normalize_props import normalize as fn  # type: ignore
         return fn
-    except Exception as e:
-        err = e
+    except Exception:
+        pass
     try:
-        from scripts.normalize_props import normalize_df as fn
+        from scripts.normalize_props import normalize_df as fn  # type: ignore
         return fn
-    except Exception as e:
-        err = e
-    try:
-        from scripts.normalize_props import to_model_schema as fn
-        return fn
-    except Exception as e:
-        err = e
+    except Exception:
+        pass
     mod = importlib.import_module("scripts.normalize_props")
-    for name in ("normalize_props", "normalize", "normalize_df", "to_model_schema"):
+    for name in ("normalize_props","normalize","normalize_df","to_model_schema"):
         fn = getattr(mod, name, None)
-        if callable(fn):
-            return fn
-    raise ImportError("Could not import a normalizer from scripts.normalize_props") from err
+        if callable(fn): return fn
+    raise ImportError("Could not import a normalizer from scripts.normalize_props")
 
+def _call_odds_fetcher(fn, **kwargs):
+    sig = inspect.signature(fn)
+    params: Dict[str, Any] = {}
+    selection = _none_if_blank(kwargs.get("selection"))
+    hours = _parse_window_to_hours(kwargs.get("window"))
+    canonical = {
+        "date": kwargs.get("date"),
+        "season": kwargs.get("season"),
+        "cap": kwargs.get("cap"),
+        "markets": kwargs.get("markets"),
+        "order": kwargs.get("order"),
+        "books": kwargs.get("books"),
+        "team_filter": kwargs.get("team_filter"),
+        "selection": selection,
+        "event_ids": kwargs.get("event_ids"),
+        "window": hours,
+        "hours": hours,
+        "lookahead": hours,
+    }
+    for k, v in list(canonical.items()):
+        if k in sig.parameters and v is not None:
+            params[k] = v
+    return fn(**params)
 
-# =====================================================
-# API CREDIT LOGGING
-# =====================================================
-def _save_api_credits(headers: Dict[str, Any], path: str = "outputs/oddsapi_credits.json") -> None:
-    """Save used/remaining credits to a JSON file."""
-    used = headers.get("x-requests-used") or headers.get("X-Requests-Used")
-    rem = headers.get("x-requests-remaining") or headers.get("X-Requests-Remaining")
-    if used is None and rem is None:
-        return
-    Path("outputs").mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"used": used, "remaining": rem}, f, indent=2)
-    _log(f"[credits] used={used} remaining={rem} (saved to {path})")
+# ----- hook points you already have: pricing + output -----
+def price_props(df: pd.DataFrame) -> pd.DataFrame:
+    # Your existing pricing function (not included here)
+    return df
 
+def write_outputs(df: pd.DataFrame, out_dir: str, basename: str) -> None:
+    # Your existing writer (not included here)
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    df.to_csv(Path(out_dir) / f"{basename}.csv", index=False)
 
-# =====================================================
-# UPDATED FETCHER ADAPTER
-# =====================================================
-def _call_odds_fetcher(
-    date: str,
-    season: str | None,
-    window: int,
-    cap: int,
-    books: list[str] | str | None,
-    markets: list[str] | str | None,
-    order: str | None,
-    selection: str | None,
-    teams: list[str] | str | None,
-    events: list[str] | str | None,
-):
-    """
-    Adapter that calls scripts.props_hybrid.get_props and returns a DataFrame.
-    Injects THE_ODDS_API_KEY automatically and saves credit info.
-    """
-    fn = _import_odds_fetcher()
-
-    api_key = (
-        os.getenv("THE_ODDS_API_KEY")
-        or os.getenv("ODDS_API_KEY")
-    )
-    if not api_key:
-        raise RuntimeError(
-            "THE_ODDS_API_KEY is not set. "
-            "Add it to your GitHub Secrets (or your local env)."
-        )
-
-    books_arg = books
-    markets_arg = markets
-
-    _log(f"Calling get_props() with API key and cap={cap}")
-    results = fn(
-        api_key=api_key,
-        books=books_arg,
-        markets=markets_arg,
-        limit=cap if isinstance(cap, int) and cap > 0 else 0,
-    )
-
-    # if results come with credit headers (from hybrid fetcher), persist them
-    if isinstance(results, dict) and "headers" in results and "data" in results:
-        _save_api_credits(results["headers"])
-        results = results["data"]
-
-    if isinstance(results, pd.DataFrame):
-        return results
-
-    rows = []
-    for item in results or []:
-        ev = item.get("event", {})
-        props = item.get("props", [])
-        rows.append({
-            "event_id": ev.get("id"),
-            "commence_time": ev.get("commence_time"),
-            "home_team": ev.get("home_team"),
-            "away_team": ev.get("away_team"),
-            "props_payload": props,
-            "books": books_arg,
-            "markets": markets_arg,
-        })
-    return pd.DataFrame(rows)
-
-
-# =====================================================
-# MAIN PIPELINE
-# =====================================================
 def run_pipeline(**kwargs) -> int:
     args = _coerce_args(kwargs)
-
-    season: Optional[int] = args["season"]
-    date: str = args["date"]
-    window: str | int | None = args["window"]
-    cap: int = int(args["cap"])
-    books: str = str(args["books"])
-    order: str = str(args["order"])
-    selection: Optional[str] = _none_if_blank(args["selection"])
-    write_dir: str = str(args["write_dir"])
-    basename: Optional[str] = args["basename"]
+    season, date, window, cap = args["season"], args["date"], args["window"], int(args["cap"])
+    books, order = str(args["books"]), str(args["order"])
+    selection = _none_if_blank(args["selection"])
+    write_dir, basename = str(args["write_dir"]), args["basename"]
 
     markets = args["markets"]
     if isinstance(markets, str) and markets.strip():
@@ -214,14 +121,7 @@ def run_pipeline(**kwargs) -> int:
         markets = None
 
     team_filter = _to_list_if_csv(args.get("teams"))
-    if team_filter is None:
-        _log("team filter: None (ALL teams in the date window)")
-    else:
-        _log(f"team filter: {team_filter}")
-
-    event_ids = _to_list_if_csv(args.get("events"))
-    if event_ids:
-        _log(f"event IDs filter: {event_ids}")
+    event_ids   = _to_list_if_csv(args.get("events"))
 
     if not basename:
         basename = f"props_priced_{date}"
@@ -233,19 +133,13 @@ def run_pipeline(**kwargs) -> int:
         _log(f"selection={selection}")
 
         fetch_fn = _import_odds_fetcher()
-        norm_fn = _import_normalizer()
+        norm_fn  = _import_normalizer()
 
         df_props = _call_odds_fetcher(
-            date=date,
-            season=season,
-            window=window,
-            cap=cap,
-            markets=markets,
-            order=order,
-            books=books,
-            teams=team_filter,
-            selection=selection,
-            events=event_ids,
+            fetch_fn,
+            date=date, season=season, window=window, cap=cap,
+            markets=markets, order=order, books=books,
+            team_filter=team_filter, selection=selection, event_ids=event_ids,
         )
 
         if df_props is None or (isinstance(df_props, (list, tuple)) and len(df_props) == 0):
@@ -265,20 +159,14 @@ def run_pipeline(**kwargs) -> int:
             return 1
         _log(f"normalized {len(df_norm)} rows")
 
-        # --- pricing logic placeholder ---
-        df_priced = df_norm
+        df_priced = price_props(df_norm)
+        if df_priced is None or df_priced.empty:
+            _log("Pricing produced 0 rows.")
+            return 1
         _log(f"priced {len(df_priced)} rows")
 
-        Path(write_dir).mkdir(parents=True, exist_ok=True)
-        outfile = Path(write_dir) / f"{basename}.csv"
-        df_priced.to_csv(outfile, index=False)
-        _log(f"✅ pipeline complete: wrote {outfile}")
-
-        # Save latest API credits snapshot if available
-        credit_path = Path(write_dir) / "oddsapi_credits.json"
-        if credit_path.exists():
-            _log(f"✅ API credits log saved at: {credit_path}")
-
+        write_outputs(df_priced, write_dir, basename)
+        _log("pipeline complete.")
         return 0
 
     except Exception as e:
