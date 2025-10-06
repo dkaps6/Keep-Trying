@@ -2,7 +2,7 @@
 # Complete Odds API adapter for NFL player props.
 # - Requires env ODDS_API_KEY
 # - date + window/hours/lookahead pick the slate
-# - books + markets filters supported
+# - books + markets filters supported (with shorthand → full name mapping)
 # - Applies selection/team/event-id filters once (blank == no filter)
 # - Returns a tidy DataFrame of props
 
@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import time
 import re
-import math
 import json
 import urllib.parse
 import urllib.request
@@ -26,11 +25,10 @@ import pandas as pd
 # --------------------------------------------------------------------
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
-SPORT_KEY = "americanfootball_nfl"   # Odds API sport key
+SPORT_KEY = "americanfootball_nfl"   # must be underscore
 BASE_URL = "https://api.the-odds-api.com/v4"
 
 # Mapping from our “friendly” markets to Odds API player-prop market keys.
-# You can extend this mapping as needed.
 MARKET_MAP = {
     "player_receptions": "player_receptions",
     "player_receiving_yds": "player_receiving_yards",
@@ -40,12 +38,20 @@ MARKET_MAP = {
     "player_pass_tds": "player_passing_tds",
     "player_anytime_td": "player_touchdown_anytime",
 }
-
 DEFAULT_MARKETS = list(MARKET_MAP.keys())
+
+# Normalize bookmaker names: accept shorthand and common variants.
+BOOKMAP = {
+    "dk": "draftkings", "draftkings": "draftkings",
+    "fd": "fanduel", "fanduel": "fanduel",
+    "mgm": "betmgm", "betmgm": "betmgm",
+    "cz": "caesars", "czrs": "caesars", "caesars": "caesars",
+    "pointsbet": "pointsbet", "bet365": "bet365", "barstool": "barstool",
+}
 
 
 # --------------------------------------------------------------------
-# Small utilities
+# Utilities
 # --------------------------------------------------------------------
 
 def _to_hours(hours=None, window=None, lookahead=None, default: int = 24) -> int:
@@ -62,10 +68,6 @@ def _to_hours(hours=None, window=None, lookahead=None, default: int = 24) -> int
     return int(default)
 
 def _parse_date_anchor(date: Optional[str]) -> datetime:
-    """
-    If date is 'today' or None -> today (UTC midnight).
-    If 'YYYY-MM-DD' -> that calendar date (UTC midnight).
-    """
     if not date or str(date).strip().lower() == "today":
         dt = datetime.now(timezone.utc)
         return datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
@@ -77,22 +79,30 @@ def _parse_date_anchor(date: Optional[str]) -> datetime:
         return datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
 
 def _http_get(url: str, params: Dict[str, Any]) -> Any:
-    """Simple GET with retries."""
+    """GET with retries and clearer error messages."""
     if not ODDS_API_KEY:
         raise RuntimeError("ODDS_API_KEY env variable is not set.")
     q = params.copy()
     q["apiKey"] = ODDS_API_KEY
     full = f"{url}?{urllib.parse.urlencode(q, doseq=True)}"
     backoff = 1.0
+    last_err_text = ""
     for _ in range(4):
         try:
             with urllib.request.urlopen(full, timeout=30) as resp:
                 data = resp.read()
-            return json.loads(data.decode("utf-8"))
-        except Exception:
-            time.sleep(backoff)
-            backoff = min(8.0, backoff * 2.0)
-    raise RuntimeError(f"GET failed after retries: {full}")
+                return json.loads(data.decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                body = ""
+            last_err_text = f"HTTP {e.code} {e.reason}: {body}"
+        except Exception as e:
+            last_err_text = f"{type(e).__name__}: {e}"
+        time.sleep(backoff)
+        backoff = min(8.0, backoff * 2.0)
+    raise RuntimeError(f"GET failed after retries: {full}\nDetail: {last_err_text}")
 
 
 # --------------------------------------------------------------------
@@ -173,7 +183,7 @@ def _fetch_events_from_provider(
     Pull events and attach requested player props (organized by event).
     Returns list of event dicts with:
       - id, name, home_team, away_team, commence_time
-      - props: list of {player, market, bookmaker, line, over_odds, under_odds, etc.}
+      - props: list of {player, market, bookmaker, line, over_odds, under_odds}
     """
     hrs = int(hours or 24)
     anchor = _parse_date_anchor(date)
@@ -189,17 +199,18 @@ def _fetch_events_from_provider(
         "commenceTimeFrom": start.isoformat().replace("+00:00", "Z"),
         "commenceTimeTo": end.isoformat().replace("+00:00", "Z"),
     })
-
     if not isinstance(events, list):
         events = []
 
-    # Normalize book list
+    # Normalize book list -> API keys
     book_list: List[str] = []
     if books:
         if isinstance(books, str):
             book_list = [b.strip() for b in books.split(",") if b.strip()]
         elif isinstance(books, (list, tuple)):
             book_list = list(books)
+    book_list = [BOOKMAP.get(b.lower(), b.lower()) for b in book_list if b]
+    books_param = ",".join(book_list) if book_list else None
     regions = "us"
 
     # Normalize markets
@@ -209,13 +220,7 @@ def _fetch_events_from_provider(
         wanted_markets = [m.strip() for m in markets.split(",") if m.strip()]
     else:
         wanted_markets = list(markets)
-
-    # Prepare lookup for Odds API market keys
     odds_markets = [MARKET_MAP.get(m, m) for m in wanted_markets]
-
-    # 2) For each market, hit the player-props endpoint (book scoped)
-    #    Endpoint: /v4/sports/{sport}/players/props
-    props_url = f"{BASE_URL}/sports/{SPORT_KEY}/players/props"
 
     # Build events dict
     by_id: Dict[str, Dict[str, Any]] = {}
@@ -236,10 +241,8 @@ def _fetch_events_from_provider(
     if not by_id:
         return []
 
-    # To reduce calls, we request by market and (optionally) by bookmaker set
-    # Odds API allows comma-separated bookmakers.
-    books_param = ",".join(book_list) if book_list else None
-
+    # 2) Player props endpoint per market (optionally with bookmakers)
+    props_url = f"{BASE_URL}/sports/{SPORT_KEY}/players/props"
     for mkt in odds_markets:
         params = {
             "markets": mkt,
@@ -251,8 +254,6 @@ def _fetch_events_from_provider(
             params["bookmakers"] = books_param
 
         data = _http_get(props_url, params)
-
-        # data is a list of player props entries across events
         if not isinstance(data, list):
             continue
 
@@ -265,14 +266,14 @@ def _fetch_events_from_provider(
 
                 player_name = entry.get("player_name") or entry.get("playerName") or entry.get("name")
                 market_key = entry.get("market") or mkt
-                bookmaker = entry.get("bookmaker")
-                # Try to parse line/odds shape
+                bookmaker = (entry.get("bookmaker") or "").lower()
+                # normalize bookmaker key back to your canonical label if desired
+                # (we'll just keep raw API book key)
                 line = entry.get("handicap") or entry.get("line")
 
                 over_price = None
                 under_price = None
                 prices = entry.get("prices") or entry.get("outcomes") or []
-                # Each outcome: {"name":"Over","price":-115} / {"name":"Under","price":-105}
                 for o in prices:
                     oname = (o.get("name") or "").lower()
                     if "over" in oname:
@@ -284,7 +285,6 @@ def _fetch_events_from_provider(
                         if line is None:
                             line = o.get("point")
 
-                # Some books may provide separate outcomes records; be tolerant
                 event["props"].append({
                     "event_id": eid,
                     "player": player_name,
@@ -297,10 +297,8 @@ def _fetch_events_from_provider(
             except Exception:
                 continue
 
-        # small sleep to be polite with rate limits
         time.sleep(0.2)
 
-    # List of enriched events
     return [ev for ev in by_id.values() if ev.get("props")]
 
 
@@ -333,7 +331,6 @@ def events_to_dataframe(events: List[Dict[str, Any]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    # Normalize to our canonical market names if needed
     inv_map = {v: k for k, v in MARKET_MAP.items()}
     df["market"] = df["market"].map(lambda m: inv_map.get(str(m), str(m)))
     return df
@@ -365,7 +362,6 @@ def fetch_props(
     mstr = ",".join(markets) if isinstance(markets, (list, tuple)) else (markets or ",".join(DEFAULT_MARKETS))
     print(f"markets={mstr}\norder={order},{books}")
 
-    # Fetch enriched events
     events = _fetch_events_from_provider(
         date=date,
         season=season,
@@ -376,22 +372,12 @@ def fetch_props(
         **kwargs,
     ) or []
 
-    # Apply filters ONCE
-    before = len(events)
     events = _apply_selection_filters(
         events_list=events,
         teams=team_filter,
         events=event_ids,
         selection=selection,
     )
-    after = len(events)
-    if (team_filter and getattr(team_filter, "__len__", lambda: 0)() > 0) \
-       or (event_ids and getattr(event_ids, "__len__", lambda: 0)() > 0) \
-       or (selection and str(selection).strip() != ""):
-        print(f"[odds_api] selection filter -> {after} events kept")
-    else:
-        print("[odds_api] selection filter -> no filter applied")
-
     if cap and cap > 0 and isinstance(events, list):
         events = events[:cap]
 
