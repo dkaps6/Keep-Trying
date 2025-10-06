@@ -2,262 +2,444 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 import json
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import math
+import re
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 
+# --------------------------------------------------------------------------------------
+# Logging (quiet by default; engine prints key lines)
+# --------------------------------------------------------------------------------------
+LOG = logging.getLogger(__name__)
+if not LOG.handlers:
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("[props_hybrid] %(message)s"))
+    LOG.addHandler(h)
+LOG.setLevel(logging.INFO)
 
-# -----------------------------
-# Config / helpers
-# -----------------------------
+# --------------------------------------------------------------------------------------
+# Config / constants
+# --------------------------------------------------------------------------------------
 
-ODDS_API_BASE = "https://api.the-odds-api.com/v4"
-SPORT_KEY = "americanfootball_nfl"
-PLAYER_PROPS_ENDPOINT = f"{ODDS_API_BASE}/sports/{SPORT_KEY}/players/props"
+ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY") or os.getenv("ODDS_API_KEY") or ""
 
-DEFAULT_BOOKS = ["draftkings", "fanduel", "betmgm", "caesars"]
+BASE_URL = "https://api.the-odds-api.com/v4"
+SPORT = "americanfootball_nfl"  # you can parametrize later if you add NBA/NHL, etc.
+REGIONS = "us"
+ODDS_FORMAT = "american"
+DATE_FORMAT = "iso"
 
-# You can request many markets; these are commonly supported:
-# (This list is intentionally conservative to avoid INVALID_MARKET)
+# market-name mapping: your sheet/engine -> Odds API player prop key
+MARKET_MAP = {
+    "player_receptions": "player_receptions",
+    "player_receiving_yds": "player_receiving_yards",
+    "player_rush_yds": "player_rushing_yards",
+    "player_rush_attempts": "player_rushing_attempts",
+    "player_pass_yds": "player_passing_yards",
+    "player_pass_tds": "player_passing_tds",
+    "player_anytime_td": "player_touchdown_anytime",
+    # allow commonly-typed alternatives
+    "player_receiving_yards": "player_receiving_yards",
+    "player_rushing_yards": "player_rushing_yards",
+    "player_passing_yards": "player_passing_yards",
+    "player_passing_tds": "player_passing_tds",
+    "player_touchdown_anytime": "player_touchdown_anytime",
+}
+
+# default set if engine passes "default" or None
 DEFAULT_MARKETS = [
     "player_receptions",
     "player_receiving_yards",
-    "player_rush_yards",
-    "player_rush_attempts",
-    "player_pass_yards",
-    "player_pass_tds",
+    "player_rushing_yards",
+    "player_rushing_attempts",
+    "player_passing_yards",
+    "player_passing_tds",
     "player_touchdown_anytime",
-    # If you want more, add carefully and test:
-    # "player_pass_attempts",
-    # "player_pass_completions",
-    # "player_pass_interceptions",
 ]
 
-OUTPUTS_DIR = "outputs"
-CREDITS_FILE = os.path.join(OUTPUTS_DIR, "oddsapi_credits.json")
+# Normalize some common book name spellings -> Odds API bookmaker keys
+BOOK_MAP = {
+    "dk": "draftkings",
+    "draftkings": "draftkings",
+    "fanduel": "fanduel",
+    "fd": "fanduel",
+    "betmgm": "betmgm",
+    "mgm": "betmgm",
+    "caesars": "caesars",
+    "czr": "caesars",
+}
+
+REQUESTS_RETRIES = 2
+REQUESTS_SLEEP_S = 0.8
+
+# Will be filled with credit headers on each request
+_last_credits: Dict[str, Any] = {}
 
 
-def _ensure_outputs_dir() -> None:
+# --------------------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------------------
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_date(date_str: str) -> datetime:
+    """
+    Accepts either 'today' or an ISO date (YYYY-MM-DD). Returns UTC midnight.
+    """
+    if str(date_str).lower() == "today":
+        dt = _now_utc().date()
+        return datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
     try:
-        os.makedirs(OUTPUTS_DIR, exist_ok=True)
+        y, m, d = map(int, date_str.split("-"))
+        return datetime(y, m, d, tzinfo=timezone.utc)
     except Exception:
+        # fallback to today if weird format
+        dt = _now_utc().date()
+        return datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+
+
+def _headers() -> Dict[str, str]:
+    return {"Accept": "application/json"}
+
+
+def _record_credits(resp: requests.Response) -> None:
+    global _last_credits
+    try:
+        remaining = resp.headers.get("x-requests-remaining")
+        used = resp.headers.get("x-requests-used")
+        if remaining is not None or used is not None:
+            _last_credits = {
+                "requests_remaining": int(remaining) if remaining is not None else None,
+                "requests_used": int(used) if used is not None else None,
+                "captured_at": _now_utc().isoformat(),
+            }
+    except Exception:
+        # Don't let headers parsing break flow
         pass
 
 
-def _log(msg: str) -> None:
-    print(f"[props_hybrid] {msg}")
-
-
-def _odds_api_key() -> str:
-    key = os.getenv("THE_ODDS_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("Missing THE_ODDS_API_KEY in environment.")
-    return key
-
-
-def _http_get(url: str, params: Dict[str, Any], retries: int = 2, sleep: float = 0.8) -> Tuple[Dict, Dict[str, str]]:
+def _http_get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    GET with small retry. Returns (json, headers)
-    Raises RuntimeError with response text on failure.
+    GET with simple retry; raises with body detail on failure.
+    Also captures credits headers.
     """
-    last_err = None
-    for i in range(retries + 1):
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            if r.status_code == 200:
-                try:
-                    return r.json(), {k.lower(): v for k, v in r.headers.items()}
-                except Exception as e:
-                    raise RuntimeError(f"Failed to parse JSON: {e}. Body[:500]={r.text[:500]}")
-            else:
-                last_err = f"{r.status_code} {r.text[:500]}"
-        except Exception as e:
-            last_err = str(e)
-        time.sleep(sleep)
-    raise RuntimeError(f"GET failed after retries: {url}\nDetail: {last_err}")
+    last_err_text = None
+    for i in range(REQUESTS_RETRIES + 1):
+        r = requests.get(url, params=params, headers=_headers(), timeout=30)
+        _record_credits(r)
+        if r.ok:
+            try:
+                return r.json()
+            except Exception:
+                # Non-JSON means nothing we can do here
+                raise RuntimeError(f"Non-JSON from {url}")
+        last_err_text = r.text
+        time.sleep(REQUESTS_SLEEP_S)
+    raise RuntimeError(
+        f"GET failed after retries: {r.url}\nDetail: {r.status_code} {r.reason}\nBody: {last_err_text}"
+    )
 
 
-def _read_credits_from_headers(headers: Dict[str, str]) -> Dict[str, Any]:
+def _normalize_books(books: Optional[List[str]]) -> List[str]:
+    if not books:
+        # your engine often passes ['draftkings', 'fanduel', ...]; keep that
+        return ["draftkings", "fanduel", "betmgm", "caesars"]
+    out: List[str] = []
+    for b in books:
+        k = BOOK_MAP.get(str(b).lower().strip(), b)
+        if k not in out:
+            out.append(k)
+    return out
+
+
+def _normalize_markets(markets: Optional[List[str]]) -> List[str]:
     """
-    The Odds API returns usage headers:
-      X-Requests-Used, X-Requests-Remaining, X-Requests-Limit (names are case-insensitive)
-    We lower-case headers earlier, so read lower keys.
+    Accept engine/default names and return Odds API keys.
     """
-    used = headers.get("x-requests-used")
-    remaining = headers.get("x-requests-remaining")
-    limit_ = headers.get("x-requests-limit")
-    return {
-        "requests_used": int(used) if (used and used.isdigit()) else used,
-        "requests_remaining": int(remaining) if (remaining and remaining.isdigit()) else remaining,
-        "requests_limit": int(limit_) if (limit_ and limit_.isdigit()) else limit_,
-    }
+    if not markets or str(markets).lower() == "default":
+        return DEFAULT_MARKETS[:]
+    out: List[str] = []
+    for m in markets:
+        key = MARKET_MAP.get(m, m)
+        if key not in out:
+            out.append(key)
+    return out
 
 
-# -----------------------------
-# Odds API: player props fetch
-# -----------------------------
-
-def _fetch_from_oddsapi(
-    date: Optional[str] = None,
-    hours: Optional[int] = None,
-    books: Optional[Iterable[str]] = None,
-    markets: Optional[Iterable[str]] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _apply_selection_filters(
+    name: str,
+    home: str,
+    away: str,
+    teams: Optional[List[str]],
+    selection_regex: Optional[re.Pattern]
+) -> bool:
     """
-    Hit the The Odds API PLAYER PROPS endpoint and return a list of props (raw json rows)
-    plus a small 'meta' dict that includes usage/credits.
-
-    Notes:
-    - `date` and `hours` are accepted for compatibility with the engine signature,
-      but The Odds API player-props endpoint does not filter by those directly.
-      (You can post-filter by commence_time if you want; we leave that to the engine.)
+    Keep an event if it passes team and selection filters.
+    - teams: list of substrings e.g., ['Jets', 'Cowboys']
+    - selection_regex: if provided, must match the event title
     """
-    api_key = _odds_api_key()
+    if teams:
+        bucket = f"{home} {away} {name}".lower()
+        ok = any(t.lower() in bucket for t in teams)
+        if not ok:
+            return False
+    if selection_regex:
+        if not selection_regex.search(name or ""):
+            return False
+    return True
 
-    books_list = list(books) if books else DEFAULT_BOOKS
-    mkts_list = list(markets) if markets else DEFAULT_MARKETS
+
+def _as_list(x: Any) -> List[str]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        return [s.strip() for s in x.split(",") if s.strip()]
+    return []
+
+
+# --------------------------------------------------------------------------------------
+# Core Odds API flow
+# --------------------------------------------------------------------------------------
+
+def _fetch_event_shells(
+    date: str,
+    hours: int,
+    books: List[str],
+    teams: Optional[List[str]],
+    selection: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Get the slate shells from the H2H odds endpoint — it includes event ids,
+    start time, teams. This is cheap and works reliably.
+    """
+    start = _parse_date(date)
+    # we use 'hours' window forward from the midnight of 'date'
+    end = start + timedelta(hours=hours if hours and hours > 0 else 168)
 
     params = {
-        "apiKey": api_key,
-        "regions": "us",
-        "bookmakers": ",".join(books_list),
-        "markets": ",".join(mkts_list),
-        "oddsFormat": "american",
-        "dateFormat": "iso",
+        "regions": REGIONS,
+        "markets": "h2h",  # cheap market; we only want ids/teams
+        "oddsFormat": ODDS_FORMAT,
+        "dateFormat": DATE_FORMAT,
+        "bookmakers": ",".join(books),
+        "apiKey": ODDS_API_KEY,
     }
+    url = f"{BASE_URL}/sports/{SPORT}/odds"
 
-    _log(f"OddsAPI GET {PLAYER_PROPS_ENDPOINT} books={books_list} markets={mkts_list}")
-    payload, headers = _http_get(PLAYER_PROPS_ENDPOINT, params=params)
+    data = _http_get(url, params)
+    shells: List[Dict[str, Any]] = []
 
-    # Credits/usage info
-    credits = _read_credits_from_headers(headers)
-    _ensure_outputs_dir()
-    try:
-        with open(CREDITS_FILE, "w", encoding="utf-8") as f:
-            json.dump(credits, f, indent=2)
-    except Exception:
-        pass
+    # optional selection filter
+    sel_rx = None
+    if selection:
+        try:
+            sel_rx = re.compile(selection, re.IGNORECASE)
+        except Exception:
+            sel_rx = re.compile(re.escape(selection), re.IGNORECASE)
 
-    # Also print a friendly line
-    _log(f"Credits: used={credits.get('requests_used')} "
-         f"remaining={credits.get('requests_remaining')} "
-         f"limit={credits.get('requests_limit')}")
+    for ev in data:
+        try:
+            event_id = ev.get("id")
+            commence = ev.get("commence_time")  # ISO
+            if not event_id or not commence:
+                continue
+            dt = datetime.fromisoformat(commence.replace("Z", "+00:00"))
+            if dt < start or dt > end:
+                continue
+            home = ev.get("home_team", "")
+            away = ev.get("away_team", "")
+            name = ev.get("sport_title", "") or f"{away} @ {home}"
 
-    # Payload is a list of games or props grouped by event. We just return it; we’ll
-    # flatten to a DataFrame in `get_props`.
-    return payload, credits
+            if not _apply_selection_filters(name, home, away, teams, sel_rx):
+                continue
+
+            shells.append(
+                {
+                    "id": event_id,
+                    "commence_time": dt,
+                    "home_team": home,
+                    "away_team": away,
+                    "name": name,
+                }
+            )
+        except Exception:
+            # ignore weird entries
+            continue
+
+    LOG.info(f"event shells kept: {len(shells)} in window")
+    return shells
 
 
-# -----------------------------
-# Normalization
-# -----------------------------
-
-def _flatten_props_to_df(payload: List[Dict[str, Any]]) -> pd.DataFrame:
+def _fetch_event_props(
+    event_id: str,
+    books: List[str],
+    markets: List[str],
+) -> Dict[str, Any]:
     """
-    Convert Odds API /players/props payload into a tidy DataFrame.
+    Fetch player props for a single event (per Odds API docs).
+    """
+    params = {
+        "regions": REGIONS,
+        "markets": ",".join(markets),
+        "oddsFormat": ODDS_FORMAT,
+        "dateFormat": DATE_FORMAT,
+        "bookmakers": ",".join(books),
+        "apiKey": ODDS_API_KEY,
+    }
+    url = f"{BASE_URL}/sports/{SPORT}/events/{event_id}/odds"
+    return _http_get(url, params)
 
-    Output columns (stable, safe for further joins):
-      - event_id
-      - commence_time
-      - home_team
-      - away_team
-      - bookmaker
-      - market
-      - player
-      - outcome_name        (e.g., 'Over', 'Under', 'Yes')
-      - point               (line)
-      - price               (American odds)
+
+def _flat_props_rows(
+    event_shell: Dict[str, Any],
+    payload: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Flatten the Odds API per-event props payload to rows.
     """
     rows: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return rows
 
-    for ev in payload or []:
-        event_id = ev.get("id") or ev.get("event_id")
-        commence_time = ev.get("commence_time")
-        home = ev.get("home_team")
-        away = ev.get("away_team")
+    bookmakers = payload.get("bookmakers") or []
+    for bk in bookmakers:
+        book_key = (bk.get("key") or "").lower()
+        markets = bk.get("markets") or []
+        for mk in markets:
+            market_key = mk.get("key")  # e.g., 'player_receiving_yards'
+            outcomes = mk.get("outcomes") or []
+            for oc in outcomes:
+                # outcomes shape differs a little by market; be defensive
+                outcome_name = oc.get("name")
+                participant = oc.get("participant") or oc.get("description")
+                line = oc.get("point")
+                price = oc.get("price")
+                last_update = oc.get("last_update") or mk.get("last_update")
 
-        for book in (ev.get("bookmakers") or []):
-            bookmaker = book.get("key") or book.get("title") or ""
-            for mk in (book.get("markets") or []):
-                market_key = mk.get("key") or mk.get("name") or ""
-                for outcome in (mk.get("outcomes") or []):
-                    row = {
-                        "event_id": event_id,
-                        "commence_time": commence_time,
-                        "home_team": home,
-                        "away_team": away,
-                        "bookmaker": bookmaker,
+                rows.append(
+                    {
+                        "event_id": event_shell["id"],
+                        "commence_time": event_shell["commence_time"],
+                        "home_team": event_shell["home_team"],
+                        "away_team": event_shell["away_team"],
+                        "book": book_key,
                         "market": market_key,
-                        "player": outcome.get("description") or outcome.get("name") or outcome.get("player") or "",
-                        "outcome_name": outcome.get("name") or outcome.get("label") or "",
-                        "point": outcome.get("point"),
-                        "price": outcome.get("price"),
+                        "player": participant or outcome_name,  # for ATD, 'name' is the player
+                        "outcome": outcome_name,               # e.g., Over/Under/Yes/No
+                        "line": line,
+                        "price": price,                        # American odds
+                        "last_update": last_update,
                     }
-                    rows.append(row)
+                )
+    return rows
 
+
+def _build_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=[
+            "event_id","commence_time","home_team","away_team","book","market",
+            "player","outcome","line","price","last_update"
+        ])
     df = pd.DataFrame(rows)
-    # Basic hygiene
-    if not df.empty:
-        # normalize strings
-        for c in ["bookmaker", "market", "player", "outcome_name", "home_team", "away_team"]:
-            if c in df.columns:
-                df[c] = df[c].astype(str)
+    # sort a bit for readability
+    if "commence_time" in df.columns:
+        df = df.sort_values(["commence_time","event_id","book","market","player","outcome"]).reset_index(drop=True)
     return df
 
 
-# -----------------------------
-# Public entry point
-# -----------------------------
+def _print_and_write_credits(write_dir: str) -> None:
+    if not _last_credits:
+        LOG.info("credits: (not reported by API headers)")
+        return
+    remaining = _last_credits.get("requests_remaining")
+    used = _last_credits.get("requests_used")
+    LOG.info(f"credits used={used} remaining={remaining}")
+    try:
+        os.makedirs(write_dir, exist_ok=True)
+        out = os.path.join(write_dir, "oddsapi_credits.json")
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(_last_credits, f, indent=2)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------------------
+# Public entry point used by engine
+# --------------------------------------------------------------------------------------
 
 def get_props(
+    date: str = "today",
+    hours: int = 168,
+    books: Optional[List[str]] = None,
+    markets: Optional[List[str]] = None,
     *,
-    date: Optional[str] = None,
-    season: Optional[str] = None,
-    window: Optional[int] = None,
-    books: Optional[Iterable[str]] = None,
-    markets: Optional[Iterable[str]] = None,
-    order: Optional[str] = None,
-    teams: Optional[Iterable[str]] = None,
-    events: Optional[Iterable[str]] = None,
     selection: Optional[str] = None,
+    teams: Optional[List[str]] = None,
+    write_dir: str = "outputs",
+    **kwargs: Any,
 ) -> pd.DataFrame:
     """
-    Engine calls this with kwargs. We only use what applies to the Odds API fetch.
+    Main entry called by engine.
 
-    Returns a pandas DataFrame of raw player props,
-    and writes credits info to outputs/oddsapi_credits.json.
+    Parameters expected by your pipeline (flexible):
+      - date: 'today' or 'YYYY-MM-DD'
+      - hours: forward window
+      - books: list of bookmakers (keys: draftkings,fanduel,betmgm,caesars)
+      - markets: list of your names or Odds API keys
+      - selection: optional regex on event title (e.g., 'Chiefs|Jaguars')
+      - teams: optional list of team substrings
+      - write_dir: where to write 'oddsapi_credits.json'
     """
-    # Fetch raw payload + credits
-    payload, credits = _fetch_from_oddsapi(
+    if not ODDS_API_KEY:
+        raise RuntimeError("Missing THE_ODDS_API_KEY in environment.")
+
+    books_norm = _normalize_books(books)
+    markets_norm = _normalize_markets(markets)
+
+    LOG.info(f"books={books_norm}")
+    LOG.info(f"markets={markets_norm}")
+
+    # 1) Find slate events (ids) using cheap H2H call
+    event_shells = _fetch_event_shells(
         date=date,
-        hours=window,
-        books=books,
-        markets=markets,
+        hours=hours,
+        books=books_norm,
+        teams=_as_list(teams),
+        selection=selection,
     )
+    if not event_shells:
+        LOG.info("No events in window after filters.")
+        _print_and_write_credits(write_dir)
+        return _build_dataframe([])
 
-    df = _flatten_props_to_df(payload)
+    # 2) For each event id, fetch props for requested markets
+    all_rows: List[Dict[str, Any]] = []
+    for sh in event_shells:
+        try:
+            payload = _fetch_event_props(
+                event_id=sh["id"],
+                books=books_norm,
+                markets=markets_norm,
+            )
+            rows = _flat_props_rows(sh, payload)
+            all_rows.extend(rows)
+        except Exception as e:
+            # keep going if a single game fails (rare)
+            LOG.info(f"event {sh['id']} props fetch failed: {e}")
 
-    # Optional: post-filter by team substrings (if provided)
-    if teams:
-        terms = [str(t).strip().lower() for t in (teams if isinstance(teams, (list, tuple, set)) else [teams])]
-        def _keep_team(row: pd.Series) -> bool:
-            bucket = f"{row.get('home_team','')}".lower() + " " + f"{row.get('away_team','')}".lower()
-            return any(t in bucket for t in terms)
-        if not df.empty:
-            df = df[df.apply(_keep_team, axis=1)]
-
-    # Optional: selection regex substring on player/market/outcome (simple contains)
-    if selection:
-        s = str(selection).lower()
-        if not df.empty:
-            df = df[
-                df["player"].str.lower().str.contains(s, na=False)
-                | df["market"].str.lower().str.contains(s, na=False)
-                | df["outcome_name"].str.lower().str.contains(s, na=False)
-            ]
-
-    _log(f"normalized props rows: {len(df)}")
+    # 3) Build DF and print/write credits
+    df = _build_dataframe(all_rows)
+    LOG.info(f"props rows: {len(df)}")
+    _print_and_write_credits(write_dir)
     return df
