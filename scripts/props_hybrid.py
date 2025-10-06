@@ -137,9 +137,12 @@ def _fetch_event_props(api_key: str, event_id: str, books_csv: str, markets: lis
     return agg
 
 # ------------ flattening ------------
+# ------------ flattening ------------
 def _flatten(payloads: list[dict]) -> pd.DataFrame:
     """
     Flatten event -> bookmakers -> markets -> outcomes to rows.
+    Adds 'side' derived from outcome 'name' so downstream normalizers that
+    expect ['market','side','price','point', 'book', ...] won't KeyError.
     """
     rows: list[dict] = []
     for ev in payloads:
@@ -147,25 +150,43 @@ def _flatten(payloads: list[dict]) -> pd.DataFrame:
         commence_time = ev.get("commence_time") or ev.get("commenceTime")
         home = ev.get("home_team")
         away = ev.get("away_team")
+
         for bk in (ev.get("bookmakers") or []):
             book = bk.get("key")
             for mk in (bk.get("markets") or []):
-                market_key = mk.get("key")
+                market_key = mk.get("key")  # e.g. 'player_pass_yds'
                 for oc in (mk.get("outcomes") or []):
+                    name = (oc.get("name") or "").strip()  # 'Over'/'Under'/'Yes'/'No'
+                    side = name  # expose as 'side' for normalizer compatibility
                     rows.append(
-                        dict(
-                            event_id=event_id,
-                            commence_time=commence_time,
-                            home_team=home,
-                            away_team=away,
-                            book=book,
-                            market=market_key,
-                            name=oc.get("name"),
-                            price=oc.get("price"),
-                            point=oc.get("point"),
-                        )
+                        {
+                            # event/team context
+                            "event_id": event_id,
+                            "commence_time": commence_time,
+                            "home_team": home,
+                            "away_team": away,
+
+                            # book & market
+                            "book": book,                # some normalizers expect 'book'
+                            "bookmaker": book,           # keep original too
+                            "market": market_key,        # normalizer uses 'market'
+                            "market_key": market_key,    # some pipelines map this too
+
+                            # outcome fields
+                            "side": side,                # <- NEW (from 'name')
+                            "outcome_name": name,        # keep raw 'name' as well
+                            "price": oc.get("price"),
+                            "point": oc.get("point"),
+                        }
                     )
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+
+    # Ensure expected columns exist even if empty
+    for col in ["market", "side", "price", "point", "book"]:
+        if col not in df.columns:
+            df[col] = None
+
+    return df
 
 # ------------ public API ------------
 def get_props(
