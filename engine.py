@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import traceback
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import importlib
@@ -75,7 +76,7 @@ def _log(msg: str) -> None:
 # DYNAMIC IMPORTS
 # =====================================================
 def _import_odds_fetcher():
-    from scripts.props_hybrid import get_props as fn  # new hybrid odds fetcher
+    from scripts.props_hybrid import get_props as fn  # use hybrid fetcher
     return fn
 
 
@@ -110,6 +111,21 @@ def _import_normalizer():
 
 
 # =====================================================
+# API CREDIT LOGGING
+# =====================================================
+def _save_api_credits(headers: Dict[str, Any], path: str = "outputs/oddsapi_credits.json") -> None:
+    """Save used/remaining credits to a JSON file."""
+    used = headers.get("x-requests-used") or headers.get("X-Requests-Used")
+    rem = headers.get("x-requests-remaining") or headers.get("X-Requests-Remaining")
+    if used is None and rem is None:
+        return
+    Path("outputs").mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"used": used, "remaining": rem}, f, indent=2)
+    _log(f"[credits] used={used} remaining={rem} (saved to {path})")
+
+
+# =====================================================
 # UPDATED FETCHER ADAPTER
 # =====================================================
 def _call_odds_fetcher(
@@ -126,7 +142,7 @@ def _call_odds_fetcher(
 ):
     """
     Adapter that calls scripts.props_hybrid.get_props and returns a DataFrame.
-    Injects THE_ODDS_API_KEY automatically from environment.
+    Injects THE_ODDS_API_KEY automatically and saves credit info.
     """
     fn = _import_odds_fetcher()
 
@@ -140,7 +156,6 @@ def _call_odds_fetcher(
             "Add it to your GitHub Secrets (or your local env)."
         )
 
-    # normalize args
     books_arg = books
     markets_arg = markets
 
@@ -151,6 +166,11 @@ def _call_odds_fetcher(
         markets=markets_arg,
         limit=cap if isinstance(cap, int) and cap > 0 else 0,
     )
+
+    # if results come with credit headers (from hybrid fetcher), persist them
+    if isinstance(results, dict) and "headers" in results and "data" in results:
+        _save_api_credits(results["headers"])
+        results = results["data"]
 
     if isinstance(results, pd.DataFrame):
         return results
@@ -246,13 +266,19 @@ def run_pipeline(**kwargs) -> int:
         _log(f"normalized {len(df_norm)} rows")
 
         # --- pricing logic placeholder ---
-        df_priced = df_norm  # temporary; replace with actual pricing call
+        df_priced = df_norm
         _log(f"priced {len(df_priced)} rows")
 
         Path(write_dir).mkdir(parents=True, exist_ok=True)
         outfile = Path(write_dir) / f"{basename}.csv"
         df_priced.to_csv(outfile, index=False)
         _log(f"✅ pipeline complete: wrote {outfile}")
+
+        # Save latest API credits snapshot if available
+        credit_path = Path(write_dir) / "oddsapi_credits.json"
+        if credit_path.exists():
+            _log(f"✅ API credits log saved at: {credit_path}")
+
         return 0
 
     except Exception as e:
