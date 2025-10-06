@@ -47,7 +47,13 @@ def run_pipeline(
     write_dir: str = "outputs",
     basename: Optional[str] = None,
 ) -> int:
-    """Orchestrates the end-to-end pricing run."""
+       # --- alias legacy CLI arg "hours" -> "window" ---
+    import inspect
+    frame_locals = inspect.currentframe().f_locals
+    if "hours" in frame_locals and "window" not in frame_locals:
+        window = frame_locals["hours"]
+
+   """Orchestrates the end-to-end pricing run."""
     try:
         team_filter = _to_list_if_csv(teams)
         event_ids = _to_list_if_csv(events)
