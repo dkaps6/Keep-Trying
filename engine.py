@@ -36,7 +36,9 @@ def run_pipeline(
     *,
     date: str = "today",
     season: Optional[int] = None,
+    # Accept either window or legacy hours
     window: Optional[str | int] = "168h",
+    hours: Optional[int] = None,
     cap: int = 0,
     markets: Optional[str] = None,
     books: str = "draftkings,fanduel",
@@ -47,16 +49,27 @@ def run_pipeline(
     write_dir: str = "outputs",
     basename: Optional[str] = None,
 ) -> int:
-       # --- alias legacy CLI arg "hours" -> "window" ---
-    import inspect
-    frame_locals = inspect.currentframe().f_locals
-    if "hours" in frame_locals and "window" not in frame_locals:
-        window = frame_locals["hours"]
+    """
+    Orchestrates the end-to-end pricing run.
+    Accepts either `window` (preferred) or legacy `hours`.
+    """
 
-   """Orchestrates the end-to-end pricing run."""
+    # --- normalize window / hours ------------------------------------------------
+    # If hours was passed (old workflow) and window isn't meaningful, use hours.
+    if hours is not None and (window in (None, "", 0, "0", "0h", "0H")):
+        window = hours
+
+    # Keep `window` as string like "36h" or integer hours – downstream handles both
+    # Make sure we only log plain values
+    _log(f"starting pipeline…")
+    _log(f"team filter: None (ALL teams in the date window)")
+    _log(f"fetching props… date={date} season={season}")
+    _log(f"window={window} cap={cap}")
+    _log(f"markets={markets or 'default'} order={order} books={books}")
+
     try:
         team_filter = _to_list_if_csv(teams)
-        event_ids = _to_list_if_csv(events)
+        event_ids   = _to_list_if_csv(events)
 
         print(f"[engine] fetching props… date={date} season={season}")
         print(f"[engine] markets={markets or 'default'} order={order} books={books}")
