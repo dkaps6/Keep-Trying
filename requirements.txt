@@ -9,4 +9,4 @@ selenium
 nflfastpy
 pyarrow
 numpy==1.26.4
-openpyxl
+openpyxl>=3.1.0
