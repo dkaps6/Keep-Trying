@@ -3,40 +3,62 @@ from __future__ import annotations
 from pathlib import Path
 import pandas as pd
 
-from scripts.fetch_all import main as fetch_main
-from scripts.normalize_props import normalize
+# 1) Player props (Odds API / DK)
+from scripts.odds_api import fetch_props
+
+# 2) External metrics (team_form via nfl_data_py, weather via NWS)
+#    NOTE: this main() accepts only season (no date)
+from scripts.fetch_all import main as fetch_metrics
+
+# 3) Pricing/model + writer (compat helper)
 from scripts.pricing import price_props, write_outputs
 
-ROOT = Path(".")
-OUT = ROOT / "outputs"
-DATA = ROOT / "data"
-DATA.mkdir(exist_ok=True)
 
-def run_pipeline(target_date: str="today", season: str="2025", write: bool=True) -> pd.DataFrame:
-    print("[engine] fetching props...")
-    fetch_main(date=target_date, season=season)  # will fail-fast if no props
+def run_pipeline(
+    target_date: str,
+    season: int,
+    out_dir: str = "outputs",
+    teams: list[str] | None = None,
+    events: list[str] | None = None,
+    markets: list[str] | None = None,
+    provider_order: str | None = None,
+) -> pd.DataFrame:
+    """
+    End-to-end:
+      - fetch player props
+      - fetch external metrics (team_form + weather)
+      - price with model
+      - write outputs and return priced DataFrame
+    """
+    print(f"[engine] fetching props… date={target_date} season={season}")
 
-    print("[engine] normalizing...")
-    raw = pd.read_csv(OUT/"props_raw.csv")
-    norm = normalize(raw)
+    # Only pass filters that were provided
+    props_kwargs = {}
+    if teams:           props_kwargs["teams"] = teams
+    if events:          props_kwargs["events"] = events
+    if markets:         props_kwargs["markets"] = markets
+    if provider_order:  props_kwargs["provider_order"] = provider_order
 
-    # optional id map join (do not drop unmatched)
-    id_map_path = DATA/"id_map.csv"
-    if id_map_path.exists():
-        try:
-            mp = pd.read_csv(id_map_path)
-            if set(["player_name","player_id"]).issubset(mp.columns):
-                norm = norm.merge(mp.rename(columns={"player_name":"player"}), on="player", how="left")
-                norm["needs_mapping"] = norm["player_id"].isna()
-        except Exception as e:
-            print("[engine] id_map read failed:", e)
+    props = fetch_props(date=target_date, season=season, **props_kwargs)
+    if props is None or props.empty:
+        raise SystemExit("[engine] No props available to price (props fetch returned 0 rows).")
 
-    print(f"[engine] pricing {len(norm)} consolidated rows...")
-    priced = price_props(norm)
+    print(f"[engine] fetching metrics (team_form + weather)… season={season}")
+    # IMPORTANT: no 'date' here
+    fetch_metrics(season=season)
 
-    if write:
-        write_outputs(priced, OUT)
+    print("[engine] pricing…")
+    priced_clean = price_props(props)  # also writes standard outputs internally if you left that logic
 
-    print("[engine] done. wrote to:", OUT)
-    return priced
+    # Ensure the “clean” table is written the way the old engine expected
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    write_outputs(priced_clean, out_dir=out_dir, basename="props_priced_clean")
 
+    # Optional summary (best-effort)
+    try:
+        from scripts.validate_outputs import summarize
+        summarize(f"{out_dir}/props_priced_clean.csv", top_k=15, min_edge_mark=0.01, write_md=f"{out_dir}/SUMMARY.md")
+    except Exception as e:
+        print(f"[engine] summary skipped: {e}")
+
+    return priced_clean
