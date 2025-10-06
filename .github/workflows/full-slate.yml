@@ -1,54 +1,53 @@
-name: "Full Slate (manual): fetch odds + run model"
+name: Run pipeline
 
 on:
   workflow_dispatch:
     inputs:
       date:
-        description: "Logical date for the run (usually 'today')"
+        description: "Logical date (YYYY-MM-DD or 'today')"
         required: true
         default: "today"
       season:
         description: "Season tag (e.g., 2025)"
         required: true
         default: "2025"
-      teams:
-        description: "Only include games where team name contains any of these (comma separated, e.g. 'Jets,Cowboys'). Leave blank for full slate."
-        required: false
-        default: ""
-      events:
-        description: "Only include these Odds API event IDs (comma separated). Leave blank for none."
-        required: false
-        default: ""
-      event_window_hours:
-        description: "Credit guard: only price events starting within N hours (0 = no filter)"
+      window_hours:
+        description: "Only price events starting within N hours (0 = no filter)"
         required: true
-        default: "168"
-      max_events:
-        description: "Credit guard: hard cap on number of events to fetch (0 = no cap)"
+        default: "36"
+      cap:
+        description: "Hard cap on number of events to fetch (0 = no cap)"
         required: true
-        default: "40"
-      bookmakers:
-        description: "Bookmakers to include (comma separated keys)"
+        default: "0"
+      books:
+        description: "Bookmakers (comma separated keys)"
         required: true
         default: "draftkings,fanduel,betmgm,caesars"
+      markets:
+        description: "Override markets (comma separated). Leave blank for defaults."
+        required: false
+        default: ""
+      order:
+        description: "Provider sorting (usually 'odds')"
+        required: false
+        default: "odds"
+      teams:
+        description: "Team name contains any of these (comma separated). Leave blank for full slate."
+        required: false
+        default: ""
+      selection:
+        description: "Optional player-name filter (substring/regex). Leave blank for none."
+        required: false
+        default: ""
 
 jobs:
-  build:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    concurrency:
-      group: full-slate-${{ github.ref }}
-      cancel-in-progress: false
-
-    # These envs are read by scripts/odds_api.py
+    timeout-minutes: 30
     env:
-      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-      ODDS_API_EVENT_WINDOW_HOURS: ${{ inputs.event_window_hours }}
-      ODDS_API_MAX_EVENTS: ${{ inputs.max_events }}
-      ODDS_API_BOOKMAKERS: ${{ inputs.bookmakers }}
-      # teams/events are also passed as CLI flags, but env keeps it consistent
-      ODDS_API_INCLUDE_TEAMS: ${{ inputs.teams }}
-      ODDS_API_INCLUDE_EVENTS: ${{ inputs.events }}
+      # Map the same secret to BOTH names (new and legacy)
+      THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+      ODDS_API_KEY:     ${{ secrets.THE_ODDS_API_KEY }}
 
     steps:
       - name: Checkout repository
@@ -61,58 +60,49 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # in case XLSX export is desired and not pinned in your reqs
-          pip install --quiet openpyxl || true
+            python -m pip install --upgrade pip
+            if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Show run filters (for transparency)
-        run: |
-          echo "Date:        ${{ inputs.date }}"
-          echo "Season:      ${{ inputs.season }}"
-          echo "Teams:       '${{ inputs.teams }}'"
-          echo "Event IDs:   '${{ inputs.events }}'"
-          echo "Window (h):  ${{ inputs.event_window_hours }}"
-          echo "Max events:  ${{ inputs.max_events }}"
-          echo "Bookmakers:  ${{ inputs.bookmakers }}"
-
-      - name: Make output dirs
-        run: |
-          mkdir -p outputs metrics inputs outputs/debug
-
-      # Optional quota ping — this endpoint is safe (doesn't burn event credits)
-      - name: Check Odds API quota
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      - name: Check Odds API key present
         run: |
           python - <<'PY'
-          import os, requests
-          key = os.environ.get("ODDS_API_KEY","")
-          if not key:
-              print("⚠️  ODDS_API_KEY is empty; skipping check.")
-          else:
-              r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={key}", timeout=20)
-              print("HTTP", r.status_code)
-              print("Key suffix:", (key[-4:] if len(key)>=4 else "n/a"))
-              print("Remaining:", r.headers.get("x-requests-remaining"), "Used:", r.headers.get("x-requests-used"), "Limit:", r.headers.get("x-requests-limit"))
+          import os, sys
+          k1 = os.getenv("THE_ODDS_API_KEY")
+          k2 = os.getenv("ODDS_API_KEY")
+          if not k1:
+              print("❌ THE_ODDS_API_KEY is missing"); sys.exit(1)
+          print("✅ THE_ODDS_API_KEY loaded (length:", len(k1), ")")
+          print("ℹ️  ODDS_API_KEY mirror present:", bool(k2))
           PY
 
-      # Single step that fetches odds (with filters) and runs the whole pipeline
-      - name: Run pipeline
+      - name: Run model
+        env:
+          DATE:       ${{ github.event.inputs.date }}
+          SEASON:     ${{ github.event.inputs.season }}
+          WINDOW:     ${{ github.event.inputs.window_hours }}
+          CAP:        ${{ github.event.inputs.cap }}
+          BOOKS:      ${{ github.event.inputs.books }}
+          MARKETS:    ${{ github.event.inputs.markets }}
+          ORDER:      ${{ github.event.inputs.order }}
+          TEAMS:      ${{ github.event.inputs.teams }}
+          SELECTION:  ${{ github.event.inputs.selection }}
         run: |
-          python run_model.py \
-            --date "${{ inputs.date }}" \
-            --season "${{ inputs.season }}" \
-            --write outputs \
-            --teams "${{ inputs.teams }}" \
-            --events "${{ inputs.events }}"
+          set -euo pipefail
 
-      - name: Upload artifacts (outputs + debug)
+          # Build CLI args only when values are non-empty
+          ARGS=( --date "$DATE" --season "$SEASON" --window "$WINDOW" --cap "$CAP" --books "$BOOKS" )
+          [ -n "$MARKETS" ]  && ARGS+=( --markets "$MARKETS" )
+          [ -n "$ORDER" ]    && ARGS+=( --order "$ORDER" )
+          [ -n "$TEAMS" ]    && ARGS+=( --teams "$TEAMS" )
+          [ -n "$SELECTION" ]&& ARGS+=( --selection "$SELECTION" )
+
+          echo "Running: python run_model.py ${ARGS[*]}"
+          python run_model.py "${ARGS[@]}"
+
+      - name: Upload outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: slate-${{ inputs.date }}-${{ inputs.season }}
-          path: |
-            outputs/**
-            metrics/**
+          name: model-outputs
+          path: outputs/**
           if-no-files-found: warn
