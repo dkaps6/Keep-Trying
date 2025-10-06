@@ -1,42 +1,46 @@
-#!/usr/bin/env python3
-"""
-Entry point for the slate pipeline.
+# run_model.py
+from __future__ import annotations
 
-Adds optional filters so you can run the full slate or only specific games:
-  --teams  "Jets,Cowboys"      (keeps events where either team name matches)
-  --events "6e206c...,ff8222"  (keeps only these Odds API event IDs)
-
-We pass filters via env vars so any module that fetches odds (scripts/odds_api.py)
-will see them even if called indirectly.
-"""
-import os
-import importlib
 import argparse
+import importlib
+import sys
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--date", default="today", help="logical date (usually 'today')")
-    p.add_argument("--season", default="2025", help="season tag used in outputs/metrics")
-    p.add_argument("--write", default="outputs", help="directory to write outputs to")
+    ap = argparse.ArgumentParser(description="Run end-to-end pricing pipeline")
+    ap.add_argument("--date", default="today", help="target date (ISO YYYY-MM-DD or 'today')")
+    ap.add_argument("--season", type=int, required=True, help="season year, e.g. 2025")
+    ap.add_argument(
+        "--write",
+        default="outputs",
+        help="directory to write outputs (CSV/XLSX/SUMMARY.md)",
+    )
+    args = ap.parse_args()
 
-    # NEW: selection filters
-    p.add_argument("--teams", default="", help="Comma-separated team substrings to include (e.g., 'Jets,Cowboys')")
-    p.add_argument("--events", default="", help="Comma-separated Odds API event IDs to include")
-
-    args = p.parse_args()
-
-    if args.teams:
-        os.environ["ODDS_API_INCLUDE_TEAMS"] = args.teams
-    if args.events:
-        os.environ["ODDS_API_INCLUDE_EVENTS"] = args.events
-
-    # Allow both the new and old engine signatures
-    engine = importlib.import_module("engine")
+    # Load engine dynamically so this file stays tiny and the engine can evolve.
     try:
-        engine.run_pipeline(target_date=args.date, season=args.season, write_outputs=args.write)
-    except TypeError:
-        engine.run_pipeline(args.date, args.season, args.write)
+        engine = importlib.import_module("engine")
+    except Exception as e:
+        print(f"[run_model] failed to import engine: {e}", file=sys.stderr)
+        raise
+
+    try:
+        print(f"[run_model] Loaded engine module from: {engine.__file__}")
+    except Exception:
+        pass
+
+    # Execute the pipeline
+    try:
+        print("[run_model] starting pipeline…")
+        df = engine.run_pipeline(target_date=args.date, season=args.season, out_dir=args.write)
+        n = 0 if df is None else len(df)
+        print(f"[run_model] pipeline completed. Wrote outputs to: {args.write}  (rows={n})")
+    except SystemExit as e:
+        # let explicit SystemExit (e.g., no props available) propagate as nonzero
+        raise
+    except Exception as e:
+        print(f"[run_model] pipeline crashed: {e}", file=sys.stderr)
+        raise
 
 
 if __name__ == "__main__":
