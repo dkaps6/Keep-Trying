@@ -124,54 +124,82 @@ def _import_normalizer():
 
 from scripts.pricing import price_props, write_outputs
 
-# ---------- module override shim (CRITICAL) ----------
+# ---------- SAFE module override shim (CRITICAL) ----------
 
 def _override_odds_api_defaults(mod, *, hours: Optional[int], selection: Optional[str],
                                 team_filter: Optional[List[str]], event_ids: Optional[List[str]]):
     """
     Some repos read module-level variables/env inside odds_api instead of kwargs.
-    We proactively set common names so the fetcher can't ignore our choices.
+    We gently set a few known variable names — NEVER touching callables.
     """
+
     # hard-clear env that could force filters
     for k in ("SELECTION_FILTER", "ODDS_SELECTION", "SELECTION", "EVENTS", "EVENT_IDS",
               "WINDOW_HOURS", "LOOKAHEAD_HOURS", "WINDOW"):
         if os.environ.get(k) is not None:
             os.environ.pop(k, None)
 
-    def _set(name, value):
+    def _safe_set(name: str, value):
         if hasattr(mod, name):
-            setattr(mod, name, value)
+            obj = getattr(mod, name)
+            # do NOT overwrite functions or callables
+            if not callable(obj):
+                setattr(mod, name, value)
 
-    # selection-like names
-    for name in dir(mod):
-        lname = name.lower()
-        if "select" in lname and ("filter" in lname or lname.endswith("selection")):
-            _set(name, selection)
+    # Common explicit knobs some repos define:
+    explicit_map = {
+        # selection
+        "SELECTION_FILTER": selection,
+        "DEFAULT_SELECTION": selection,
+        "SELECTION": selection,
+        # team filter
+        "TEAM_FILTER": team_filter,
+        "DEFAULT_TEAM_FILTER": team_filter,
+        # event ids
+        "EVENT_IDS": event_ids,
+        "DEFAULT_EVENT_IDS": event_ids,
+        # window / hours
+        "WINDOW_HOURS": hours,
+        "LOOKAHEAD_HOURS": hours,
+        "DEFAULT_WINDOW_HOURS": hours,
+        "WINDOW": hours,
+        "DEFAULT_WINDOW": hours,
+    }
+    for k, v in explicit_map.items():
+        _safe_set(k, v)
 
-    # window/hours-like names
+    # Additionally, adjust any obvious non-callable attributes with safe heuristics
     for name in dir(mod):
+        obj = getattr(mod, name)
+        if callable(obj):
+            continue
         lname = name.lower()
-        if any(tok in lname for tok in ("window", "hour", "lookahead")) and not callable(getattr(mod, name)):
-            if hours is not None:
-                _set(name, hours)
 
-    # team filter-like names
-    for name in dir(mod):
-        lname = name.lower()
-        if "team" in lname and "filter" in lname:
-            _set(name, team_filter)
+        # window/hours-like
+        if hours is not None and any(tok in lname for tok in ("window", "hour", "lookahead")):
+            try:
+                # if it's numeric-like, set it
+                _safe_set(name, hours)
+            except Exception:
+                pass
 
-    # event id-like names
-    for name in dir(mod):
-        lname = name.lower()
-        if ("event" in lname and ("ids" in lname or "filter" in lname)) or lname in {"events", "event_ids"}:
-            _set(name, event_ids)
+        # selection-like
+        if selection is None and ("select" in lname and ("filter" in lname or lname.endswith("selection"))):
+            _safe_set(name, None)
+
+        # team filter-like
+        if team_filter is None and ("team" in lname and "filter" in lname):
+            _safe_set(name, None)
+
+        # event ids-like
+        if event_ids is None and (("event" in lname and ("ids" in lname or "filter" in lname)) or lname in {"events", "event_ids"}):
+            _safe_set(name, None)
 
 # ---------- call fetcher with adaptive params ----------
 
 def _call_odds_fetcher(fn, odds_mod, **kwargs):
     """
-    Pass only accepted params. Also monkeypatch module-level defaults so internal code can't
+    Pass only accepted params. Also set module-level defaults so internal code can't
     override our args with env/config.
     """
     selection = _none_if_blank(kwargs.get("selection"))
@@ -179,7 +207,7 @@ def _call_odds_fetcher(fn, odds_mod, **kwargs):
     team_filter = kwargs.get("team_filter")
     event_ids = kwargs.get("event_ids")
 
-    # Set module-level knobs first (covers fetchers that ignore kwargs)
+    # set module-level knobs first (covers fetchers that ignore kwargs)
     _override_odds_api_defaults(
         odds_mod,
         hours=hours,
