@@ -16,9 +16,10 @@ DEFAULT_REGION = "us"
 DEFAULT_ODDS_FORMAT = "american"
 DEFAULT_DATE_FORMAT = "iso"
 
-# Batch size to avoid 422s when the API or your plan dislikes many markets at once
+# batch size (small keeps OddsAPI happy)
 ODDS_API_MARKETS_MAX = int(os.getenv("ODDS_API_MARKETS_MAX", "3"))
 
+# map our aliases -> OddsAPI v4 market names
 MARKET_MAP = {
     # receiving / receptions
     "player_receiving_yds": "player_receiving_yards",
@@ -52,6 +53,7 @@ MARKET_MAP = {
     "player_touchdown_anytime": "player_touchdown_anytime",
 }
 
+# sensible default markets
 DEFAULT_MARKETS = [
     "player_receptions",
     "player_receiving_yards",
@@ -81,29 +83,26 @@ def _split_csv_maybe_list(x: T.Optional[T.Union[str, T.List[str]]]) -> T.List[st
 def _normalize_books(books: T.Optional[T.Union[str, T.List[str]]]) -> T.List[str]:
     items = _split_csv_maybe_list(books)
     items = [i.lower() for i in items]
-    items = [i for i in items if len(i) > 2]
-    return items
+    # drop 1–2 letter garbage
+    return [i for i in items if len(i) > 2]
 
 def _normalize_markets(markets: T.Optional[T.Union[str, T.List[str]]]) -> T.List[str]:
     raw = _split_csv_maybe_list(markets)
     if not raw:
         return DEFAULT_MARKETS[:]
-    normalized: T.List[str] = []
+    out: T.List[str] = []
+    seen: set[str] = set()
     for m in raw:
         key = re.sub(r"[^a-z0-9_]", "", m.lower())
         mapped = MARKET_MAP.get(key, key)
-        normalized.append(mapped)
-    seen: set[str] = set()
-    out: T.List[str] = []
-    for m in normalized:
-        if m and m not in seen:
-            seen.add(m)
-            out.append(m)
+        if mapped and mapped not in seen:
+            seen.add(mapped)
+            out.append(mapped)
     return out
 
 def _http_get(url: str, retries: int = 2, sleep: float = 0.8) -> str:
     last_err: T.Optional[Exception] = None
-    for attempt in range(retries + 1):
+    for _ in range(retries + 1):
         try:
             with urllib.request.urlopen(url, timeout=30) as r:
                 return r.read().decode("utf-8")
@@ -113,7 +112,7 @@ def _http_get(url: str, retries: int = 2, sleep: float = 0.8) -> str:
                 body = e.read().decode("utf-8")
             except Exception:
                 pass
-            last_err = RuntimeError(f"HTTPError {e.code}: {e.reason} – body: {body[:600]}")
+            last_err = RuntimeError(f"HTTPError {e.code}: {e.reason} – body: {body[:800]}")
             time.sleep(sleep)
         except Exception as e:
             last_err = e
@@ -124,9 +123,7 @@ def _http_get(url: str, retries: int = 2, sleep: float = 0.8) -> str:
 class OddsRow:
     raw: dict
 
-def _fetch_from_oddsapi_one_batch(
-    *, api_key: str, books: T.List[str], markets: T.List[str]
-) -> T.List[dict]:
+def _fetch_from_oddsapi_one_batch(*, api_key: str, books: T.List[str], markets: T.List[str]) -> T.List[dict]:
     params = {
         "apiKey": api_key,
         "regions": DEFAULT_REGION,
@@ -145,7 +142,17 @@ def _fetch_from_oddsapi_one_batch(
     return data
 
 def _chunk(lst: T.List[str], n: int) -> T.List[T.List[str]]:
-    return [lst[i : i + n] for i in range(0, len(lst), n)]
+    return [lst[i:i+n] for i in range(0, len(lst), n)]
+
+def _parse_invalid_markets_from_error_text(err_text: str) -> T.List[str]:
+    # looks for  'Invalid markets: a, b, c'
+    m = re.search(r"Invalid markets:\s*([a-z0-9_,\s]+)", err_text, flags=re.I)
+    if not m:
+        return []
+    found = m.group(1)
+    parts = [p.strip().lower() for p in found.split(",")]
+    parts = [MARKET_MAP.get(p, p) for p in parts]  # normalize aliases if present
+    return [p for p in parts if p]
 
 def _fetch_from_oddsapi(
     *,
@@ -163,31 +170,44 @@ def _fetch_from_oddsapi(
     books_list = _normalize_books(books)
     markets_list = _normalize_markets(markets)
 
-    # Batch markets into smaller chunks to avoid 422s
+    if not markets_list:
+        _log("No markets requested after normalization.")
+        return []
+
     batches = _chunk(markets_list, max(1, ODDS_API_MARKETS_MAX))
     merged: dict[str, dict] = {}
 
     for batch in batches:
-        data = _fetch_from_oddsapi_one_batch(api_key=api_key, books=books_list, markets=batch)
-        # Merge by event id (OddsAPI returns list of events with markets per event)
+        try:
+            data = _fetch_from_oddsapi_one_batch(api_key=api_key, books=books_list, markets=batch)
+        except RuntimeError as e:
+            s = str(e)
+            invalid = _parse_invalid_markets_from_error_text(s)
+            if invalid:
+                # remove invalids from this batch and retry once
+                keep = [m for m in batch if m.lower() not in set(invalid)]
+                _log(f"OddsAPI reported invalid markets {invalid}; dropping and retrying batch -> {keep}")
+                if not keep:
+                    _log("Batch became empty after pruning invalid markets; skipping.")
+                    continue
+                data = _fetch_from_oddsapi_one_batch(api_key=api_key, books=books_list, markets=keep)
+            else:
+                # some other error – bubble up
+                raise
+
         for ev in data:
             key = str(ev.get("id") or ev.get("eventId") or ev.get("commence_time") or json.dumps(ev, sort_keys=True))
             if key not in merged:
                 merged[key] = ev
             else:
-                # merge markets if both dicts have 'bookmakers' lists
                 a = merged[key]
                 b = ev
                 if isinstance(a.get("bookmakers"), list) and isinstance(b.get("bookmakers"), list):
-                    a_bm = a["bookmakers"]
-                    b_bm = b["bookmakers"]
-                    a_bm.extend(b_bm)
+                    a["bookmakers"].extend(b["bookmakers"])
                 else:
-                    # fallback: last wins
                     merged[key] = ev
 
-    rows: T.List[OddsRow] = [OddsRow(raw=v) for v in merged.values()]
-    return rows
+    return [OddsRow(raw=v) for v in merged.values()]
 
 def get_props(
     *,
