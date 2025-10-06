@@ -21,7 +21,7 @@ def _log(msg: str) -> None:
 # Small helpers
 # -----------------------------
 def _to_list_if_csv(x: Optional[Union[str, List[str]]]) -> Optional[List[str]]:
-    """Turn 'a,b,c' into ['a','b','c'] ; keep list as-is ; normalize blanks to None."""
+    """Turn 'a,b,c' into ['a','b','c']; keep list as-is; normalize blanks to None."""
     if x is None:
         return None
     if isinstance(x, list):
@@ -43,8 +43,7 @@ def _none_if_blank(x: Optional[str]) -> Optional[str]:
 
 def _parse_window_to_hours(w: Optional[Union[str, int]]) -> Optional[int]:
     """
-    Accept '36' / '36h' / 36 -> 36
-    Accept '0' -> 0 ; None -> None
+    Accept '36' / '36h' / 36 -> 36. Accept '0' -> 0 ; None -> None
     """
     if w is None:
         return None
@@ -60,21 +59,18 @@ def _parse_window_to_hours(w: Optional[Union[str, int]]) -> Optional[int]:
 
 
 def _coerce_args(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Central place to populate defaults used by the CLI and UI.
-    DO NOT remove keys—some are consumed by downstream functions via signature filtering.
-    """
     out = dict(kwargs)
     out.setdefault("date", "today")
     out.setdefault("season", None)
-    out.setdefault("window", "168h")  # hours lookahead
+    out.setdefault("window", "168h")  # hours lookahead (string or int)
+    out.setdefault("hours", None)     # ALSO supported now; runner may pass this
     out.setdefault("cap", 0)
     out.setdefault("markets", None)
     out.setdefault("books", "dk")
     out.setdefault("order", "odds")
-    out.setdefault("teams", None)        # CSV string -> list
-    out.setdefault("selection", None)    # substring / regex
-    out.setdefault("events", None)       # CSV event IDs
+    out.setdefault("teams", None)
+    out.setdefault("selection", None)
+    out.setdefault("events", None)
     out.setdefault("write_dir", "outputs")
     out.setdefault("basename", None)
     return out
@@ -84,9 +80,6 @@ def _coerce_args(kwargs: Dict[str, Any]) -> Dict[str, Any]:
 # Robust dynamic imports
 # -----------------------------
 def _import_odds_fetcher():
-    """
-    Your project’s unified fetcher that now supports Odds API v4 (and more).
-    """
     try:
         from scripts.props_hybrid import get_props as fn  # type: ignore
         return fn
@@ -98,9 +91,6 @@ def _import_odds_fetcher():
 
 
 def _import_normalizer():
-    """
-    Find a normalizer function in scripts.normalize_props with several fallback names.
-    """
     candidates = (
         ("scripts.normalize_props", "normalize_props"),
         ("scripts.normalize_props", "normalize"),
@@ -123,9 +113,6 @@ def _import_normalizer():
 
 
 def _import_pricer():
-    """
-    Try to import a pricing function. If not found, we’ll pass-through with a warning.
-    """
     candidates = (
         ("scripts.price_props", "price_props"),
         ("scripts.pricing", "price_props"),
@@ -148,9 +135,6 @@ def _import_pricer():
 
 
 def _import_writer():
-    """
-    Try to import a writer function. If not found, we’ll write a simple CSV fallback.
-    """
     candidates = (
         ("scripts.write_outputs", "write_outputs"),
         ("scripts.outputs", "write_outputs"),
@@ -180,12 +164,17 @@ def _import_writer():
 def _call_fetcher_safely(fn, **kwargs):
     """
     Inspect the fetcher’s signature and only pass supported parameters.
-    Also adapts window → hours and cleans blanks.
+    Also adapts window/hours → hours and cleans blanks.
     """
     sig = inspect.signature(fn)
 
     selection = _none_if_blank(kwargs.get("selection"))
-    hours = _parse_window_to_hours(kwargs.get("window"))
+    # normalize a possible window/hours pair into one integer
+    hours = kwargs.get("hours")
+    if hours is None:
+        hours = _parse_window_to_hours(kwargs.get("window"))
+    else:
+        hours = _parse_window_to_hours(hours)
 
     canonical = {
         "date": kwargs.get("date"),
@@ -198,9 +187,9 @@ def _call_fetcher_safely(fn, **kwargs):
         "selection": selection,
         "event_ids": kwargs.get("event_ids"),
         # windows/hours variants
-        "window": hours,
-        "hours": hours,
-        "lookahead": hours,
+        "window": hours,   # if fetcher expects 'window'
+        "hours": hours,    # if fetcher expects 'hours'
+        "lookahead": hours # if fetcher expects 'lookahead'
     }
 
     params: Dict[str, Any] = {}
@@ -221,6 +210,7 @@ def run_pipeline(
     date: str = "today",
     season: Optional[int] = None,
     window: Optional[Union[str, int]] = "168h",
+    hours: Optional[Union[str, int]] = None,  # <— NEW: accept hours directly
     cap: int = 0,
     markets: Optional[str] = None,
     books: str = "draftkings,fanduel",
@@ -240,9 +230,12 @@ def run_pipeline(
         event_ids = _to_list_if_csv(events)
         markets_list = _to_list_if_csv(markets)
 
+        # Resolve effective hours for logging (CLI may provide hours or window)
+        eff_hours = _parse_window_to_hours(hours if hours is not None else window)
+
         _log(f"fetching props… date={date} season={season}")
         _log(f"markets={','.join(markets_list) if markets_list else 'default'} order={order} books={books}")
-        _log(f"selection={_none_if_blank(selection)} window={window} cap={cap}")
+        _log(f"selection={_none_if_blank(selection)} window={window} hours={eff_hours} cap={cap}")
 
         # Resolve modules
         fetch_fn = _import_odds_fetcher()
@@ -250,12 +243,13 @@ def run_pipeline(
         price_fn = _import_pricer()
         writer_fn = _import_writer()
 
-        # Fetch
+        # Fetch (pass both window and hours; safe-caller will adapt to fetcher signature)
         raw_df = _call_fetcher_safely(
             fetch_fn,
             date=date,
             season=season,
             window=window,
+            hours=eff_hours,
             cap=cap,
             markets=markets_list,
             order=order,
@@ -302,3 +296,4 @@ def run_pipeline(
         _log(f"EXCEPTION: {e}")
         traceback.print_exc()
         return 1
+
