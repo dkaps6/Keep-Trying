@@ -66,8 +66,7 @@ def _log(msg: str) -> None:
 # ---------- robust imports (now use the SAFE adapter) ----------
 
 def _import_odds_fetcher():
-    # Use the v4 adapter (correct /odds endpoint)
-    from scripts.odds_api_v4 import get_props as fn  # type: ignore
+    from scripts.props_hybrid import get_props as fn  # type: ignore
     return fn
 
 def _import_normalizer():
