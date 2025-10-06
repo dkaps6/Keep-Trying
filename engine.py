@@ -11,7 +11,6 @@ import pandas as pd
 import importlib
 import inspect
 
-from scripts.pricing import price_props, write_outputs
 from scripts.odds_api_v4 import get_props as odds_get_props
 
 
@@ -67,8 +66,8 @@ def _log(msg: str) -> None:
 # ---------- robust imports (now use the SAFE adapter) ----------
 
 def _import_odds_fetcher():
-    # We import from the new safe wrapper which delegates to your existing odds_api.
-    from scripts.odds_api_safe import get_props as fn  # type: ignore
+    # Use the v4 adapter (correct /odds endpoint)
+    from scripts.odds_api_v4 import get_props as fn  # type: ignore
     return fn
 
 def _import_normalizer():
@@ -197,7 +196,7 @@ def run_pipeline(**kwargs) -> int:
             _log("No props available to price (props fetch returned empty DataFrame).")
             return 1
 
-        _log(f"fetched {len(df_props)} raw props from odds_api")
+        _log(f"fetched {len(df_props)} raw props from odds_api_v4")
 
         df_norm = norm_fn(df_props)
         if df_norm is None or (hasattr(df_norm, "empty") and df_norm.empty):
