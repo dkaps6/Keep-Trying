@@ -139,17 +139,66 @@ def _list_event_ids(api_key:str, date:str, books_csv:str)->list[str]:
     _log(f"event shells fetched: {len(out)}")
     return out
 
-def _fetch_event_props(api_key:str, event_id:str, books_csv:str, markets:list[str])->list[dict]:
-    if not markets: return []
-    url=f"{BASE}/sports/{NFL_SPORT}/events/{event_id}/odds"
-    params=dict(apiKey=api_key, regions=DEFAULT_REGIONS, markets=",".join(markets),
-                oddsFormat=DEFAULT_ODDS_FORMAT, dateFormat=DEFAULT_DATEFORMAT,
-                bookmakers=books_csv)
-    data,h=_http_get(url, params); _print_credits(h)
-    # v4 returns a dict per bookmaker set for the event
-    if isinstance(data, dict) and "bookmakers" in data: return [data]
-    if isinstance(data, list): return data
-    return []
+# --- helper: check if payload contains any outcomes
+def _has_outcomes(payload: dict) -> bool:
+    """Return True if any bookmaker in payload has any market with any outcomes."""
+    for bk in (payload.get("bookmakers") or []):
+        for mk in (bk.get("markets") or []):
+            oc = mk.get("outcomes") or []
+            if oc:
+                return True
+    return False
+
+
+# --- robust event-prop fetcher with per-market fallback
+def _fetch_event_props(api_key: str, event_id: str, books_csv: str, markets: list[str]) -> list[dict]:
+    """
+    Fetch props for one event. First try all markets together.
+    If the payload has no outcomes, retry one-market-at-a-time and merge.
+    """
+    if not markets:
+        return []
+
+    base_url = f"{BASE}/sports/{NFL_SPORT}/events/{event_id}/odds"
+    common = dict(
+        apiKey=api_key,
+        regions=DEFAULT_REGIONS,
+        oddsFormat=DEFAULT_ODDS_FORMAT,
+        dateFormat=DEFAULT_DATEFORMAT,
+        bookmakers=books_csv,
+    )
+
+    # 1) bulk request for all markets
+    params = dict(common, markets=",".join(markets))
+    data, hdrs = _http_get(base_url, params)
+    _print_credits(hdrs)
+
+    agg: list[dict] = []
+    if isinstance(data, dict):
+        data.setdefault("eventId", event_id)
+        if _has_outcomes(data):
+            agg.append(data)
+            _log(f"event {event_id}: outcomes (bulk) ✓")
+            return agg
+
+    # 2) fallback: one-market-at-a-time
+    _log(f"event {event_id}: no outcomes in bulk call → retrying per-market")
+    for m in markets:
+        p = dict(common, markets=m)
+        d, h = _http_get(base_url, p)
+        _print_credits(h)
+        if isinstance(d, dict):
+            d.setdefault("eventId", event_id)
+            if _has_outcomes(d):
+                agg.append(d)
+
+    if agg:
+        _log(f"event {event_id}: outcomes (per-market) ✓ {len(agg)} payload(s)")
+    else:
+        _log(f"event {event_id}: still no outcomes for requested markets")
+
+    return agg
+
 
 # ---------- NEW: flatten to one-row-per-outcome with explicit "market" ----------
 
