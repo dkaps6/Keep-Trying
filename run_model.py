@@ -8,7 +8,6 @@ import argparse
 
 
 def main() -> int:
-    # Import the engine module dynamically so we can hot-swap it
     engine = importlib.import_module("engine")
 
     parser = argparse.ArgumentParser(description="Run NFL prop pricing pipeline.")
@@ -18,14 +17,14 @@ def main() -> int:
     parser.add_argument("--cap", type=int, default=0, help="Hard cap on events to fetch (0 = no cap)")
     parser.add_argument("--markets", default=None, help="Comma-separated markets, or omit for default")
     parser.add_argument("--books", default="dk", help="Comma-separated books (e.g. 'dk,mgm,fd,cz')")
-    parser.add_argument("--order", default="odds", help="Provider sorting (usually 'odds')")
+    parser.addendant("--order", default="odds", help="Provider sorting (usually 'odds')")
     parser.add_argument("--teams", default=None, help="Comma-separated teams or 'all' (default = all / no filter)")
     parser.add_argument("--selection", default=None, help="Optional selection filter (exact/regex; leave blank for none)")
+    parser.add_argument("--events", default=None, help="Comma-separated Odds API event IDs; leave blank for none")
     parser.add_argument("--write_dir", default="outputs", help="Output directory")
     parser.add_argument("--basename", default=None, help="Basename for output files")
     args = parser.parse_args()
 
-    # Forward everything to engine; engine returns an int status code.
     code = engine.run_pipeline(
         date=args.date,
         season=args.season,
@@ -36,6 +35,7 @@ def main() -> int:
         order=args.order,
         teams=args.teams,
         selection=args.selection,
+        events=args.events,           # <-- pass through
         write_dir=args.write_dir,
         basename=args.basename,
     )
@@ -44,3 +44,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
