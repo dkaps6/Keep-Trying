@@ -1,6 +1,7 @@
 # engine.py
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -10,7 +11,7 @@ import pandas as pd
 import importlib
 import inspect
 
-# ---------- small helpers ----------
+# ---------- helpers ----------
 
 def _to_list_if_csv(s: Optional[str]) -> Optional[List[str]]:
     if s is None:
@@ -39,7 +40,7 @@ def _parse_window_to_hours(w: Optional[str | int]) -> Optional[int]:
     try:
         return int(float(s))
     except Exception:
-        return None  # let fetcher default if we can't parse
+        return None
 
 def _coerce_args(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(kwargs)
@@ -51,8 +52,8 @@ def _coerce_args(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     out.setdefault("books", "dk")
     out.setdefault("order", "odds")
     out.setdefault("teams", None)       # default: no team filter
-    out.setdefault("selection", None)   # may be blank in UI; we'll coerce to None
-    out.setdefault("events", None)      # optional event IDs
+    out.setdefault("selection", None)   # we will coerce blank -> None
+    out.setdefault("events", None)      # optional Odds API event IDs
     out.setdefault("write_dir", "outputs")
     out.setdefault("basename", None)
     return out
@@ -130,18 +131,16 @@ def _call_odds_fetcher(fn, **kwargs):
     Pass only accepted params. Map:
       - window -> window|hours|lookahead (int hours)
       - team_filter <-> teams
-      - selection None if blank
+      - selection: blank -> None
       - event_ids -> event_ids|events|ids
     """
     sig = inspect.signature(fn)
     params: Dict[str, Any] = {}
 
-    # sanitize selection
     selection = _none_if_blank(kwargs.get("selection"))
-    # parse hours
     hours = _parse_window_to_hours(kwargs.get("window"))
 
-    # canonical
+    # canonical pool
     canonical = {
         "date": kwargs.get("date"),
         "season": kwargs.get("season"),
@@ -152,12 +151,12 @@ def _call_odds_fetcher(fn, **kwargs):
         "team_filter": kwargs.get("team_filter"),
         "selection_filter": selection,
         "event_ids": kwargs.get("event_ids"),
-        "window": hours,     # may be None
-        "hours": hours,      # will pick correct one below
-        "lookahead": hours,  # "
+        "window": hours,
+        "hours": hours,
+        "lookahead": hours,
     }
 
-    # direct pass-through where accepted
+    # pass through only what the fetcher accepts (and only if not None)
     for k, v in list(canonical.items()):
         if k in sig.parameters and v is not None:
             params[k] = v
@@ -174,11 +173,6 @@ def _call_odds_fetcher(fn, **kwargs):
     if "selection" not in sig.parameters and "selection_filter" in sig.parameters:
         params["selection_filter"] = canonical["selection_filter"]
 
-    # window mapping: prefer existing one; else map to hours/lookahead/window
-    if hours is not None and all(k not in sig.parameters for k in ("window", "hours", "lookahead")):
-        # do nothing—fetcher doesn't support windowed pulls
-        pass
-
     # event_ids mapping
     if "event_ids" not in sig.parameters and kwargs.get("event_ids") is not None:
         for alt in ("events", "ids"):
@@ -192,13 +186,18 @@ def _call_odds_fetcher(fn, **kwargs):
 def run_pipeline(**kwargs) -> int:
     args = _coerce_args(kwargs)
 
+    # HARD-CLEAR env knobs that might force selection/event filters inside odds_api
+    for k in ("SELECTION_FILTER", "ODDS_SELECTION", "SELECTION", "EVENTS", "EVENT_IDS"):
+        if os.environ.get(k) is not None:
+            os.environ.pop(k, None)
+
     season: Optional[int] = args["season"]
     date: str = args["date"]
     window: str | int | None = args["window"]
     cap: int = int(args["cap"])
     books: str = str(args["books"])
     order: str = str(args["order"])
-    selection: Optional[str] = args["selection"]
+    selection: Optional[str] = _none_if_blank(args["selection"])  # force None if blank
     write_dir: str = str(args["write_dir"])
     basename: Optional[str] = args["basename"]
 
@@ -228,6 +227,7 @@ def run_pipeline(**kwargs) -> int:
         _log(f"fetching props… date={date} season={season}")
         _log(f"window={window} cap={cap}")
         _log(f"markets={','.join(markets) if markets else 'default'} order={order} books={books}")
+        _log(f"selection={selection}")
 
         fetch_fn = _import_odds_fetcher()
         norm_fn  = _import_normalizer()
@@ -242,7 +242,7 @@ def run_pipeline(**kwargs) -> int:
             order=order,
             books=books,
             team_filter=team_filter,
-            selection=selection,
+            selection=selection,  # now definitely None if blank
             event_ids=event_ids,
         )
 
