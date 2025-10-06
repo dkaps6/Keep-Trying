@@ -24,52 +24,70 @@ def main() -> None:
         help="directory to write outputs (CSV/XLSX/SUMMARY.md)",
     )
 
-    # Optional filters (nargs='?' allows the flag to appear with no value)
-    ap.add_argument("--teams", nargs="?", default="", help="comma-separated team names to filter (e.g. Chiefs,Jaguars)")
-    ap.add_argument("--events", nargs="?", default="", help="comma-separated event IDs to filter (Odds API event ids)")
+    # Optional filters (passed only if engine.run_pipeline accepts them)
+    ap.add_argument("--teams", nargs="?", default="", help="comma-separated team names (e.g. Chiefs,Jaguars)")
+    ap.add_argument("--events", nargs="?", default="", help="comma-separated event IDs")
     ap.add_argument("--markets", nargs="?", default="", help="comma-separated markets (e.g. receiving_yards,player_receptions)")
     ap.add_argument("--provider-order", nargs="?", default="", help="override provider order, e.g. 'odds,dk' or 'dk,odds'")
 
     args = ap.parse_args()
 
-    # Import engine dynamically
+    # Import engine
     try:
         engine = importlib.import_module("engine")
+        print(f"[run_model] Loaded engine module from: {engine.__file__}")
     except Exception as e:
         print(f"[run_model] failed to import engine: {e}", file=sys.stderr)
         raise
-    try:
-        print(f"[run_model] Loaded engine module from: {engine.__file__}")
-    except Exception:
-        pass
 
-    # Build optional passthrough kwargs from CLI
+    # Build optional passthroughs from CLI
     requested: Dict[str, Any] = {
         "teams": _parse_csv_list(args.teams),
         "events": _parse_csv_list(args.events),
         "markets": _parse_csv_list(args.markets),
-        "provider_order": args.provider_order or "",
+        "provider_order": (args.provider_order or "").strip(),
     }
-    # Drop empties
-    requested = {k: v for k, v in requested.items() if (v if not isinstance(v, str) else v.strip())}
+    requested = {k: v for k, v in requested.items() if (v if not isinstance(v, str) else v)}
 
-    # Only pass kwargs the current engine.run_pipeline actually accepts
+    # Introspect engine.run_pipeline and adapt argument names
     try:
         sig = inspect.signature(engine.run_pipeline)
-        allowed = {p.name for p in sig.parameters.values()}
-        passthrough = {k: v for k, v in requested.items() if k in allowed}
+        params = set(sig.parameters.keys())
     except Exception:
-        # If introspection fails, don't pass any optional kwargs
-        passthrough = {}
+        params = set()
+
+    kwargs: Dict[str, Any] = {}
+
+    # Date param name
+    if "target_date" in params:
+        kwargs["target_date"] = args.date
+    elif "date" in params:
+        kwargs["date"] = args.date
+    else:
+        # if engine doesn't take date, just omit it
+        pass
+
+    # Season (most engines require this)
+    if "season" in params:
+        kwargs["season"] = args.season
+
+    # Output directory param name
+    if "out_dir" in params:
+        kwargs["out_dir"] = args.write
+    elif "write_outputs" in params:
+        kwargs["write_outputs"] = args.write
+    elif "write" in params:
+        kwargs["write"] = args.write
+    # else: engine handles writing internally; omit
+
+    # Add optional filters only if the engine accepts them
+    for k, v in requested.items():
+        if k in params:
+            kwargs[k] = v
 
     print("[run_model] starting pipeline…")
     try:
-        df = engine.run_pipeline(
-            target_date=args.date,
-            season=args.season,
-            out_dir=args.write,
-            **passthrough,
-        )
+        df = engine.run_pipeline(**kwargs)
         n = 0 if df is None else len(df)
         print(f"[run_model] pipeline completed. Wrote outputs to: {args.write}  (rows={n})")
     except SystemExit:
@@ -81,4 +99,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
