@@ -1,45 +1,100 @@
-# run_model.py
-# Thin CLI wrapper that delegates to engine.run_pipeline and exits with its status.
-from __future__ import annotations
+name: Run pipeline
 
-import importlib
-import sys
-import argparse
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Logical date for the run (YYYY-MM-DD or 'today')"
+        required: true
+        default: "today"
+      season:
+        description: "Season tag (e.g., 2025)"
+        required: true
+        default: "2025"
+      window_hours:
+        description: "Only price events starting within N hours (0 = no filter)"
+        required: true
+        default: "36"
+      cap:
+        description: "Hard cap on number of events to fetch (0 = no cap)"
+        required: true
+        default: "0"
+      books:
+        description: "Bookmakers (comma separated keys)"
+        required: true
+        default: "draftkings,fanduel,betmgm,caesars"
+      markets:
+        description: "Override markets (comma separated). Leave blank for defaults."
+        required: false
+        default: ""
+      order:
+        description: "Provider sorting (usually 'odds')"
+        required: false
+        default: "odds"
+      teams:
+        description: "Only include games where team name contains any of these (comma separated). Leave blank for full slate."
+        required: false
+        default: ""
+      selection:
+        description: "Optional selection filter (regex/substring on player name). Leave blank for none."
+        required: false
+        default: ""
 
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Odds API key comes from repo secrets
+      THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
 
-def main() -> int:
-    engine = importlib.import_module("engine")
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    parser = argparse.ArgumentParser(description="Run NFL prop pricing pipeline.")
-    parser.add_argument("--date", default="today", help="Anchor date: 'today' or YYYY-MM-DD")
-    parser.add_argument("--season", type=int, default=None, help="Season year, e.g. 2025")
-    parser.add_argument("--window", default="168h", help="Lookahead window from date, e.g. '24h', '36h', '168h'")
-    parser.add_argument("--cap", type=int, default=0, help="Hard cap on events to fetch (0 = no cap)")
-    parser.add_argument("--markets", default=None, help="Comma-separated markets, or omit for default")
-    parser.add_argument("--books", default="dk", help="Comma-separated books (e.g. 'dk,mgm,fd,cz')")
-    parser.add_argument("--order", default="odds", help="Provider sorting (usually 'odds')")
-    parser.add_argument("--teams", default=None, help="Comma-separated teams or 'all' (default = all / no filter)")
-    parser.add_argument("--selection", default=None, help="Optional selection filter (exact/regex; leave blank for none)")
-    parser.add_argument("--events", default=None, help="Comma-separated Odds API event IDs; leave blank for none")
-    parser.add_argument("--write_dir", default="outputs", help="Output directory")
-    parser.add_argument("--basename", default=None, help="Basename for output files")
-    args = parser.parse_args()
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    code = engine.run_pipeline(
-        date=args.date,
-        season=args.season,
-        window=args.window,
-        cap=args.cap,
-        markets=args.markets,
-        books=args.books,
-        order=args.order,
-        teams=args.teams,
-        selection=args.selection,
-        events=args.events,
-        write_dir=args.write_dir,
-        basename=args.basename,
-    )
-    return int(code)
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run model
+        env:
+          DATE:       ${{ github.event.inputs.date }}
+          SEASON:     ${{ github.event.inputs.season }}
+          WINDOW:     ${{ github.event.inputs.window_hours }}
+          CAP:        ${{ github.event.inputs.cap }}
+          BOOKS:      ${{ github.event.inputs.books }}
+          MARKETS:    ${{ github.event.inputs.markets }}
+          ORDER:      ${{ github.event.inputs.order }}
+          TEAMS:      ${{ github.event.inputs.teams }}
+          SELECTION:  ${{ github.event.inputs.selection }}
+        run: |
+          set -euo pipefail
+
+          ARGS="--date \"$DATE\" --season \"$SEASON\" --window \"$WINDOW\" --cap \"$CAP\" --books \"$BOOKS\""
+
+          # Only include optional flags if non-empty to avoid argparse errors
+          if [ -n "$MARKETS" ];   then ARGS="$ARGS --markets \"$MARKETS\""; fi
+          if [ -n "$ORDER" ];     then ARGS="$ARGS --order \"$ORDER\""; fi
+          if [ -n "$TEAMS" ];     then ARGS="$ARGS --teams \"$TEAMS\""; fi
+          if [ -n "$SELECTION" ]; then ARGS="$ARGS --selection \"$SELECTION\""; fi
+
+          echo "Running: python run_model.py $ARGS"
+          python run_model.py $ARGS
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-outputs
+          path: |
+            outputs/**
+          if-no-files-found: warn
 
 
 if __name__ == "__main__":
