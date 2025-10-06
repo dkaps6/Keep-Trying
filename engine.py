@@ -1,8 +1,7 @@
 # engine.py
 # Orchestrates fetching sportsbook props, normalizing, pricing, and writing outputs.
-# - No team filter by default (fetch all teams in the date window)
-# - Robust import: works whether odds_api exposes get_props(), fetch_props(), or get_props_df()
-# - You can still pass teams="Chiefs,Jaguars" from run_model.py to filter if desired
+# - No team filter by default (fetch ALL teams in the window)
+# - Robust imports: odds fetcher and normalizer function names are auto-detected
 
 from __future__ import annotations
 
@@ -12,15 +11,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-
+import importlib
+import inspect
 
 # ===========================
 # Robust odds_api importer
 # ===========================
 def _import_odds_fetcher():
     """
-    Try multiple common names so we don't crash if your odds_api changed.
-    Returns a callable fetcher from scripts.odds_api.
+    Try multiple names so we don't crash if scripts/odds_api.py changed.
+    Returns a callable fetcher.
     """
     err = None
     try:
@@ -38,6 +38,15 @@ def _import_odds_fetcher():
         return fn
     except Exception as e:
         err = e
+    # Last resort: import module and look for a callable that sounds right
+    try:
+        mod = importlib.import_module("scripts.odds_api")
+        for name in ("get_props", "fetch_props", "get_props_df"):
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                return fn
+    except Exception as e:
+        err = e
     raise ImportError(
         "Could not import a props fetcher from scripts.odds_api "
         "(tried get_props, fetch_props, get_props_df)"
@@ -49,12 +58,9 @@ def _call_odds_fetcher(fn, **kwargs):
     Call the fetcher with only the parameters it accepts.
     Transparently maps team_filter<->teams and selection_filter<->selection if needed.
     """
-    import inspect
-
     sig = inspect.signature(fn)
     params = {}
 
-    # Primary args we support at the engine level:
     canonical = {
         "date": kwargs.get("date"),
         "season": kwargs.get("season"),
@@ -63,11 +69,10 @@ def _call_odds_fetcher(fn, **kwargs):
         "markets": kwargs.get("markets"),
         "order": kwargs.get("order"),
         "books": kwargs.get("books"),
-        "team_filter": kwargs.get("team_filter"),      # None or list[str]
-        "selection_filter": kwargs.get("selection"),   # string or None
+        "team_filter": kwargs.get("team_filter"),
+        "selection_filter": kwargs.get("selection"),
     }
 
-    # Direct pass-through where accepted
     for k, v in canonical.items():
         if k in sig.parameters:
             params[k] = v
@@ -88,14 +93,60 @@ def _call_odds_fetcher(fn, **kwargs):
 
 
 # ===========================
-# Repo-local model imports
+# Robust normalizer importer
 # ===========================
-from scripts.normalize_props import normalize_props  # your existing normalizer
-from scripts.pricing import price_props, write_outputs  # pricing & writer
+def _import_normalizer():
+    """
+    Try common export names in scripts/normalize_props.py and return a callable.
+    """
+    err = None
+    try:
+        from scripts.normalize_props import normalize_props as fn  # type: ignore
+        return fn
+    except Exception as e:
+        err = e
+    try:
+        from scripts.normalize_props import normalize as fn  # type: ignore
+        return fn
+    except Exception as e:
+        err = e
+    try:
+        from scripts.normalize_props import normalize_df as fn  # type: ignore
+        return fn
+    except Exception as e:
+        err = e
+    try:
+        from scripts.normalize_props import to_model_schema as fn  # type: ignore
+        return fn
+    except Exception as e:
+        err = e
+
+    # Last resort: look for any callable that sounds like a normalizer
+    try:
+        mod = importlib.import_module("scripts.normalize_props")
+        for name in ("normalize_props", "normalize", "normalize_df", "to_model_schema"):
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                return fn
+    except Exception as e:
+        err = e
+
+    raise ImportError(
+        "Could not import a normalizer from scripts.normalize_props "
+        "(tried normalize_props, normalize, normalize_df, to_model_schema)"
+    ) from err
 
 
+# ===========================
+# Pricing & writer (fixed names)
+# ===========================
+from scripts.pricing import price_props, write_outputs  # these exist in your repo
+
+# ===========================
+# Helpers
+# ===========================
 def _to_list_if_csv(s: Optional[str]) -> Optional[List[str]]:
-    """Turn 'Chiefs,Jaguars' into ['Chiefs','Jaguars']; None/''/'all' -> None (no filter)."""
+    """'Chiefs,Jaguars' -> ['Chiefs','Jaguars']; None/''/'all' -> None (no filter)."""
     if s is None:
         return None
     if isinstance(s, list):
@@ -107,17 +158,16 @@ def _to_list_if_csv(s: Optional[str]) -> Optional[List[str]]:
 
 
 def _coerce_args(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Coerce run args to sane pass-through defaults."""
     out = dict(kwargs)
-    out.setdefault("season", None)            # e.g. 2025
-    out.setdefault("date", "today")           # 'today' or 'YYYY-MM-DD'
-    out.setdefault("window", "168h")          # lookahead window (e.g. '24h', '168h')
-    out.setdefault("cap", 0)                  # 0 = no cap
-    out.setdefault("markets", None)           # None -> odds_api default set
-    out.setdefault("books", "dk")             # e.g. 'dk,mgm'
-    out.setdefault("order", "odds")           # odds_api ordering
-    out.setdefault("teams", None)             # None/''/'all' => NO team filter
-    out.setdefault("selection", None)         # optional selection filter
+    out.setdefault("season", None)
+    out.setdefault("date", "today")
+    out.setdefault("window", "168h")
+    out.setdefault("cap", 0)
+    out.setdefault("markets", None)
+    out.setdefault("books", "dk")
+    out.setdefault("order", "odds")
+    out.setdefault("teams", None)         # default: no team filter
+    out.setdefault("selection", None)
     out.setdefault("write_dir", "outputs")
     out.setdefault("basename", None)
     return out
@@ -127,10 +177,13 @@ def _log(msg: str) -> None:
     print(f"[engine] {msg}")
 
 
+# ===========================
+# Main
+# ===========================
 def run_pipeline(**kwargs) -> int:
     """
-    Main entry point. Returns 0 on success, non-zero on failure.
-    Default: NO TEAM FILTER (fetch all teams within the window).
+    Returns 0 on success, non-zero on failure.
+    Default: NO TEAM FILTER (fetch all teams in the given date+window).
     """
     args = _coerce_args(kwargs)
 
@@ -149,7 +202,7 @@ def run_pipeline(**kwargs) -> int:
     if isinstance(markets, str) and markets.strip():
         markets = [m.strip() for m in markets.split(",") if m.strip()]
     elif not markets:
-        markets = None  # let odds_api decide default set
+        markets = None  # let odds_api decide defaults
 
     # Teams (NO FILTER by default)
     team_filter = _to_list_if_csv(args.get("teams"))
@@ -158,7 +211,6 @@ def run_pipeline(**kwargs) -> int:
     else:
         _log(f"team filter: {team_filter}")
 
-    # Basename for outputs
     if not basename:
         basename = f"props_priced_{date}"
 
@@ -168,8 +220,9 @@ def run_pipeline(**kwargs) -> int:
         _log(f"markets={','.join(markets) if markets else 'default'} order={order} books={books}")
 
         fetch_fn = _import_odds_fetcher()
+        norm_fn  = _import_normalizer()
 
-        # 1) Fetch sportsbook props (no team filter by default)
+        # 1) Fetch sportsbook props
         df_props = _call_odds_fetcher(
             fetch_fn,
             date=date,
@@ -183,20 +236,24 @@ def run_pipeline(**kwargs) -> int:
             selection=selection,
         )
 
-        if df_props is None or len(df_props) == 0:
+        if df_props is None or (isinstance(df_props, (list, tuple)) and len(df_props) == 0):
             _log("No props available to price (props fetch returned 0 rows).")
             return 1
 
-        # Normalize input to DataFrame just in case fetcher returned a list
         if not isinstance(df_props, pd.DataFrame):
             df_props = pd.DataFrame(df_props)
+        if df_props.empty:
+            _log("No props available to price (props fetch returned empty DataFrame).")
+            return 1
+
         _log(f"fetched {len(df_props)} raw props from odds_api")
 
         # 2) Normalize to model schema
-        df_norm = normalize_props(df_props)
-        if df_norm is None or df_norm.empty:
+        df_norm = norm_fn(df_props)
+        if df_norm is None or (hasattr(df_norm, "empty") and df_norm.empty):
             _log("Normalization produced 0 rows. Check provider mapping / markets.")
             return 1
+
         _log(f"normalized {len(df_norm)} rows")
 
         # 3) Price
@@ -219,7 +276,6 @@ def run_pipeline(**kwargs) -> int:
 
 
 if __name__ == "__main__":
-    # Quick local test without run_model.py
     import argparse
 
     parser = argparse.ArgumentParser(description="Run pricing pipeline (no team filter by default).")
