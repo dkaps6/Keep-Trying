@@ -512,3 +512,40 @@ def price_props(df_props: pd.DataFrame) -> pd.DataFrame:
     df.to_csv("outputs/props_priced.csv", index=False)
 
     return out
+
+# ---------------------------
+# compatibility helper: write_outputs
+# ---------------------------
+from pathlib import Path
+
+def write_outputs(
+    df: pd.DataFrame,
+    out_dir: str = "outputs",
+    basename: str = "props_priced",
+    **kwargs,  # tolerate legacy args (e.g., write_xlsx=True)
+) -> None:
+    """
+    Backward-compatible writer so engine.py can 'from scripts.pricing import write_outputs'.
+    - Always writes CSV:  <out_dir>/<basename>.csv
+    - Tries to write XLSX if openpyxl is installed:  <out_dir>/<basename>.xlsx
+    - Also writes the concise table if you pass basename='props_priced_clean'
+      (engine usually calls this only once — duplication is harmless).
+    """
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    # CSV
+    csv_path = Path(out_dir) / f"{basename}.csv"
+    try:
+        df.to_csv(csv_path, index=False)
+        print(f"[pricing.write_outputs] wrote {csv_path}")
+    except Exception as e:
+        print(f"[pricing.write_outputs] CSV write failed: {e}")
+
+    # XLSX (best-effort)
+    try:
+        import openpyxl  # noqa: F401
+        xlsx_path = Path(out_dir) / f"{basename}.xlsx"
+        df.to_excel(xlsx_path, index=False)  # uses openpyxl if present
+        print(f"[pricing.write_outputs] wrote {xlsx_path}")
+    except Exception as e:
+        print(f"[pricing.write_outputs] XLSX skipped ({e})")
