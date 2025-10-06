@@ -12,6 +12,7 @@ import importlib
 import inspect
 
 from scripts.pricing import price_props, write_outputs
+from scripts.odds_api_v4 import get_props as odds_get_props
 
 
 def _to_list_if_csv(s: Optional[str]) -> Optional[List[str]]:
