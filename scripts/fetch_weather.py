@@ -1,76 +1,109 @@
 # scripts/fetch_weather.py
 from __future__ import annotations
+import argparse
+import datetime as dt
+from pathlib import Path
 import pandas as pd
 import requests
-from datetime import datetime
-import os
 
-STADIUMS_CSV = "data/stadiums.csv"
+UA = {"User-Agent": "Keep-Trying/1.0 (github actions; contact: none)"}
 
-def _load_stadiums() -> pd.DataFrame:
-    if os.path.exists(STADIUMS_CSV):
-        return pd.read_csv(STADIUMS_CSV)
-    # minimal fallback: you can expand this file over time
-    df = pd.DataFrame([
-        {"team":"BUF","stadium":"Highmark Stadium","lat":42.7738,"lon":-78.7868},
-        {"team":"KC","stadium":"GEHA Field at Arrowhead","lat":39.049,"lon":-94.4843},
-        {"team":"DAL","stadium":"AT&T Stadium","lat":32.7473,"lon":-97.0945},
-        {"team":"PHI","stadium":"Lincoln Financial Field","lat":39.9008,"lon":-75.1675},
-    ])
-    os.makedirs("data", exist_ok=True)
-    df.to_csv(STADIUMS_CSV, index=False)
-    return df
+def _read_stadiums() -> pd.DataFrame:
+    p = Path("data/stadiums.csv")
+    if not p.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(p)
+    df.columns = [c.strip().lower() for c in df.columns]
+    need = {"team","lat","lon"}
+    if not need.issubset(df.columns):
+        return pd.DataFrame()
+    return df[["team","lat","lon"]].copy()
 
-def _open_meteo(lat: float, lon: float, t: pd.Timestamp) -> dict:
-    # hourly forecast around kickoff time (UTC assumed; open-meteo takes ISO date with tz offset)
-    url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        "&hourly=temperature_2m,precipitation,precipitation_probability,windspeed_10m"
-        f"&start_date={t.date()}&end_date={t.date()}"
-    )
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json()
+def _read_events() -> pd.DataFrame:
+    p = Path("outputs/game_lines.csv")
+    if not p.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(p)
+    # expected columns: event_id, home_team, commence_time (ISO8601 UTC)
+    return df[["event_id","home_team","commence_time"]].dropna()
 
-def build_weather_csv(season: int) -> pd.DataFrame:
-    import nfl_data_py as nfl
-    sched = nfl.import_schedules([season])
-    # Keep regular-season games with kickoffs
-    sched = sched[~sched["gameday"].isna()].copy()
-    sched["kickoff"] = pd.to_datetime(sched["gameday"] + " " + sched["gametime"], errors="coerce", utc=True)
+def _iso_to_dt_utc(s: str) -> dt.datetime:
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z","+00:00")).astimezone(dt.timezone.utc)
+    except Exception:
+        return None
 
-    stad = _load_stadiums()
-    stad_map = {row["team"]: (row["lat"], row["lon"]) for _, row in stad.iterrows()}
+def _round_to_hour(t: dt.datetime) -> dt.datetime:
+    return t.replace(minute=0, second=0, microsecond=0)
 
-    rows = []
-    for _, g in sched.iterrows():
-        home = g.get("home_team")
-        latlon = stad_map.get(home)
-        if not latlon: 
+def _precip_from_forecast(text: str) -> str:
+    s = (text or "").lower()
+    if any(w in s for w in ["snow","flurries","blowing snow"]): return "snow"
+    if any(w in s for w in ["rain","showers","thunderstorm","drizzle"]): return "rain"
+    return "none"
+
+def _nws_hourly(lat: float, lon: float) -> pd.DataFrame:
+    try:
+        r = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=UA, timeout=20)
+        r.raise_for_status()
+        hourly_url = r.json()["properties"]["forecastHourly"]
+        r2 = requests.get(hourly_url, headers=UA, timeout=20)
+        r2.raise_for_status()
+        periods = r2.json()["properties"]["periods"]
+        df = pd.json_normalize(periods)
+        # columns: startTime, temperature, windSpeed, shortForecast
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def fetch_weather() -> pd.DataFrame:
+    stad = _read_stadiums()
+    ev   = _read_events()
+    if stad.empty or ev.empty:
+        return pd.DataFrame(columns=["event_id","wind_mph","temp_f","precip"])
+
+    ev = ev.merge(stad.rename(columns={"team":"home_team"}), on="home_team", how="left")
+    out_rows = []
+    for _, row in ev.iterrows():
+        event_id = row["event_id"]
+        lat, lon = row["lat"], row["lon"]
+        kickoff  = _iso_to_dt_utc(str(row["commence_time"]))
+        if kickoff is None or pd.isna(lat) or pd.isna(lon):
             continue
-        lat, lon = latlon
-        k = g["kickoff"]
+        kickoff_hr = _round_to_hour(kickoff)
+
+        hourly = _nws_hourly(float(lat), float(lon))
+        if hourly.empty or "startTime" not in hourly.columns:
+            continue
+
+        hourly["t"] = pd.to_datetime(hourly["startTime"], utc=True)
+        # nearest period at/after kickoff hour
+        h = hourly.loc[hourly["t"] >= pd.Timestamp(kickoff_hr)].head(1)
+        if h.empty:
+            h = hourly.tail(1)
+
+        temp_f = h["temperature"].iloc[0] if "temperature" in h.columns else None
+        wind_s = h["windSpeed"].iloc[0] if "windSpeed" in h.columns else ""
+        wind_mph = None
         try:
-            data = _open_meteo(lat, lon, k)
-            # find hour == kickoff hour
-            hourly = pd.DataFrame(data.get("hourly", {}))
-            if hourly.empty or "time" not in hourly: 
-                continue
-            hourly["time"] = pd.to_datetime(hourly["time"], utc=True)
-            hrow = hourly.iloc[(hourly["time"]-k).abs().argsort()[:1]]
-            rec = {
-                "season": season,
-                "week": int(g.get("week", 0) or 0),
-                "home_team": home,
-                "away_team": g.get("away_team"),
-                "kickoff_utc": k.isoformat(),
-                "wind_mph": float(hrow["windspeed_10m"].iloc[0]) if "windspeed_10m" in hrow else None,
-                "precip": "rain" if ("precipitation" in hrow and hrow["precipitation"].iloc[0] and float(hrow["precipitation"].iloc[0])>0) else "none",
-                "temperature_f": float(hrow["temperature_2m"].iloc[0]) * 9/5 + 32 if "temperature_2m" in hrow else None,
-            }
-            rows.append(rec)
-        except Exception as e:
-            # non-fatal
-            continue
-    return pd.DataFrame(rows)
+            wind_mph = int(str(wind_s).split()[0])
+        except Exception:
+            wind_mph = None
+        short = h["shortForecast"].iloc[0] if "shortForecast" in h.columns else ""
+        precip = _precip_from_forecast(short)
+
+        out_rows.append({"event_id": event_id, "wind_mph": wind_mph, "temp_f": temp_f, "precip": precip})
+
+    return pd.DataFrame(out_rows)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--write", default="data/weather.csv")
+    args = ap.parse_args()
+    df = fetch_weather()
+    Path(args.write).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(args.write, index=False)
+    print(f"[weather] wrote {len(df)} rows to {args.write}")
+
+if __name__ == "__main__":
+    main()
