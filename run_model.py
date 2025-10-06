@@ -1,100 +1,131 @@
-name: Run pipeline
+# run_model.py
+from __future__ import annotations
 
-on:
-  workflow_dispatch:
-    inputs:
-      date:
-        description: "Logical date for the run (YYYY-MM-DD or 'today')"
-        required: true
-        default: "today"
-      season:
-        description: "Season tag (e.g., 2025)"
-        required: true
-        default: "2025"
-      window_hours:
-        description: "Only price events starting within N hours (0 = no filter)"
-        required: true
-        default: "36"
-      cap:
-        description: "Hard cap on number of events to fetch (0 = no cap)"
-        required: true
-        default: "0"
-      books:
-        description: "Bookmakers (comma separated keys)"
-        required: true
-        default: "draftkings,fanduel,betmgm,caesars"
-      markets:
-        description: "Override markets (comma separated). Leave blank for defaults."
-        required: false
-        default: ""
-      order:
-        description: "Provider sorting (usually 'odds')"
-        required: false
-        default: "odds"
-      teams:
-        description: "Only include games where team name contains any of these (comma separated). Leave blank for full slate."
-        required: false
-        default: ""
-      selection:
-        description: "Optional selection filter (regex/substring on player name). Leave blank for none."
-        required: false
-        default: ""
+import argparse
+import importlib
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # Odds API key comes from repo secrets
-      THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+def _log(msg: str) -> None:
+    print(f"[run_model] {msg}", flush=True)
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+def _to_list(s: Optional[str]) -> Optional[List[str]]:
+    """
+    Convert a comma-separated string to a list[str].
+    Return None for empty/blank/None so engine can apply defaults.
+    """
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    return [x.strip() for x in s.split(",") if x.strip()]
 
-      - name: Run model
-        env:
-          DATE:       ${{ github.event.inputs.date }}
-          SEASON:     ${{ github.event.inputs.season }}
-          WINDOW:     ${{ github.event.inputs.window_hours }}
-          CAP:        ${{ github.event.inputs.cap }}
-          BOOKS:      ${{ github.event.inputs.books }}
-          MARKETS:    ${{ github.event.inputs.markets }}
-          ORDER:      ${{ github.event.inputs.order }}
-          TEAMS:      ${{ github.event.inputs.teams }}
-          SELECTION:  ${{ github.event.inputs.selection }}
-        run: |
-          set -euo pipefail
 
-          ARGS="--date \"$DATE\" --season \"$SEASON\" --window \"$WINDOW\" --cap \"$CAP\" --books \"$BOOKS\""
+def _positive_int_or_zero(x: str) -> int:
+    v = int(x)
+    if v < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return v
 
-          # Only include optional flags if non-empty to avoid argparse errors
-          if [ -n "$MARKETS" ];   then ARGS="$ARGS --markets \"$MARKETS\""; fi
-          if [ -n "$ORDER" ];     then ARGS="$ARGS --order \"$ORDER\""; fi
-          if [ -n "$TEAMS" ];     then ARGS="$ARGS --teams \"$TEAMS\""; fi
-          if [ -n "$SELECTION" ]; then ARGS="$ARGS --selection \"$SELECTION\""; fi
 
-          echo "Running: python run_model.py $ARGS"
-          python run_model.py $ARGS
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run the NFL props pipeline")
 
-      - name: Upload outputs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: model-outputs
-          path: |
-            outputs/**
-          if-no-files-found: warn
+    p.add_argument("--date", required=True, help="Logical date (YYYY-MM-DD or 'today')")
+    p.add_argument("--season", required=True, help="Season tag (e.g., 2025)")
+
+    p.add_argument("--window", type=_positive_int_or_zero, default=36,
+                   help="Only price events starting within N hours (0 = no filter)")
+    p.add_argument("--cap", type=_positive_int_or_zero, default=0,
+                   help="Hard cap on number of events to fetch (0 = no cap)")
+
+    p.add_argument("--books", default="draftkings,fanduel,betmgm,caesars",
+                   help="Comma-separated list of bookmaker keys")
+    p.add_argument("--markets", default="",
+                   help="Comma-separated markets override (blank = engine defaults)")
+    p.add_argument("--order", default="odds",
+                   help="Provider sorting (usually 'odds')")
+
+    p.add_argument("--teams", default="",
+                   help="Only include games where team name contains any of these (comma separated)")
+    p.add_argument("--selection", default="",
+                   help="Optional player-name filter (substring/regex)")
+
+    # Optional paths if your engine supports them; safe to leave unused.
+    p.add_argument("--write_dir", default="outputs",
+                   help="Directory to write outputs (engine may handle)")
+    p.add_argument("--basename", default="",
+                   help="Optional basename for output files")
+
+    args = p.parse_args(argv)
+    return args
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+
+    # Build kwargs for the engine
+    kwargs: Dict[str, Any] = {
+        "date": args.date,
+        "season": args.season,
+        "hours": int(args.window),
+        "cap": int(args.cap),
+        "books": _to_list(args.books),
+        "order": args.order or None,
+        "markets": _to_list(args.markets) if args.markets else None,
+        "teams": _to_list(args.teams) if args.teams else None,
+        "selection": (args.selection or None),
+        # Optional—engine can ignore if unsupported:
+        "write_dir": args.write_dir,
+        "basename": (args.basename or None),
+    }
+
+    # Import your engine dynamically
+    try:
+        engine = importlib.import_module("engine")
+        _log(f"Loaded engine module from: {Path(getattr(engine, '__file__', 'engine.py')).resolve()}")
+    except Exception as e:
+        _log(f"failed to import engine: {e}")
+        return 1
+
+    # Pick the entrypoint the engine provides
+    entry = None
+    if hasattr(engine, "run_pipeline") and callable(getattr(engine, "run_pipeline")):
+        entry = getattr(engine, "run_pipeline")
+    elif hasattr(engine, "main") and callable(getattr(engine, "main")):
+        entry = getattr(engine, "main")
+
+    if entry is None:
+        _log("engine module must define run_pipeline(**kwargs) or main(**kwargs)")
+        return 1
+
+    # Pretty log of what we're about to do
+    _log("starting pipeline…")
+    _log(f"team filter: {kwargs.get('teams') if kwargs.get('teams') else 'None (ALL teams in the date window)'}")
+    _log(f"fetching props… date={args.date} season={args.season}")
+    _log(f"window={args.window}h cap={args.cap}")
+    _log(f"markets={'default' if not kwargs.get('markets') else ','.join(kwargs['markets'])} "
+         f"order={args.order} books={','.join(kwargs['books'] or [])}")
+
+    try:
+        result = entry(**kwargs)
+    except SystemExit as se:
+        # If engine uses sys.exit
+        code = int(getattr(se, "code", 1) or 1)
+        return code
+    except Exception as e:
+        _log(f"pipeline crashed: {e}")
+        return 1
+
+    # If the engine returns a code, propagate it; otherwise success.
+    if isinstance(result, int):
+        return result
+    return 0
 
 
 if __name__ == "__main__":
