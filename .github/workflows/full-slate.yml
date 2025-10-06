@@ -1,86 +1,118 @@
-name: "Full Slate (Odds API only, fail-fast)"
+name: "Full Slate (manual): fetch odds + run model"
 
 on:
-  workflow_dispatch:  # manual only
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Logical date for the run (usually 'today')"
+        required: true
+        default: "today"
+      season:
+        description: "Season tag (e.g., 2025)"
+        required: true
+        default: "2025"
+      teams:
+        description: "Only include games where team name contains any of these (comma separated, e.g. 'Jets,Cowboys'). Leave blank for full slate."
+        required: false
+        default: ""
+      events:
+        description: "Only include these Odds API event IDs (comma separated). Leave blank for none."
+        required: false
+        default: ""
+      event_window_hours:
+        description: "Credit guard: only price events starting within N hours (0 = no filter)"
+        required: true
+        default: "168"
+      max_events:
+        description: "Credit guard: hard cap on number of events to fetch (0 = no cap)"
+        required: true
+        default: "40"
+      bookmakers:
+        description: "Bookmakers to include (comma separated keys)"
+        required: true
+        default: "draftkings,fanduel,betmgm,caesars"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    concurrency:
+      group: full-slate-${{ github.ref }}
+      cancel-in-progress: false
 
+    # These envs are read by scripts/odds_api.py
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-      # full-slate window & caps
-      ODDS_API_EVENT_WINDOW_HOURS: "168"     # next 7 days
-      ODDS_API_MAX_EVENTS: "40"
-      # shaping (tune as you like)
-      ODDS_API_REGIONS: "us"
-      ODDS_API_BOOKMAKERS: "draftkings,fanduel,betmgm,caesars,pointsbetus"
+      ODDS_API_EVENT_WINDOW_HOURS: ${{ inputs.event_window_hours }}
+      ODDS_API_MAX_EVENTS: ${{ inputs.max_events }}
+      ODDS_API_BOOKMAKERS: ${{ inputs.bookmakers }}
+      # teams/events are also passed as CLI flags, but env keeps it consistent
+      ODDS_API_INCLUDE_TEAMS: ${{ inputs.teams }}
+      ODDS_API_INCLUDE_EVENTS: ${{ inputs.events }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # in case XLSX export is desired and not pinned in your reqs
+          pip install --quiet openpyxl || true
 
-      - name: Check Odds API quota (pre-run)
-        shell: bash
+      - name: Show run filters (for transparency)
+        run: |
+          echo "Date:        ${{ inputs.date }}"
+          echo "Season:      ${{ inputs.season }}"
+          echo "Teams:       '${{ inputs.teams }}'"
+          echo "Event IDs:   '${{ inputs.events }}'"
+          echo "Window (h):  ${{ inputs.event_window_hours }}"
+          echo "Max events:  ${{ inputs.max_events }}"
+          echo "Bookmakers:  ${{ inputs.bookmakers }}"
+
+      - name: Make output dirs
+        run: |
+          mkdir -p outputs metrics inputs outputs/debug
+
+      # Optional quota ping — this endpoint is safe (doesn't burn event credits)
+      - name: Check Odds API quota
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python - <<'PY'
           import os, requests
-          k = os.environ.get("ODDS_API_KEY","")
-          if not k: 
-              print("No ODDS_API_KEY set."); raise SystemExit(0)
-          r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={k}", timeout=20)
-          print("HTTP", r.status_code, "| key suffix ...", k[-4:])
-          print("Remaining:", r.headers.get("x-requests-remaining"),
-                "Used:", r.headers.get("x-requests-used"),
-                "Limit:", r.headers.get("x-requests-limit"))
-          if r.status_code != 200: print(r.text[:400])
+          key = os.environ.get("ODDS_API_KEY","")
+          if not key:
+              print("⚠️  ODDS_API_KEY is empty; skipping check.")
+          else:
+              r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={key}", timeout=20)
+              print("HTTP", r.status_code)
+              print("Key suffix:", (key[-4:] if len(key)>=4 else "n/a"))
+              print("Remaining:", r.headers.get("x-requests-remaining"), "Used:", r.headers.get("x-requests-used"), "Limit:", r.headers.get("x-requests-limit"))
           PY
 
-      - name: Fetch props (Odds API only; no CSV fallback)
-        run: python -m scripts.fetch_all --season 2025
-
-      - name: Assert props present (fail-fast)
-        shell: bash
+      # Single step that fetches odds (with filters) and runs the whole pipeline
+      - name: Run pipeline
         run: |
-          if [ ! -s outputs/props_raw.csv ]; then
-            echo "❌ No props fetched."
-            [ -f outputs/_NO_PROPS ] && echo "--- Reason ---" && cat outputs/_NO_PROPS
-            echo "--- Debug payloads ---"
-            ls -l outputs/debug || true
-            exit 1
-          fi
-          echo "✅ props_raw.csv present:"
-          head -n 12 outputs/props_raw.csv
+          python run_model.py \
+            --date "${{ inputs.date }}" \
+            --season "${{ inputs.season }}" \
+            --write outputs \
+            --teams "${{ inputs.teams }}" \
+            --events "${{ inputs.events }}"
 
-      - name: Run pricing/model
-        run: python run_model.py --date today --season 2025 --write outputs
-
-      - name: Check Odds API quota (post-run)
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, requests
-          k = os.environ.get("ODDS_API_KEY","")
-          if not k: raise SystemExit(0)
-          r = requests.get(f"https://api.the-odds-api.com/v4/sports?apiKey={k}", timeout=20)
-          print("Post-run Remaining:", r.headers.get("x-requests-remaining"),
-                "Used:", r.headers.get("x-requests-used"))
-          PY
-
-      - name: Upload artifacts
+      - name: Upload artifacts (outputs + debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nfl-outputs
+          name: slate-${{ inputs.date }}-${{ inputs.season }}
           path: |
-            outputs/
-            metrics/
+            outputs/**
+            metrics/**
           if-no-files-found: warn
