@@ -1,267 +1,271 @@
 # scripts/odds_api_safe.py
-# Safe wrapper around your existing scripts.odds_api provider.
-# - Normalizes window to hours
-# - Applies selection/team/event-id filters once (blank == no filter)
-# - Delegates fetch & transform to your current scripts.odds_api (so we don't break anything)
-
 from __future__ import annotations
 
-import re
-import inspect
-from typing import Any, Dict, Iterable, List, Optional
+import os
+import time
+import json
+import math
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
 
-# We will call into your existing odds_api module for provider functions.
-import importlib
-_odds_mod = importlib.import_module("scripts.odds_api")
+
+"""
+Drop-in Odds API v4 fetcher for player props.
+
+WHY THIS FILE:
+- Replaces earlier attempts that hit /players/props (404/422). The correct v4 endpoint is /odds
+- Mirrors the approach used by the recent "player-props-scraper" repo (Odds API centric)
+- Returns a normalized DataFrame your engine/pricing step expects:
+    [event_id, event_time, home_team, away_team, book, market, player, point, over_odds, under_odds]
+
+REQUIRED ENV:
+- THE_ODDS_API_KEY
+
+OPTIONAL ENV:
+- THE_ODDS_API_URL (default: https://api.the-odds-api.com/v4/sports)
+- ODDS_REGIONS (default: us)
+- ODDS_ODDS_FORMAT (default: american)
+- ODDS_DATE_FORMAT (default: iso)
+
+ENGINE CALL:
+- Your engine imports: from scripts.odds_api_safe import get_props
+- Signature: get_props(date, season, hours, books, markets, order, selection=None, teams=None, events=None)
+- Only date/hours/books/markets are used by this fetcher; selection/teams/events are handled upstream if needed.
+"""
+
+DEFAULT_API_URL = os.getenv("THE_ODDS_API_URL", "https://api.the-odds-api.com/v4/sports")
+DEFAULT_REGIONS = os.getenv("ODDS_REGIONS", "us")
+DEFAULT_FORMAT  = os.getenv("ODDS_ODDS_FORMAT", "american")
+DEFAULT_DF      = os.getenv("ODDS_DATE_FORMAT", "iso")
+
+NFL_KEY = "americanfootball_nfl"
+
+# OddsAPI market keys we’ll support out of the box (extend as you like)
+DEFAULT_MARKETS = [
+    "player_pass_tds",
+    "player_pass_yds",
+    "player_pass_attempts",
+    "player_pass_completions",
+    "player_pass_interceptions",
+    "player_rush_yds",
+    "player_rush_attempts",
+    "player_receptions",
+    "player_receiving_yds",
+    "player_anytime_td",
+]
+
+# Books to include if none are provided (matches what you typically use)
+DEFAULT_BOOKS = ["draftkings", "fanduel", "betmgm", "caesars"]
+
+UTC = timezone.utc
 
 
-# ------------------------------------------------------------
-# Window parser
-# ------------------------------------------------------------
-
-def _to_hours(hours=None, window=None, lookahead=None, default: int = 24) -> int:
-    """
-    Accepts values like 36, '36', '36h', '168h', returns integer hours.
-    Falls back to `default` if nothing usable is provided.
-    """
-    for v in (hours, window, lookahead):
-        if v is None:
-            continue
-        s = str(v).strip().lower()
-        if s.endswith("h"):
-            s = s[:-1]
+# ------------------------------
+# HTTP helpers (with retries)
+# ------------------------------
+def _http_get(url: str, query: Dict[str, str], retries: int = 3, sleep: float = 0.8) -> Any:
+    q = urllib.parse.urlencode(query)
+    full = f"{url}?{q}"
+    last_err = None
+    for _ in range(max(1, retries)):
         try:
-            return int(float(s))
-        except Exception:
+            req = urllib.request.Request(full, headers={
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+                "Accept": "application/json, text/plain, */*",
+            })
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                body = resp.read().decode("utf-8")
+                return json.loads(body)
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep)
+    raise RuntimeError(f"GET failed after retries: {full}\nDetail: {repr(last_err)}")
+
+
+def _parse_iso(ts: str) -> datetime:
+    # Odds API returns ISO e.g. "2025-10-06T17:25:00Z"
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(UTC)
+
+
+# ------------------------------
+# Core normalization
+# ------------------------------
+def _rows_from_event(ev: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Flatten the Odds API event structure into rows at granularity:
+      event_id, event_time, home_team, away_team, book, market, player, point, over_odds, under_odds
+    """
+    out: List[Dict[str, Any]] = []
+    event_id = ev.get("id")
+    home     = ev.get("home_team")
+    away     = ev.get("away_team")
+    start    = ev.get("commence_time")
+    evt_ts   = _parse_iso(start) if start else None
+
+    for bk in ev.get("bookmakers", []):
+        book_key = bk.get("key")
+        for mkt in bk.get("markets", []):
+            market_key = mkt.get("key")
+            # For player props, outcomes carry player name + description "Over"/"Under" with a shared "point"
+            # Structure: outcomes: [{name: "Player Name", description: "Over", price: -115, point: 67.5}, {... Under ...}]
+            # We need to group by (player, point).
+            cache: Dict[Tuple[str, float], Dict[str, Any]] = {}
+            for oc in mkt.get("outcomes", []):
+                player_name = oc.get("name") or ""
+                desc        = str(oc.get("description") or "").lower()  # "over" / "under" (or sometimes blank for TD Yes/No)
+                price       = oc.get("price")
+                point       = oc.get("point")
+                try:
+                    pt = float(point) if point is not None else math.nan
+                except Exception:
+                    pt = math.nan
+
+                key = (player_name, pt)
+                row = cache.get(key)
+                if row is None:
+                    row = {
+                        "event_id": event_id,
+                        "event_time": evt_ts.isoformat() if evt_ts else None,
+                        "home_team": home,
+                        "away_team": away,
+                        "book": book_key,
+                        "market": market_key,
+                        "player": player_name,
+                        "point": pt,
+                        "over_odds": None,
+                        "under_odds": None,
+                    }
+                    cache[key] = row
+
+                if desc == "over":
+                    row["over_odds"] = price
+                elif desc == "under":
+                    row["under_odds"] = price
+                else:
+                    # Some yes/no markets (anytime TD on some books) may not use Over/Under wording.
+                    # Put the single price into "over_odds" and leave under None.
+                    if row.get("over_odds") is None:
+                        row["over_odds"] = price
+                    else:
+                        row["under_odds"] = price
+
+            out.extend(cache.values())
+    return out
+
+
+def _filter_events_by_time(
+    events: List[Dict[str, Any]],
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+) -> List[Dict[str, Any]]:
+    if start_dt is None and end_dt is None:
+        return events
+
+    kept = []
+    for ev in events:
+        ct = ev.get("commence_time")
+        if not ct:
             continue
-    return int(default)
+        evt = _parse_iso(ct)
+        if (start_dt is None or evt >= start_dt) and (end_dt is None or evt <= end_dt):
+            kept.append(ev)
+    return kept
 
 
-# ------------------------------------------------------------
-# Filters (selection / team / event-ids)
-# ------------------------------------------------------------
-
-def _apply_selection_filters(
-    events_list: Iterable[Any],
-    teams: Optional[Iterable[str]] = None,
-    events: Optional[Iterable[str]] = None,
-    selection: Optional[str] = None,
-):
-    """
-    Apply optional filters to a list of events.
-
-    - teams: list[str] of substrings to match in home/away/team names.
-             None/[]/"all" -> no team filter
-    - events: list[str] of Odds API event IDs.
-             None/[]/"all" -> no event-id filter
-    - selection: string/regex to match event names.
-             None/"" -> no selection filter
-    Returns the filtered list.
-    """
-    # 1) selection
-    sel_regex = None
-    if selection is not None:
-        s = str(selection).strip()
-        if s != "":
-            try:
-                sel_regex = re.compile(s, re.IGNORECASE)
-            except Exception:
-                # treat as plain substring if regex fails
-                sel_regex = re.compile(re.escape(s), re.IGNORECASE)
-
-    def _sel_ok(ev):
-        if sel_regex is None:
-            return True
-        name = str(getattr(ev, "name", "") or getattr(ev, "title", "") or "")
-        return bool(sel_regex.search(name))
-
-    # 2) team filter
-    team_terms = None
-    if teams is not None:
-        if isinstance(teams, str):
-            teams = [t.strip() for t in teams.split(",") if t.strip()]
-        if isinstance(teams, (list, tuple)) and len(teams) > 0 and str(teams).lower() not in ("all",):
-            team_terms = [t.lower() for t in teams]
-
-    def _team_ok(ev):
-        if team_terms is None:
-            return True
-        # Try to get home/away or team names safely
-        home = str(getattr(ev, "home_team", "")).lower()
-        away = str(getattr(ev, "away_team", "")).lower()
-        name = str(getattr(ev, "name", "") or getattr(ev, "title", "") or "").lower()
-        bucket = f"{home} {away} {name}"
-        return any(term in bucket for term in team_terms)
-
-    # 3) event-id filter
-    event_ids = None
-    if events is not None:
-        if isinstance(events, str):
-            events = [e.strip() for e in events.split(",") if e.strip()]
-        if isinstance(events, (list, tuple)) and len(events) > 0 and str(events).lower() not in ("all",):
-            event_ids = set(events)
-
-    def _id_ok(ev):
-        if event_ids is None:
-            return True
-        eid = getattr(ev, "id", None) or getattr(ev, "event_id", None) or getattr(ev, "key", None)
-        return (eid in event_ids)
-
-    filtered = [ev for ev in events_list if _sel_ok(ev) and _team_ok(ev) and _id_ok(ev)]
-    return filtered
-
-
-# ------------------------------------------------------------
-# Delegate discovery (we call your existing provider/transformers)
-# ------------------------------------------------------------
-
-def _discover_provider_fetch():
-    """
-    Find a function that fetches raw events/props in *your* odds_api module.
-    The function SHOULD accept (date, season, hours, books, markets, order, **kwargs)
-    and return an iterable of events.
-    """
-    # search inside your existing scripts.odds_api first
-    for name in (
-        "_fetch_events_from_provider",
-        "fetch_events_from_provider",
-        "fetch_events",
-        "_fetch_events",
-        "raw_fetch_events",
-    ):
-        fn = getattr(_odds_mod, name, None)
-        if callable(fn):
-            return fn
-
-    # last resort: if your module exposes fetch_props_raw, we’ll use it
-    for name in ("fetch_props_raw", "get_raw_events"):
-        fn = getattr(_odds_mod, name, None)
-        if callable(fn):
-            return fn
-
-    raise RuntimeError(
-        "No provider fetcher found in scripts.odds_api. "
-        "Add a callable like `_fetch_events_from_provider(date, season, hours, books, markets, order, **kwargs)` "
-        "that returns a list of events."
-    )
-
-
-def _discover_events_to_df():
-    """
-    Find a function that transforms events list -> pandas DataFrame of props in *your* odds_api module.
-    """
-    for name in (
-        "events_to_dataframe",
-        "_events_to_dataframe",
-        "events_to_df",
-        "_events_to_df",
-        "to_dataframe",
-        "to_df",
-    ):
-        fn = getattr(_odds_mod, name, None)
-        if callable(fn):
-            return fn
-
-    raise RuntimeError(
-        "No transformer found in scripts.odds_api. "
-        "Provide `events_to_dataframe(events)` that returns a pandas.DataFrame."
-    )
-
-
-# ------------------------------------------------------------
-# Public API (mirrors your old odds_api)
-# ------------------------------------------------------------
-
-def fetch_props(
+# ------------------------------
+# Public entry
+# ------------------------------
+def get_props(
     date: Optional[str] = None,
-    season: Optional[int] = None,
-    window: Optional[str | int] = None,   # may be '36h' etc.
-    hours: Optional[int] = None,          # alternate
-    lookahead: Optional[int] = None,      # alternate
-    cap: int = 0,
-    markets: Optional[List[str] | str] = None,
-    order: str = "odds",
-    books: str = "dk",
-    team_filter: Optional[List[str] | str] = None,
-    selection: Optional[str] = None,
-    event_ids: Optional[List[str] | str] = None,
-    **kwargs: Any,
+    season: Optional[str] = None,
+    hours: Optional[int] = None,
+    books: Optional[List[str]] = None,
+    markets: Optional[List[str]] = None,
+    order: str = "odds",          # unused here
+    selection: Optional[str] = None,  # upstream selection filter if desired
+    teams: Optional[List[str]] = None, # upstream team filter if desired
+    events: Optional[List[str]] = None # upstream event-id filter if desired
 ) -> pd.DataFrame:
     """
-    Fetch raw events via your provider (in scripts.odds_api), apply filters safely, convert to DataFrame.
+    Main fetcher your engine calls. Returns a pandas DataFrame with columns:
+      event_id, event_time, home_team, away_team, book, market, player, point, over_odds, under_odds
     """
-    hrs = _to_hours(hours=hours, window=window, lookahead=lookahead, default=24)
+    api_key = os.getenv("THE_ODDS_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing THE_ODDS_API_KEY in environment.")
 
-    # Pretty log (kept to match your previous output style)
-    print(f"[odds_api] window={hrs}h cap={cap}")
-    if markets:
-        mstr = ",".join(markets) if isinstance(markets, (list, tuple)) else str(markets)
-    else:
-        mstr = "player_receptions,player_receiving_yds,player_rush_yds,player_rush_attempts,player_pass_yds,player_pass_tds,player_anytime_td"
-    print(f"markets={mstr}\norder={order},{books}")
+    books = books or DEFAULT_BOOKS
+    markets = markets or DEFAULT_MARKETS
 
-    # ---- FETCH (from your existing odds_api) ----
-    provider_fetch = _discover_provider_fetch()
-    sig = inspect.signature(provider_fetch)
-    pkwargs: Dict[str, Any] = {}
-    for k, v in {
-        "date": date,
-        "season": season,
-        "hours": hrs,
-        "books": books,
-        "markets": markets,
-        "order": order,
-    }.items():
-        if k in sig.parameters:
-            pkwargs[k] = v
-    for k, v in kwargs.items():
-        if k in sig.parameters:
-            pkwargs[k] = v
+    # Build a time window to mimic your UI (date OR hours window)
+    # - If 'date' looks like 'YYYY-MM-DD', we keep events from 00:00 to 23:59 UTC that day
+    # - Else if 'hours' is provided, keep events within now..now+hours
+    start_dt: Optional[datetime] = None
+    end_dt: Optional[datetime] = None
 
-    evs = provider_fetch(**pkwargs) or []
-    before = len(evs) if hasattr(evs, "__len__") else -1
-
-    # ---- FILTER (once) ----
-    evs = _apply_selection_filters(
-        events_list=evs,
-        teams=team_filter,
-        events=event_ids,
-        selection=selection,
-    )
-    after = len(evs) if hasattr(evs, "__len__") else -1
-
-    # optional log
-    if (team_filter and (isinstance(team_filter, (list, tuple)) and len(team_filter) > 0)) \
-       or (event_ids and (isinstance(event_ids, (list, tuple)) and len(event_ids) > 0)) \
-       or (selection and str(selection).strip() != ""):
-        print(f"[odds_api] selection filter -> {after} events kept")
-    else:
-        print("[odds_api] selection filter -> no filter applied")
-
-    # ---- CAP ----
-    if cap and cap > 0 and isinstance(evs, list):
-        evs = evs[:cap]
-
-    # ---- TO DATAFRAME (via your existing odds_api) ----
-    to_df = _discover_events_to_df()
-    df = to_df(evs)
-
-    if df is None:
-        return pd.DataFrame()
-    if not isinstance(df, pd.DataFrame):
+    if date and date.lower() != "today":
         try:
-            df = pd.DataFrame(df)
+            d = datetime.fromisoformat(date).date()
+            start_dt = datetime(d.year, d.month, d.day, 0, 0, tzinfo=UTC)
+            end_dt   = start_dt + timedelta(days=1)
         except Exception:
-            return pd.DataFrame()
+            # Fallback to hours if date parse fails
+            pass
 
+    if start_dt is None and hours is not None and hours > 0:
+        start_dt = datetime.now(tz=UTC)
+        end_dt   = start_dt + timedelta(hours=hours)
+
+    # Query /odds with all needed markets & books
+    base_url = f"{DEFAULT_API_URL}/{NFL_KEY}/odds"
+    params   = {
+        "apiKey": api_key,
+        "regions": DEFAULT_REGIONS,
+        "markets": ",".join(markets),
+        "oddsFormat": DEFAULT_FORMAT,
+        "dateFormat": DEFAULT_DF,
+        "bookmakers": ",".join(books),
+    }
+
+    payload = _http_get(base_url, params, retries=3, sleep=0.8)
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Unexpected Odds API response: {type(payload)}")
+
+    # Filter by time window (if any)
+    filtered_events = _filter_events_by_time(payload, start_dt, end_dt)
+
+    # Flatten to rows
+    rows: List[Dict[str, Any]] = []
+    for ev in filtered_events:
+        rows.extend(_rows_from_event(ev))
+
+    df = pd.DataFrame(rows)
+    # Apply optional simple filters upstream-style (teams/events/selection)
+    # Your engine also does this, but light redundancy is fine.
+    if teams:
+        teams_lower = [t.lower() for t in teams]
+        keep = []
+        for _, r in df.iterrows():
+            bucket = f"{str(r.get('home_team') or '').lower()} {str(r.get('away_team') or '').lower()}"
+            if any(t in bucket for t in teams_lower):
+                keep.append(True)
+            else:
+                keep.append(False)
+        df = df[keep]
+
+    if events:
+        evset = set(events)
+        df = df[df["event_id"].isin(evset)]
+
+    if selection:
+        s = str(selection).strip().lower()
+        if s:
+            df = df[df["player"].astype(str).str.lower().str.contains(s, na=False)]
+
+    df = df.reset_index(drop=True)
     return df
-
-
-# Convenience aliases expected by some callers
-def get_props(*args, **kwargs) -> pd.DataFrame:
-    return fetch_props(*args, **kwargs)
-
-def get_props_df(*args, **kwargs) -> pd.DataFrame:
-    return fetch_props(*args, **kwargs)
