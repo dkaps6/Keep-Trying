@@ -1,44 +1,78 @@
-# scripts/normalize_props.py
+"""
+normalize_props.py
+Map the raw V4 rows into a consistent schema used by the rest of the pipeline.
+"""
+
 from __future__ import annotations
+
 import pandas as pd
 
-# map feed keys → friendly names your model expects
-MARKET_KEYS = {
-    "player_pass_yds": "pass_yards",
-    "player_pass_tds": "pass_tds",
-    "player_receptions": "receptions",
-    "player_reception_yds": "rec_yards",
-    "player_rush_yds": "rush_yards",
-    "player_rush_attempts": "rush_att",
-    "player_rush_reception_yds": "rush_rec_yards",
-    "player_anytime_td": "anytime_td",
+# Human labels (optional) for readability / downstream grouping
+MARKET_LABEL = {
+    # Passing
+    "player_pass_yds": "Pass Yds",
+    "player_pass_tds": "Pass TDs",
+    "player_pass_attempts": "Pass Att",
+    "player_pass_completions": "Pass Comp",
+    "player_pass_interceptions": "Pass INTs",
+    "player_pass_longest_completion": "Longest Completion",
+    # Rushing
+    "player_rush_yds": "Rush Yds",
+    "player_rush_attempts": "Rush Att",
+    "player_rush_longest": "Longest Rush",
+    # Receiving
+    "player_reception_yds": "Recv Yds",
+    "player_receptions": "Receptions",
+    "player_reception_longest": "Longest Reception",
+    "player_reception_tds": "Reception TDs",
+    # Combo / specials
+    "player_anytime_td": "Anytime TD",
+    "player_pass_rush_reception_tds": "Pass+Rush+Recv TDs",
+    "player_pass_rush_reception_yds": "Pass+Rush+Recv Yds",
+    # Defense / kicking
+    "player_sacks": "Sacks",
+    "player_solo_tackles": "Solo Tackles",
+    "player_tackles_assists": "Tackles+Assists",
+    "player_field_goals": "Field Goals",
+    "player_pats": "PATs",
 }
 
-def normalize(df_raw: pd.DataFrame) -> pd.DataFrame:
+def normalize_props(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Input: outcome-level rows (both sides present), columns:
-      event_id, home_team, away_team, commence_time, book, market, player, side, line, price
-    Output: one row per (player,market,line,book,event) with prices for both sides.
+    Input columns from props_hybrid.get_props():
+      event_id, commence_time, home_team, away_team,
+      bookmaker, market_key, name, description, price, point, team, player
+
+    Output schema:
+      event_id, commence_time, bookmaker, market_key, market_label,
+      player, team, side, line, price, selection
     """
-    df = df_raw.copy()
-    df["market_key"] = df["market"].map(MARKET_KEYS).fillna(df["market"])
-    df["side"] = df["side"].str.lower()
+    if df is None or df.empty:
+        return df
 
-    # pivot prices into two columns
-    over_yes = df[df["side"].isin(["over","yes"])].rename(columns={"price":"price_over"})
-    under_no = df[df["side"].isin(["under","no"])].rename(columns={"price":"price_under"})
-    key_cols = ["event_id","book","market_key","player","line"]
-    left = over_yes[key_cols + ["price_over","home_team","away_team","commence_time"]]
-    right = under_no[key_cols + ["price_under"]]
-    merged = pd.merge(left, right, on=key_cols, how="outer")
+    d = df.copy()
 
-    # drop dup columns if any
-    merged["price_over"] = merged["price_over"].astype(float)
-    merged["price_under"] = merged["price_under"].astype(float)
-    merged["line"] = merged["line"].astype(float)
+    # The “side” (Over/Under/Yes/No) is in `name`; protect if missing
+    d["side"] = d["name"].fillna("")
 
-    # Keep even if one side missing (we can still price)
-    cols = ["player","market_key","line","book","event_id","home_team","away_team","commence_time","price_over","price_under"]
-    merged = merged[cols].drop_duplicates()
+    # A single numeric line for O/U markets comes as `point`
+    d["line"] = d["point"]
 
-    return merged
+    # Player: prefer 'player' column (alias of description) then description
+    d["player"] = d["player"].fillna(d.get("description"))
+
+    # Human-friendly label for BI
+    d["market_label"] = d["market_key"].map(MARKET_LABEL).fillna(d["market_key"])
+
+    # Keep a compact set of columns
+    cols = [
+        "event_id", "commence_time",
+        "bookmaker",
+        "market_key", "market_label",
+        "player", "team",
+        "side", "line", "price",
+        "name", "description",  # keep originals for audit
+        "home_team", "away_team",
+    ]
+    cols = [c for c in cols if c in d.columns]
+    return d[cols]
