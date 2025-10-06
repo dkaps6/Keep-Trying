@@ -42,8 +42,8 @@ PLAYER_ALT_MARKETS = {
 }
 VALID_MARKETS = GAME_MARKETS | QH_MARKETS | PLAYER_MARKETS | PLAYER_ALT_MARKETS
 
-# alias map (legacy -> canonical)
 ALIASES = {
+    # legacy -> canonical
     "player_passing_yards": "player_pass_yds",
     "player_receiving_yards": "player_reception_yds",
     "player_passing_tds": "player_pass_tds",
@@ -56,10 +56,8 @@ ALIASES = {
     "player_longest_reception": "player_reception_longest",
     "player_receiving_tds": "player_reception_tds",
 }
-# global/non-NFL we should ignore if ever passed
-NON_NFL_GLOBAL = {"btts", "draw_no_bet", "outrights", "h2h_lay"}
 
-# ---------------- Odds API plumbing ----------------
+NON_NFL_GLOBAL = {"btts", "draw_no_bet", "outrights", "h2h_lay"}
 
 NFL_SPORT = "americanfootball_nfl"
 BASE = "https://api.the-odds-api.com/v4"
@@ -148,14 +146,47 @@ def _fetch_event_props(api_key:str, event_id:str, books_csv:str, markets:list[st
                 oddsFormat=DEFAULT_ODDS_FORMAT, dateFormat=DEFAULT_DATEFORMAT,
                 bookmakers=books_csv)
     data,h=_http_get(url, params); _print_credits(h)
+    # v4 returns a dict per bookmaker set for the event
     if isinstance(data, dict) and "bookmakers" in data: return [data]
     if isinstance(data, list): return data
     return []
 
-def _to_df(rows:list[dict])->pd.DataFrame:
-    if not rows: return pd.DataFrame()
-    try: return pd.json_normalize(rows)
-    except Exception: return pd.DataFrame(rows)
+# ---------- NEW: flatten to one-row-per-outcome with explicit "market" ----------
+
+def _flatten_event_payloads(payloads:list[dict])->list[dict]:
+    flat=[]
+    for ev in payloads:
+        if not isinstance(ev, dict): continue
+        event_id = ev.get("id") or ev.get("eventId") or ev.get("key")
+        commence = ev.get("commence_time") or ev.get("commenceTime")
+        home = ev.get("home_team") or ev.get("homeTeam")
+        away = ev.get("away_team") or ev.get("awayTeam")
+        bookmakers = ev.get("bookmakers") or []
+
+        for bk in bookmakers or []:
+            bk_key = (bk.get("key") or bk.get("title") or "").lower()
+            for mk in bk.get("markets") or []:
+                mkey = mk.get("key")  # <-- this is the market key we need
+                # odds-api v4 has "outcomes" per market (list of dicts)
+                for oc in mk.get("outcomes") or []:
+                    row = {
+                        "eventId": event_id,
+                        "commence_time": commence,
+                        "home_team": home,
+                        "away_team": away,
+                        "bookmaker": bk_key,
+                        "market": mkey,                 # <- REQUIRED by normalize
+                        "outcome_name": oc.get("name"),
+                        "price": oc.get("price"),
+                        "point": oc.get("point"),
+                    }
+                    # helpful echoes for player props
+                    # (many books put player name in outcome_name already)
+                    player = oc.get("description") or oc.get("player") or None
+                    if player:
+                        row["player"] = player
+                    flat.append(row)
+    return flat
 
 # ---------------- public entry point ----------------
 
@@ -199,17 +230,23 @@ def get_props(
         _log("no events available with current filters; returning empty.")
         return pd.DataFrame()
 
-    all_rows=[]
+    all_payloads=[]
     for eid in event_ids:
-        rows=_fetch_event_props(api_key, eid, books_csv, clean_markets)
-        for r in rows: r.setdefault("eventId", eid)
-        all_rows.extend(rows)
+        payloads=_fetch_event_props(api_key, eid, books_csv, clean_markets)
+        # tag the top-level with the event id if the payload omitted it
+        for p in payloads:
+            p.setdefault("eventId", eid)
+        all_payloads.extend(payloads)
 
-    if not all_rows:
+    if not all_payloads:
         _log("no props returned from Odds API.")
         return pd.DataFrame()
 
-    df=_to_df(all_rows)
-    _log(f"raw rows (pre-normalize): {len(df)}")
-    return df
+    flat_rows = _flatten_event_payloads(all_payloads)
+    if not flat_rows:
+        _log("flatten produced 0 rows.")
+        return pd.DataFrame()
 
+    df = pd.DataFrame(flat_rows)
+    _log(f"raw rows (post-flatten): {len(df)}")
+    return df
