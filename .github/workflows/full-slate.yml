@@ -60,8 +60,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-            python -m pip install --upgrade pip
-            if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Check Odds API key present
         run: |
@@ -75,6 +75,50 @@ jobs:
           print("ℹ️  ODDS_API_KEY mirror present:", bool(k2))
           PY
 
+      # ---------- NEW PRE-FETCH STEPS ----------
+      - name: Build team context (team_form.csv)
+        env:
+          SEASON: ${{ github.event.inputs.season }}
+        run: |
+          set -euo pipefail
+          python -m scripts.fetch_nfl_data --season "$SEASON" --write data/team_form.csv
+          ls -lah data || true
+
+      - name: Fetch weather with fallbacks (data/weather.csv)
+        env:
+          WINDOW: ${{ github.event.inputs.window_hours }}
+        run: |
+          set -euo pipefail
+          mkdir -p data outputs logs
+          python -m scripts.fetch_weather --hours "$WINDOW" --out data/weather.csv
+          head -n 5 data/weather.csv || true
+
+      - name: Dump props to CSV via existing props_hybrid.get_props
+        env:
+          DATE:      ${{ github.event.inputs.date }}
+          SEASON:    ${{ github.event.inputs.season }}
+          WINDOW:    ${{ github.event.inputs.window_hours }}
+          BOOKS:     ${{ github.event.inputs.books }}
+          MARKETS:   ${{ github.event.inputs.markets }}
+          ORDER:     ${{ github.event.inputs.order }}
+          TEAMS:     ${{ github.event.inputs.teams }}
+          SELECTION: ${{ github.event.inputs.selection }}
+        run: |
+          set -euo pipefail
+          ARGS=( --date "$DATE" --season "$SEASON" --hours "$WINDOW" --books "$BOOKS" )
+          [ -n "$MARKETS" ]   && ARGS+=( --markets "$MARKETS" )
+          [ -n "$ORDER" ]     && ARGS+=( --order "$ORDER" )
+          [ -n "$TEAMS" ]     && ARGS+=( --team-filter "$TEAMS" )
+          [ -n "$SELECTION" ] && ARGS+=( --event-ids "$SELECTION" )
+          python -m scripts.props_to_csv "${ARGS[@]}"
+          wc -l outputs/props_raw.csv || true
+
+      - name: Validate inputs (strict)
+        run: |
+          set -euo pipefail
+          python -m scripts.validate_inputs --json logs/validate_report.json
+
+      # ---------- ORIGINAL MODEL STEP ----------
       - name: Run model
         env:
           DATE:       ${{ github.event.inputs.date }}
@@ -88,14 +132,11 @@ jobs:
           SELECTION:  ${{ github.event.inputs.selection }}
         run: |
           set -euo pipefail
-
-          # Build CLI args only when values are non-empty
           ARGS=( --date "$DATE" --season "$SEASON" --window "$WINDOW" --cap "$CAP" --books "$BOOKS" )
           [ -n "$MARKETS" ]  && ARGS+=( --markets "$MARKETS" )
           [ -n "$ORDER" ]    && ARGS+=( --order "$ORDER" )
           [ -n "$TEAMS" ]    && ARGS+=( --teams "$TEAMS" )
           [ -n "$SELECTION" ]&& ARGS+=( --selection "$SELECTION" )
-
           echo "Running: python run_model.py ${ARGS[*]}"
           python run_model.py "${ARGS[@]}"
 
@@ -104,5 +145,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: model-outputs
-          path: outputs/**
+          path: |
+            outputs/**
+            data/**
+            logs/**
           if-no-files-found: warn
