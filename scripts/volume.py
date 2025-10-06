@@ -1,54 +1,42 @@
-# scripts/volume.py
-def consensus_spread_total(game_df):
-    """
-    Expect columns: event_id, home_spread, total.
-    If not present, return empty or best-effort.
-    """
-    cols = {"event_id","home_spread","total"}
-    if not cols.issubset(set(game_df.columns)):
-        return game_df[["event_id"]].assign(home_spread=0.0, total=43.5)
-    return game_df[["event_id","home_spread","total"]].copy()
+# scripts/volume.py (STRICT)
+# No defaults: will raise if inputs missing/invalid.
 
-def team_volume_estimates(ev_row, is_home: bool, tf_row=None, weather=None):
+from __future__ import annotations
+from typing import Tuple
+
+def _as_pos_float(name: str, x) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        raise ValueError(f"[STRICT] Missing/invalid float for '{name}': {x}")
+    return v
+
+def team_volume_estimates(
+    event_row: dict,
+    is_home: bool,
+    team_form_row: dict,
+    weather_triplet: tuple | None,
+) -> Tuple[float, float, float, float]:
     """
-    Returns (plays, pass_rate, rush_rate, win_prob).
-    plays is left coarse for now; pass_rate breathes with PROE + weather.
+    Returns (plays, pass_rate, rush_rate, win_prob) with strict checks.
+    Required:
+      event_row: team_wp, total (used by your system), home_spread optional here.
+      team_form_row: plays_base, proe, pace_z
+      weather_triplet: (wind_mph, precip, temp_f) required upstream; we don't re-validate precip type here.
     """
-    plays = 63.0
-    pass_rate = 0.56
+    win_prob = _as_pos_float("team_wp", event_row.get("team_wp"))
+    plays_base = _as_pos_float("plays_base", team_form_row.get("plays_base"))
+    pace_z = float(team_form_row.get("pace_z"))
+    proe = float(team_form_row.get("proe"))
+
+    # plays with pace smoothing (no defaults)
+    plays = plays_base * (1.0 + 0.5 * pace_z)
+
+    # script nudge (kept very small, but relies on real wp)
+    plays *= (1.0 + 0.02 * (win_prob - 0.5) * 2.0)
+
+    # pass rate (no neutral default): you must supply proe
+    pass_rate = max(0.0, min(1.0, 0.57 + proe))
     rush_rate = 1.0 - pass_rate
 
-    # PROE (pass rate over expected)
-    proe = 0.0
-    try:
-        proe = float(tf_row.get("proe", 0.0)) if tf_row is not None else 0.0
-    except Exception:
-        pass
-    pass_rate += 0.6 * proe
-
-    # Weather nudges
-    if weather:
-        try:
-            wind = float(weather.get("wind_mph", 0) or 0)
-            precip = str(weather.get("precip","")).lower()
-        except Exception:
-            wind, precip = 0.0, ""
-        if wind >= 15:  pass_rate -= 0.02
-        if "rain" in precip or "snow" in precip: pass_rate -= 0.02
-
-    # Clamp and compute rush_rate
-    pass_rate = min(max(pass_rate, 0.40), 0.66)
-    rush_rate = 1.0 - pass_rate
-
-    # Win prob from spread (home_spread = home − away; negative means home favored)
-    win_prob = 0.5
-    try:
-        spread = float(ev_row.get("home_spread", 0.0) or 0.0)
-        if is_home:
-            win_prob = 0.5 + min(max(-spread / 20.0, -0.25), 0.25)
-        else:
-            win_prob = 0.5 + min(max(spread / 20.0, -0.25), 0.25)
-    except Exception:
-        pass
-
-    return plays, pass_rate, rush_rate, win_prob
+    return float(plays), float(pass_rate), float(rush_rate), float(win_prob)
