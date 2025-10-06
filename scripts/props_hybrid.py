@@ -1,255 +1,314 @@
-# scripts/props_hybrid.py
+"""
+props_hybrid.py
+Fetch NFL player props from The Odds API v4 using the per-event endpoint.
+
+- Uses correct (short) market keys, e.g. player_pass_yds (NOT player_passing_yards)
+- Optionally probes each event to discover which markets are actually offered
+  to avoid 422 INVALID_MARKET responses and save credits.
+- Logs x-requests-* credit headers after every HTTP call.
+"""
+
 from __future__ import annotations
-import os, time, typing as t
-import requests
+
+import os
+import time
+import json
+import math
+import logging
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
 import pandas as pd
+import requests
 
-from scripts.market_keys import NFL_DEFAULT_MARKETS, MARKET_SYNONYMS, VALID_MARKETS
-
-BASE = "https://api.the-odds-api.com/v4"
+# ---------- Config ----------
 NFL_SPORT = "americanfootball_nfl"
+BASE = "https://api.the-odds-api.com/v4"
 
-DEFAULT_REGIONS = "us"              # your account allows US books
-DEFAULT_ODDS_FORMAT = "american"
-DEFAULT_DATEFORMAT = "iso"
+DEFAULT_BOOKS = ["draftkings", "fanduel"]
+DEFAULT_REGIONS = "us"
+DEFAULT_ODDS_FMT = "american"
+DEFAULT_DATE_FMT = "iso"
 
-# ------------ utilities ------------
-def _log(msg: str) -> None:
-    print(f"[props_hybrid] {msg}")
+# ✅ canonical NFL player-prop market keys (matches your screenshots + docs)
+VALID_MARKETS_NFL: List[str] = [
+    # Passing
+    "player_pass_yds", "player_pass_tds", "player_pass_attempts",
+    "player_pass_completions", "player_pass_interceptions",
+    "player_pass_longest_completion",
+    # Rushing
+    "player_rush_yds", "player_rush_attempts", "player_rush_longest",
+    # Receiving
+    "player_reception_yds", "player_receptions", "player_reception_longest",
+    "player_reception_tds",
+    # Combo / Specials
+    "player_anytime_td",
+    "player_pass_rush_reception_tds",
+    "player_pass_rush_reception_yds",
+    # Defensive / Kicking (offered by fewer books; keep them optional)
+    "player_sacks", "player_solo_tackles", "player_tackles_assists",
+    "player_field_goals", "player_pats",
+]
 
-def _env_api_key() -> str | None:
-    return os.environ.get("THE_ODDS_API_KEY") or os.environ.get("ODDS_API_KEY")
+# Legacy → Canonical mapper (accepts old names but converts to valid ones)
+LEGACY_MARKET_MAP = {
+    "player_passing_yards": "player_pass_yds",
+    "player_passing_tds": "player_pass_tds",
+    "player_passing_attempts": "player_pass_attempts",
+    "player_passing_completions": "player_pass_completions",
+    "player_passing_interceptions": "player_pass_interceptions",
+    "player_passing_longest_completion": "player_pass_longest_completion",
+    "player_rushing_yards": "player_rush_yds",
+    "player_rushing_attempts": "player_rush_attempts",
+    "player_rushing_longest": "player_rush_longest",
+    "player_receiving_yards": "player_reception_yds",
+    "player_receptions_total": "player_receptions",
+    "player_receiving_longest": "player_reception_longest",
+    "player_receiving_tds": "player_reception_tds",
+    "player_anytime_touchdown": "player_anytime_td",
+}
 
-def _parse_books(books: str | list[str] | None) -> str:
-    if books is None:
-        return ""
-    if isinstance(books, list):
-        return ",".join([b.strip() for b in books if b.strip()])
-    s = str(books).strip()
-    # remove brackets/quotes if someone passed a python-list string
-    s = s.strip("[]").replace("'", "").replace('"', "")
-    # collapse multiple commas/spaces
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    return ",".join(parts)
+# ---------------- Utilities ----------------
 
-def _to_list_csv(v: str | list[str] | None) -> list[str]:
-    if v is None:
+def _env_api_key(api_key: Optional[str]) -> str:
+    """Resolve API key from arg -> env -> fail."""
+    k = api_key or os.getenv("THE_ODDS_API_KEY") or os.getenv("ODDS_API_KEY")
+    if not k:
+        raise RuntimeError("Missing THE_ODDS_API_KEY (or pass api_key=...).")
+    return k
+
+def _canon_books(books: Optional[str | Iterable[str]]) -> str:
+    if books is None or (isinstance(books, str) and not books.strip()):
+        books_list = DEFAULT_BOOKS
+    elif isinstance(books, str):
+        books_list = [b.strip() for b in books.split(",") if b.strip()]
+    else:
+        books_list = list(books)
+    return ",".join(books_list)
+
+def _canon_markets(markets: Optional[Iterable[str] | str]) -> List[str]:
+    """Normalize incoming markets → canonical keys; default to a safe bundle."""
+    if markets is None or (isinstance(markets, str) and not markets.strip()):
+        return [
+            "player_pass_yds", "player_rush_yds",
+            "player_reception_yds", "player_receptions",
+            "player_anytime_td",
+        ]
+
+    if isinstance(markets, str):
+        raw = [m.strip() for m in markets.split(",") if m.strip()]
+    else:
+        raw = [str(m).strip() for m in markets if str(m).strip()]
+
+    out: List[str] = []
+    for m in raw:
+        m2 = LEGACY_MARKET_MAP.get(m, m)
+        if m2 in VALID_MARKETS_NFL:
+            out.append(m2)
+        else:
+            logging.warning("[props_hybrid] ignoring unknown market key: %s", m)
+    # Dedup but keep order
+    seen = set()
+    norm = []
+    for m in out:
+        if m not in seen:
+            norm.append(m)
+            seen.add(m)
+    return norm
+
+def _hdr_credits(r: requests.Response) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    used = r.headers.get("x-requests-used")
+    remaining = r.headers.get("x-requests-remaining")
+    last = r.headers.get("x-requests-last")
+    def _i(x): 
+        try: return int(x) if x is not None else None
+        except: return None
+    return _i(used), _i(remaining), _i(last)
+
+def _get(url: str, params: Dict[str, Any], timeout: int = 15) -> requests.Response:
+    r = requests.get(url, params=params, timeout=timeout)
+    # log credits on every call
+    u, rem, last = _hdr_credits(r)
+    logging.info("[props_hybrid] credits | used=%s remaining=%s reset=%s", u, rem, last)
+    if r.status_code >= 400:
+        # Let caller decide how to handle 422 etc; include body for diagnostics
+        msg = f"GET {r.url} -> {r.status_code} | body={r.text[:500]}"
+        raise requests.HTTPError(msg, response=r)
+    return r
+
+# ---------------- Fetchers ----------------
+
+def _list_events(api_key: str, regions: str, books: str) -> List[Dict[str, Any]]:
+    """List NFL events (no quota cost)."""
+    url = f"{BASE}/sports/{NFL_SPORT}/events"
+    params = {
+        "apiKey": api_key,
+        "regions": regions,
+        "bookmakers": books,   # narrows to events priced by these books
+        "dateFormat": DEFAULT_DATE_FMT,
+    }
+    r = _get(url, params)
+    return r.json() or []
+
+def _probe_event_markets(api_key: str, event_id: str, regions: str, books: str) -> List[str]:
+    """
+    Ask which markets exist for this event across our target books.
+    This is cheap compared to wasting per-market odds calls that 422.
+    """
+    url = f"{BASE}/sports/{NFL_SPORT}/events/{event_id}/markets"
+    params = {
+        "apiKey": api_key,
+        "regions": regions,
+        "bookmakers": books,
+    }
+    try:
+        r = _get(url, params)
+        data = r.json() or []
+        # The response is a list of markets: [{"key":"player_pass_yds", ...}, ...]
+        keys = []
+        for m in data:
+            k = m.get("key")
+            if k: keys.append(k)
+        return keys
+    except requests.HTTPError:
+        # Some providers don’t support this endpoint consistently; fall back.
+        logging.info("[props_hybrid] market probe failed for event=%s; assuming unknown", event_id)
         return []
-    if isinstance(v, list):
-        return [x.strip() for x in v if str(x).strip()]
-    return [x.strip() for x in str(v).split(",") if x.strip()]
 
-def _print_credits(headers: requests.structures.CaseInsensitiveDict | dict | None) -> None:
-    if not headers:
-        return
-    used = headers.get("x-requests-used")
-    rem  = headers.get("x-requests-remaining")
-    reset= headers.get("x-requests-reset")
-    if used is not None and rem is not None:
-        _log(f"credits | used={used} remaining={rem} reset={reset}")
-
-def _http_get(url: str, params: dict, retries: int = 2, backoff: float = 0.8) -> tuple[dict | list | None, dict]:
-    last = None
-    for i in range(retries + 1):
-        r = requests.get(url, params=params, timeout=30)
-        _print_credits(r.headers)
-        if r.status_code == 200:
-            try:
-                return r.json(), r.headers
-            except Exception:
-                return None, r.headers
-        last = (r.status_code, r.text)
-        time.sleep(backoff * (i + 1))
-    _log(f"GET failed after retries: {url}?{params} | detail: {last}")
-    return None, {}
-
-def _has_outcomes(payload: dict) -> bool:
-    for bk in (payload.get("bookmakers") or []):
-        for mk in (bk.get("markets") or []):
-            if mk.get("outcomes"):
-                return True
-    return False
-
-# ------------ fetching ------------
-def _fetch_event_ids(api_key: str, books_csv: str) -> list[dict]:
+def _fetch_event_props(
+    api_key: str,
+    event_id: str,
+    markets: List[str],
+    regions: str,
+    books: str,
+    sleep: float,
+    timeout: int,
+    use_probe: bool,
+) -> List[Dict[str, Any]]:
     """
-    Use the sports odds endpoint (e.g., markets=h2h) just to enumerate event shells.
-    """
-    url = f"{BASE}/sports/{NFL_SPORT}/odds"
-    params = dict(
-        apiKey=api_key,
-        regions=DEFAULT_REGIONS,
-        oddsFormat=DEFAULT_ODDS_FORMAT,
-        dateFormat=DEFAULT_DATEFORMAT,
-        bookmakers=books_csv or "draftkings, fanduel",
-        markets="h2h",
-    )
-    data, hdrs = _http_get(url, params)
-    if not isinstance(data, list):
-        return []
-    _log(f"event shells fetched: {len(data)}")
-    return data
-
-def _fetch_event_props(api_key: str, event_id: str, books_csv: str, markets: list[str]) -> list[dict]:
-    """
-    Fetch props for one event. Try bulk first; if empty, try each market with synonyms.
+    Fetch desired markets for a single event via /events/{id}/odds.
+    Returns raw rows (bookmaker, market, outcomes...) for later flattening.
     """
     if not markets:
         return []
-    base_url = f"{BASE}/sports/{NFL_SPORT}/events/{event_id}/odds"
-    common = dict(
-        apiKey=api_key,
-        regions=DEFAULT_REGIONS,
-        oddsFormat=DEFAULT_ODDS_FORMAT,
-        dateFormat=DEFAULT_DATEFORMAT,
-        bookmakers=books_csv,
-    )
 
-    # 1) bulk try
-    params = dict(common, markets=",".join(markets))
-    bulk, hdrs = _http_get(base_url, params)
-    if isinstance(bulk, dict):
-        bulk.setdefault("eventId", event_id)
-        if _has_outcomes(bulk):
-            _log(f"event {event_id}: outcomes (bulk) ✓")
-            return [bulk]
-        _log(f"event {event_id}: no outcomes in bulk → retrying per-market")
+    desired = markets
+    if use_probe:
+        offered = set(_probe_event_markets(api_key, event_id, regions, books))
+        if offered:
+            desired = [m for m in desired if m in offered]
+            if not desired:
+                return []
 
-    # 2) per-market with synonyms
-    agg: list[dict] = []
-    for canonical in markets:
-        synonyms = MARKET_SYNONYMS.get(canonical, [canonical])
-        hit = False
-        for m in synonyms:
-            p = dict(common, markets=m)
-            d, h = _http_get(base_url, p)
-            if isinstance(d, dict):
-                d.setdefault("eventId", event_id)
-                if _has_outcomes(d):
-                    _log(f"event {event_id}: outcomes for '{m}' ✓")
-                    agg.append(d)
-                    hit = True
-                    break
-        if not hit:
-            _log(f"event {event_id}: still no outcomes for '{canonical}'")
-    if not agg:
-        _log(f"event {event_id}: still no outcomes for requested markets")
-    return agg
+    # The endpoint supports comma-separated markets; keep chunks modest (<= 6)
+    rows: List[Dict[str, Any]] = []
+    for i in range(0, len(desired), 6):
+        chunk = desired[i : i + 6]
+        url = f"{BASE}/sports/{NFL_SPORT}/events/{event_id}/odds"
+        params = {
+            "apiKey": api_key,
+            "regions": regions,
+            "bookmakers": books,
+            "markets": ",".join(chunk),
+            "oddsFormat": DEFAULT_ODDS_FMT,
+            "dateFormat": DEFAULT_DATE_FMT,
+        }
+        try:
+            r = _get(url, params, timeout=timeout)
+        except requests.HTTPError as e:
+            # If INVALID_MARKET for 1+ items in chunk, try per-market to salvage others
+            body = str(getattr(e, "response", None).text if getattr(e, "response", None) else "")
+            if "INVALID_MARKET" in body or "422" in str(e):
+                for m in chunk:
+                    try:
+                        rr = _get(url, {**params, "markets": m}, timeout=timeout)
+                        rows.extend(rr.json() or [])
+                    except requests.HTTPError:
+                        logging.info("[props_hybrid] skip event=%s market=%s (invalid)", event_id, m)
+                continue
+            raise
 
-# ------------ flattening ------------
-# ------------ flattening ------------
-def _flatten(payloads: list[dict]) -> pd.DataFrame:
-    """
-    Flatten event -> bookmakers -> markets -> outcomes to rows.
-    Adds 'side' derived from outcome 'name' so downstream normalizers that
-    expect ['market','side','price','point', 'book', ...] won't KeyError.
-    """
-    rows: list[dict] = []
-    for ev in payloads:
-        event_id = ev.get("id") or ev.get("eventId")
-        commence_time = ev.get("commence_time") or ev.get("commenceTime")
-        home = ev.get("home_team")
-        away = ev.get("away_team")
+        rows.extend(r.json() or [])
+        if sleep:
+            time.sleep(sleep)
+    return rows
 
-        for bk in (ev.get("bookmakers") or []):
-            book = bk.get("key")
-            for mk in (bk.get("markets") or []):
-                market_key = mk.get("key")  # e.g. 'player_pass_yds'
-                for oc in (mk.get("outcomes") or []):
-                    name = (oc.get("name") or "").strip()  # 'Over'/'Under'/'Yes'/'No'
-                    side = name  # expose as 'side' for normalizer compatibility
-                    rows.append(
-                        {
-                            # event/team context
-                            "event_id": event_id,
-                            "commence_time": commence_time,
-                            "home_team": home,
-                            "away_team": away,
+# ---------------- Public: get_props ----------------
 
-                            # book & market
-                            "book": book,                # some normalizers expect 'book'
-                            "bookmaker": book,           # keep original too
-                            "market": market_key,        # normalizer uses 'market'
-                            "market_key": market_key,    # some pipelines map this too
-
-                            # outcome fields
-                            "side": side,                # <- NEW (from 'name')
-                            "outcome_name": name,        # keep raw 'name' as well
-                            "price": oc.get("price"),
-                            "point": oc.get("point"),
-                        }
-                    )
-    df = pd.DataFrame(rows)
-
-    # Ensure expected columns exist even if empty
-    for col in ["market", "side", "price", "point", "book"]:
-        if col not in df.columns:
-            df[col] = None
-
-    return df
-
-# ------------ public API ------------
 def get_props(
     *,
-    api_key: str | None = None,
-    date: str | None = None,
-    season: int | None = None,
-    window: int | str | None = None,
+    api_key: Optional[str] = None,
+    date: Optional[str] = None,
+    season: Optional[int] = None,
+    window: Optional[int | str] = None,
     cap: int = 0,
-    markets: list[str] | str | None = None,
-    books: list[str] | str | None = None,
+    markets: Optional[Iterable[str] | str] = None,
+    books: Optional[Iterable[str] | str] = None,
     order: str = "odds",
-    team_filter: list[str] | None = None,
-    selection: str | None = None,
-    event_ids: list[str] | None = None,
+    team_filter: Optional[List[str]] = None,
+    selection: Optional[str] = None,
+    event_ids: Optional[List[str]] = None,
+    regions: str = DEFAULT_REGIONS,
+    use_probe: bool = True,
+    sleep: float = 0.15,
+    timeout: int = 15,
 ) -> pd.DataFrame:
     """
-    Unified fetcher used by engine.py. Returns a DataFrame (can be empty).
+    Main entry from engine.
+    Returns a raw (unnormalized) DataFrame combining all requested events/markets.
     """
-    key = api_key or _env_api_key()
-    if not key:
-        raise RuntimeError("Missing THE_ODDS_API_KEY in environment.")
+    logging.info("[props_hybrid] Calling get_props() with API key and cap=%s", cap)
 
-    # Markets
-    if markets is None:
-        req_markets = list(NFL_DEFAULT_MARKETS)
-        _log(f"no markets passed; using defaults: {','.join(req_markets)}")
-    else:
-        if isinstance(markets, str):
-            req_markets = [m.strip() for m in markets.split(",") if m.strip()]
-        else:
-            req_markets = [m.strip() for m in markets if str(m).strip()]
-        # filter only those we know (canonical or synonyms)
-        req_markets = [m for m in req_markets if m in VALID_MARKETS or m in MARKET_SYNONYMS]
-        if not req_markets:
-            req_markets = list(NFL_DEFAULT_MARKETS)
-            _log(f"requested markets invalid → using defaults: {','.join(req_markets)}")
+    key = _env_api_key(api_key)
+    books_str = _canon_books(books)
+    mkts = _canon_markets(markets)
 
-    # Books
-    books_csv = _parse_books(books) or "draftkings,fanduel"
-
-    # Events: use supplied or discover from shells
-    shells = _fetch_event_ids(key, books_csv) if not event_ids else []
-    if event_ids:
-        event_list = [{"id": e} for e in event_ids]
-    else:
-        # event shells from odds endpoint
-        event_list = [{"id": x.get("id")} for x in shells if x.get("id")]
-    _log(f"events queued: {len(event_list)}")
-
-    # Cap number of events if requested
+    # Get events
+    events = event_ids or [e["id"] for e in _list_events(key, regions, books_str)]
     if cap and cap > 0:
-        event_list = event_list[:cap]
+        events = events[:cap]
 
-    # Fetch props per event
-    payloads: list[dict] = []
-    for ev in event_list:
-        ev_id = ev["id"]
-        ev_payloads = _fetch_event_props(key, ev_id, books_csv, req_markets)
-        payloads.extend(ev_payloads)
+    all_rows: List[Dict[str, Any]] = []
+    for eid in events:
+        try:
+            ev_rows = _fetch_event_props(
+                api_key=key,
+                event_id=eid,
+                markets=mkts,
+                regions=regions,
+                books=books_str,
+                sleep=sleep,
+                timeout=timeout,
+                use_probe=use_probe,
+            )
+            # The per-event response is a list with a single event object (if any)
+            for ev in ev_rows:
+                ev_id = ev.get("id") or eid
+                commence_time = ev.get("commence_time")
+                home = ev.get("home_team"); away = ev.get("away_team")
+                for bk in (ev.get("bookmakers") or []):
+                    bkey = bk.get("key")
+                    for mk in (bk.get("markets") or []):
+                        mkey = mk.get("key")
+                        for out in (mk.get("outcomes") or []):
+                            # Outcomes vary by market; props typically include "description" (player)
+                            row = {
+                                "event_id": ev_id,
+                                "commence_time": commence_time,
+                                "home_team": home,
+                                "away_team": away,
+                                "bookmaker": bkey,
+                                "market_key": mkey,
+                                "name": out.get("name"),
+                                "description": out.get("description"),
+                                "price": out.get("price"),
+                                "point": out.get("point"),
+                                "team": out.get("team"),
+                                "player": out.get("description"),  # convenience alias
+                            }
+                            all_rows.append(row)
+        except Exception as e:
+            logging.info("[props_hybrid] event=%s fetch error: %s", eid, e)
 
-    # Flatten
-    df = _flatten(payloads)
-    _log(f"flattened {len(df)} rows")
+    df = pd.DataFrame(all_rows)
+    logging.info("[props_hybrid] flattened %d rows", len(df))
     return df
-
