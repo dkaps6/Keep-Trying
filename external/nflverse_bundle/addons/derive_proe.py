@@ -42,7 +42,7 @@ def main():
     seasons = [int(s) for s in args.season]
     ensure_dir(args.out)
     # Load PBP for seasons (may be large)
-    pbp = nfl.load_pbp(seasons=seasons, file_type="csv")
+    pbp = nfl.load_pbp(seasons=seasons)
     tw = compute_proe(pbp)
     tw.write_csv(os.path.join(args.out, f"team_proe_week_{'-'.join(map(str,seasons))}.csv"))
     # Season aggregate
