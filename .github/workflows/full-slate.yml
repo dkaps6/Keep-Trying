@@ -45,10 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
-      # Map your secret to both names (some scripts look for either)
       THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
       ODDS_API_KEY:     ${{ secrets.THE_ODDS_API_KEY }}
-      # Tuning knob for μ blend (keeps your pricing default unless overridden)
       MU_BLEND_WEIGHT: "0.35"
 
     steps:
@@ -64,23 +62,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # parquet support for nflverse mirrors (if not already in requirements)
-          pip install --upgrade pyarrow
+          # >>> This is the extra line you asked about <<<
+          pip install --upgrade pyarrow nflreadpy
 
       - name: Check Odds API key present
         run: |
           python - <<'PY'
           import os, sys
           k1 = os.getenv("THE_ODDS_API_KEY")
-          k2 = os.getenv("ODDS_API_KEY")
           if not k1:
-              print("❌ THE_ODDS_API_KEY is missing (add it in repo Settings → Secrets and variables → Actions)"); sys.exit(1)
-          print("✅ THE_ODDS_API_KEY loaded (length:", len(k1), ")")
-          print("ℹ️  ODDS_API_KEY mirror present:", bool(k2))
+              print("❌ THE_ODDS_API_KEY is missing (add it under Settings → Secrets and variables → Actions)")
+              sys.exit(1)
+          print("✅ THE_ODDS_API_KEY loaded (len =", len(k1), ")")
           PY
 
       # ---------- FETCH / BUILD INPUTS ----------
-
       - name: Build team context (team_form.csv)
         run: |
           set -euo pipefail
@@ -89,7 +85,6 @@ jobs:
             --history 2019-2024 \
             --season "${{ github.event.inputs.season }}" \
             --write data/team_form.csv
-          echo "team_form preview:"
           head -n 5 data/team_form.csv || true
 
       - name: Build player form (player_form.csv)
@@ -99,19 +94,17 @@ jobs:
             --history 2019-2024 \
             --season "${{ github.event.inputs.season }}" \
             --write data/player_form.csv
-          echo "player_form preview:"
           head -n 5 data/player_form.csv || true
 
-      - name: Fetch weather with fallbacks (data/weather.csv)
+      - name: Fetch weather (data/weather.csv)
         run: |
           set -euo pipefail
           python -m scripts.fetch_weather \
             --hours "${{ github.event.inputs.window_hours }}" \
             --out data/weather.csv
-          echo "weather preview:"
           head -n 5 data/weather.csv || true
 
-      - name: Dump props via existing props_hybrid.get_props (props_to_csv)
+      - name: Dump props (props_raw.csv)
         env:
           DATE:      ${{ github.event.inputs.date }}
           SEASON:    ${{ github.event.inputs.season }}
@@ -126,10 +119,8 @@ jobs:
           ARGS=( --date "$DATE" --season "$SEASON" --hours "$WINDOW" --books "$BOOKS" )
           [ -n "$MARKETS" ]   && ARGS+=( --markets "$MARKETS" )
           [ -n "$ORDER" ]     && ARGS+=( --order "$ORDER" )
-          [ -n "$TEAMS" ]     && ARGS+=( --team-filter "$TEAMS" )   # maps to props_to_csv arg
-          # SELECTION reserved for future event-id filter; omit unless you wire it
+          [ -n "$TEAMS" ]     && ARGS+=( --team-filter "$TEAMS" )
           python -m scripts.props_to_csv "${ARGS[@]}"
-          echo "props_raw preview:"
           head -n 5 outputs/props_raw.csv || true
 
       - name: Validate inputs (strict)
@@ -138,7 +129,6 @@ jobs:
           python -m scripts.validate_inputs --json logs/validate_report.json
 
       # ---------- RUN MODEL ----------
-
       - name: Run model
         env:
           DATE:       ${{ github.event.inputs.date }}
@@ -157,12 +147,9 @@ jobs:
           [ -n "$ORDER" ]    && ARGS+=( --order "$ORDER" )
           [ -n "$TEAMS" ]    && ARGS+=( --teams "$TEAMS" )
           [ -n "$SELECTION" ]&& ARGS+=( --selection "$SELECTION" )
-          echo "Running: python run_model.py ${ARGS[*]}"
           python run_model.py "${ARGS[@]}"
 
-      # ---------- ARTIFACTS ----------
-
-      - name: Upload outputs (priced, logs, inputs)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
