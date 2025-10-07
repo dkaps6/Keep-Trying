@@ -1,6 +1,6 @@
 # scripts/fetch_nfl_data.py
 from __future__ import annotations
-import argparse, warnings
+import argparse, warnings, time, requests
 from pathlib import Path
 from typing import Iterable
 import pandas as pd
@@ -18,9 +18,7 @@ try:
 except Exception:
     HAS_NFL_DATA_PY = False
 
-# ---- Fallback sources ----
-# ESPN team-table builder (lightweight) – we implement locally here
-import time, requests
+# ---- ESPN light fallback for team totals ----
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
 ESPN_BOX = "https://site.api.espn.com/apis/v2/sports/football/nfl/boxscore"
 
@@ -66,29 +64,25 @@ def _espn_team_table(season: int) -> pd.DataFrame:
                                 pass_att += float(st.get("attempts") or 0)
                             elif nm == "rushing":
                                 rush_att += float(st.get("attempts") or st.get("carries") or 0)
-                rows.append({
-                    "team": abbr,
-                    "pass_att": pass_att,
-                    "rush_att": rush_att,
-                    "plays": pass_att + rush_att,
-                    "event_id": eid
-                })
+                rows.append({"team": abbr, "pass_att": pass_att, "rush_att": rush_att, "plays": pass_att + rush_att, "event_id": eid})
             time.sleep(0.05)
     return pd.DataFrame(rows)
 
-# API-SPORTS & MySportsFeeds fallbacks
+# ---- API-SPORTS & MySportsFeeds fallbacks ----
 from .sources.apisports import season_team_player_tables as apisports_tables
 from .sources.mysportsfeeds import season_team_player_tables as msf_tables
 
+# ---- NFLGSIS authenticated fallback ----
+from .sources.nflgsis import login_session, list_games, team_player_tables as gsis_team_player_tables
 
-# ---------- Local helpers (no cross-module imports) ----------
+# ---------- Local helpers ----------
 def _is_pass(df: pd.DataFrame) -> pd.Series:
     return (df.get("pass", 0) == 1) if "pass" in df.columns \
         else df.get("play_type","").astype(str).str.contains("pass", case=False, na=False)
 
 def _is_rush(df: pd.DataFrame) -> pd.Series:
     return (df.get("rush", 0) == 1) if "rush" in df.columns \
-        else df.get("play_type","").astype(str).str.contains("rush", case=False, na=False)
+        else df.get("play_type","").astype(str).str.contains("rush|run", case=False, na=False)
 
 def _neutral_filter(cur: pd.DataFrame) -> pd.Series:
     qtr = cur.get("qtr", pd.Series([0]*len(cur)))
@@ -96,14 +90,13 @@ def _neutral_filter(cur: pd.DataFrame) -> pd.Series:
     ytg = cur.get("ydstogo", pd.Series([10]*len(cur)))
     return (qtr.between(1,3)) | ((qtr==4) & (hs>300) & (ytg<=10))
 
-
 # ---------- nflverse loaders ----------
 def _load_pbp(seasons: Iterable[int]) -> pd.DataFrame:
     seasons = list(seasons)
     if HAS_NFLREADPY:
         try:
             print(f"[fetch_nfl_data] USING PBP (nflreadpy) for {seasons}")
-            df = nrp.load_pbp(seasons=seasons)  # v0.1.3
+            df = nrp.load_pbp(seasons=seasons)
             if "season" not in df.columns and len(seasons) == 1:
                 df["season"] = seasons[0]
             return df
@@ -117,8 +110,7 @@ def _load_pbp(seasons: Iterable[int]) -> pd.DataFrame:
             warnings.warn(f"nfl_data_py.import_pbp_data failed: {type(e).__name__}: {e}")
     return pd.DataFrame()
 
-
-# ---------- team form using best-available source ----------
+# ---------- team form builders ----------
 def _team_form_from_tables(team_df: pd.DataFrame) -> pd.DataFrame:
     if team_df is None or team_df.empty:
         return pd.DataFrame()
@@ -130,9 +122,9 @@ def _team_form_from_tables(team_df: pd.DataFrame) -> pd.DataFrame:
     team["pass_rate"] = team["pass_att"] / (team["pass_att"] + team["rush_att"]).replace({0: pd.NA})
     league_pass = float(team["pass_rate"].mean(skipna=True))
     team["proe"] = (team["pass_rate"] - league_pass).fillna(0.0)
-    team["rz_rate"] = 0.20  # proxy until richer data available
-
+    team["rz_rate"] = 0.20  # proxy when RZ not known
     out = team[["team","plays_est","proe","rz_rate"]].copy()
+    # Fill required columns (zeros as neutral proxies)
     for c in ["def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
               "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z"]:
         out[c] = 0.0
@@ -153,7 +145,7 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
         "plays_est","proe","rz_rate"
     ]
 
-    # If we have PBP for current season → use it
+    # Prefer true PBP if available
     cur = pd.DataFrame()
     if pbp_all is not None and not pbp_all.empty:
         cur = pbp_all.copy()
@@ -191,7 +183,7 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
         off = off.merge(games, on="team", how="left")
         off["plays_est"] = (off["plays"] / off["games"].clip(lower=1)).fillna(off["plays"])
 
-        # minimal defensive proxies (true PBP-derived EPA if columns exist)
+        # Defensive z-proxies if EPA exists
         g_pass = (cur[cur["is_pass"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_pass_epa"}))
         g_rush = (cur[cur["is_rush"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_rush_epa"}))
         g_cnt  = (cur.groupby("defteam", as_index=False).size().rename(columns={"size":"def_plays"}))
@@ -230,22 +222,40 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
             "plays_est","proe","rz_rate"
         ]]
 
-    # No PBP → try ESPN, then API-SPORTS, then MSF
+    # No PBP → ESPN
     espn_team = _espn_team_table(current_season)
     if not espn_team.empty:
+        print("[fetch_nfl_data] using ESPN team table")
         return _team_form_from_tables(espn_team)
 
+    # API-SPORTS
     api_team, _ = apisports_tables(current_season)
     if not api_team.empty:
+        print("[fetch_nfl_data] using API-SPORTS team table")
         return _team_form_from_tables(api_team)
 
+    # MySportsFeeds
     msf_team, _ = msf_tables(current_season)
     if not msf_team.empty:
+        print("[fetch_nfl_data] using MySportsFeeds team table")
         return _team_form_from_tables(msf_team)
 
-    # last resort: empty (downstream will handle)
-    return pd.DataFrame(columns=cols)
+    # NFLGSIS (authenticated)
+    try:
+        print("[fetch_nfl_data] trying NFLGSIS fallback …")
+        s = login_session()
+        games = list_games(s)
+        if games:
+            gids = [g["id"] for g in games]
+            team_df, _ = gsis_team_player_tables(s, gids, limit=40)
+            if not team_df.empty:
+                print("[fetch_nfl_data] using NFLGSIS team table")
+                return _team_form_from_tables(team_df)
+    except Exception as e:
+        warnings.warn(f"NFLGSIS fallback failed: {type(e).__name__}: {e}")
 
+    # final: empty
+    return pd.DataFrame(columns=cols)
 
 def main():
     ap = argparse.ArgumentParser()
