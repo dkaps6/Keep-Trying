@@ -289,26 +289,27 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         env["ay_per_att"] = np.nan
 
     # --- Neutral pace (sec/play in neutral score) ---
-    sec_rem = _pick(["game_seconds_remaining","game_seconds"], pbp)
-    score_diff = _pick(["score_differential","score_diff"], pbp)
-    qtr = _pick(["qtr","quarter"], pbp)
-    env["pace"] = 0.0
-    if sec_rem and score_diff:
-        # filter neutral situations (within one score), offense-only plays
-        p = pbp.loc[pbp[posteam].notna() & (pbp[score_diff].between(-7, 7, inclusive="both"))].copy()
-        # approximate seconds per play using negative diffs of game_seconds_remaining
-        # order plays per game/possession chronology
-        order_cols = [c for c in ["game_id","old_game_id","drive","play_id","index"] if c in p.columns]
-        order_cols = list(dict.fromkeys(order_cols))  # ensure unique labels
-        if order_cols:
+sec_rem = _pick(["game_seconds_remaining","game_seconds"], pbp)
+score_diff = _pick(["score_differential","score_diff"], pbp)
+qtr = _pick(["qtr","quarter"], pbp)
+env["pace"] = 0.0
+if sec_rem and score_diff:
+    # filter neutral situations (within one score), offense-only plays
+    p = pbp.loc[pbp[posteam].notna() & (pbp[score_diff].between(-7, 7, inclusive="both"))].copy()
+    # approximate seconds per play using negative diffs of game_seconds_remaining
+    # order plays per game/possession chronology
+    order_cols = [c for c in ["game_id","old_game_id","drive","play_id","index"] if c in p.columns]
+    order_cols = list(dict.fromkeys(order_cols))
+    if order_cols:
         p = p.sort_values(order_cols)
-        p["sec"] = _safe_num(p[sec_rem])
-        p["delta"] = -p.groupby([posteam])[ "sec" ].diff().fillna(np.nan)
-        pace = p.groupby(posteam, as_index=False)["delta"].median()
-        pace = pace.rename(columns={posteam:"team","delta":"sec_per_play_neutral"})
-        env = env.merge(pace, on="team", how="left")
-        env["pace"] = env["sec_per_play_neutral"].fillna(env["sec_per_play_neutral"].median())
-        env["pace"] = -env["pace"].fillna(28.0)  # default ~28 sec/play
+    p["sec"] = _safe_num(p[sec_rem])
+    p["delta"] = -p.groupby([posteam])["sec"].diff().fillna(np.nan)
+    pace = p.groupby(posteam, as_index=False)["delta"].median()
+    pace = pace.rename(columns={posteam:"team","delta":"sec_per_play_neutral"})
+    env = env.merge(pace, on="team", how="left")
+    env["pace"] = env["sec_per_play_neutral"].fillna(env["sec_per_play_neutral"].median())
+    env["pace"] = -env["pace"].fillna(28.0)  # default ~28 sec/play
+
 
     # --- PROE (league expectation by down/dist/field/score/quarter/time) ---
     down = _pick(["down"], pbp)
