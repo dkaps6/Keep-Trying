@@ -17,6 +17,46 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+# ------------------------------------------------------------------------
+# 🧭 Timezone normalization helpers for weather lookups
+# ------------------------------------------------------------------------
+from datetime import datetime, timezone
+import pandas as pd
+
+def _to_aware_utc(x) -> datetime | None:
+    """
+    Coerce a datetime/ISO string to a timezone-aware UTC datetime.
+    Returns None if parsing fails.
+    """
+    if isinstance(x, datetime):
+        return x.replace(tzinfo=timezone.utc) if x.tzinfo is None else x.astimezone(timezone.utc)
+
+    s = str(x).strip()
+    if not s:
+        return None
+
+    # Normalize common ISO variants
+    if s.endswith("Z"):
+        s = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        try:
+            # very forgiving parser
+            dt = pd.to_datetime(s, utc=True).to_pydatetime()
+        except Exception:
+            return None
+
+    if isinstance(dt, pd.Timestamp):
+        dt = dt.to_pydatetime()
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
+
+
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 SPORT = "americanfootball_nfl"
