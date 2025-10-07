@@ -44,10 +44,16 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+
     env:
       THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
-      ODDS_API_KEY:     ${{ secrets.THE_ODDS_API_KEY }}
-      MU_BLEND_WEIGHT: "0.35"
+      ODDS_API_KEY:     ${{ secrets.THE_ODDS_API_KEY }}  # keep alias if code uses it
+      MU_BLEND_WEIGHT:  "0.35"
+      APISPORTS_KEY:    ${{ secrets.APISPORTS_KEY }}
+      MSF_KEY:          ${{ secrets.MSF_KEY }}
+      MSF_PASSWORD:     ${{ secrets.MSF_PASSWORD }}
+      NFLGSIS_USERNAME: ${{ secrets.NFLGSIS_USERNAME }}
+      NFLGSIS_PASSWORD: ${{ secrets.NFLGSIS_PASSWORD }}
 
     steps:
       - name: Checkout repository
@@ -57,74 +63,43 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # >>> This is the extra line you asked about <<<
+          # extra libs you use
           pip install --upgrade pyarrow nflreadpy
 
-          jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install deps
-        run: |
-          python -m venv .venv
-          . .venv/bin/activate
-          pip install -r requirements.txt
-
-      #####################################################
-      #  ⬇⬇⬇  INSERT THE NEW STEPS HERE  ⬇⬇⬇
-      #####################################################
-
+      # ========= NEW: Fetch + Compose (free + optional paid) =========
       - name: Fetch free data + compose (nflverse + addons)
-        env:
-          THE_ODDS_API_KEY:   ${{ secrets.THE_ODDS_API_KEY }}
-          APISPORTS_KEY:      ${{ secrets.APISPORTS_KEY }}
-          MSF_KEY:            ${{ secrets.MSF_KEY }}
-          MSF_PASSWORD:       ${{ secrets.MSF_PASSWORD }}
-          NFLGSIS_USERNAME:   ${{ secrets.NFLGSIS_USERNAME }}
-          NFLGSIS_PASSWORD:   ${{ secrets.NFLGSIS_PASSWORD }}
         run: |
-          . .venv/bin/activate
-          python make_all.py --season 2025
+          set -e
+          echo "Repo root: $(pwd)"
+          ls -la
+          if [ -f make_all.py ]; then
+            echo "Found root make_all.py"
+            python make_all.py --season "${{ github.event.inputs.season }}"
+          elif [ -f nflverse_csv_fetcher/make_all.py ]; then
+            echo "Found nflverse_csv_fetcher/make_all.py"
+            python nflverse_csv_fetcher/make_all.py --season "${{ github.event.inputs.season }}"
+          else
+            echo "::error ::make_all.py not found at repo root or nflverse_csv_fetcher/"
+            exit 1
+          fi
 
+      # ========= NEW: Validate outputs from the data pack =========
       - name: Validate data pack outputs
         run: |
-          . .venv/bin/activate
           python scripts/validate_inputs.py
 
-      # (optional safety net)
+      # Optional safety net — won’t fail if unnecessary
       - name: Build player_form (safe fallback)
         run: |
-          . .venv/bin/activate
-          python scripts/build_player_form_safe.py --season 2025 --write data/player_form.csv || true
+          python scripts/build_player_form_safe.py --season "${{ github.event.inputs.season }}" --write data/player_form.csv || true
 
-      #####################################################
-      #  ⬆⬆⬆  END OF NEW INSERTS  ⬆⬆⬆
-      #####################################################
-
-      # everything below this line is your existing job:
-      - name: Run pricing engine
-        run: |
-          . .venv/bin/activate
-          python run_model.py
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: model-outputs
-          path: outputs/**
-
+      # ---------- your existing steps (unchanged) ----------
       - name: Check Odds API key present
         run: |
           python - <<'PY'
@@ -136,7 +111,6 @@ jobs:
           print("✅ THE_ODDS_API_KEY loaded (len =", len(k1), ")")
           PY
 
-      # ---------- FETCH / BUILD INPUTS ----------
       - name: Build team context (team_form.csv)
         run: |
           set -euo pipefail
@@ -188,7 +162,6 @@ jobs:
           set -euo pipefail
           python -m scripts.validate_inputs --json logs/validate_report.json
 
-      # ---------- RUN MODEL ----------
       - name: Run model
         env:
           DATE:       ${{ github.event.inputs.date }}
