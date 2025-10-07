@@ -208,7 +208,7 @@ def _bool_col(df: pd.DataFrame, names: List[str]) -> pd.Series:
     if c is None: return pd.Series(False, index=df.index)
     v = df[c]
     if v.dtype == bool: return v.fillna(False)
-    return v.astype(float).fillna(0) > 0
+    return _safe_num(v).fillna(0) > 0
 
 def _name_col(df: pd.DataFrame, names: List[str], default: str="") -> pd.Series:
     c = _pick(names, df)
@@ -217,7 +217,7 @@ def _name_col(df: pd.DataFrame, names: List[str], default: str="") -> pd.Series:
 def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns:
-      team_env  : team-level env metrics (EPA splits, pace, plays_est, ay_per_att, proe)
+      team_env  : team-level env metrics (EPA splits, pace, plays_est, ay_per_att, proe, rz_rate)
       proe_week : optional weekly proe table (team, week, proe)
     """
     if not _ok(pbp):
@@ -227,13 +227,15 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
     posteam = _pick(["posteam","offense_team"], pbp) or "posteam"
     defteam = _pick(["defteam","defense_team"], pbp) or "defteam"
     weekcol = _pick(["week","game_week"], pbp) or "week"
+    game_id = _pick(["game_id","old_game_id","gameid","gameId"], pbp) or "game_id"
     epa = _pick(["epa"], pbp)
     pass_flag = _bool_col(pbp, ["pass","is_pass","qb_dropback"])
     rush_flag = _bool_col(pbp, ["rush","is_rush"]) & ~pass_flag
 
     # --- EPA splits (defense is negative of offense EPA allowed) ---
-    env = pd.DataFrame({"team": sorted(pd.unique(pbp[[posteam,defteam]].values.ravel("K")))}).dropna()
-    def_pass, def_rush = 0.0, 0.0
+    teams = pd.unique(pd.concat([pbp[posteam], pbp[defteam]], ignore_index=True)).astype(str)
+    env = pd.DataFrame({"team": sorted([t for t in teams if t and t != "nan"])})
+
     env["def_pass_epa"] = 0.0
     env["def_rush_epa"] = 0.0
     if epa:
@@ -271,45 +273,82 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         env["ay_per_att"] = np.nan
 
     # --- Neutral pace (sec/play in neutral score) ---
-    # nflfastR provides 'game_seconds_remaining' + 'posteam' per play
     sec_rem = _pick(["game_seconds_remaining","game_seconds"], pbp)
     score_diff = _pick(["score_differential","score_diff"], pbp)
+    qtr = _pick(["qtr","quarter"], pbp)
     env["pace"] = 0.0
     if sec_rem and score_diff:
         # filter neutral situations (within one score), offense-only plays
         p = pbp.loc[pbp[posteam].notna() & (pbp[score_diff].between(-7, 7, inclusive="both"))].copy()
         # approximate seconds per play using negative diffs of game_seconds_remaining
-        p = p.sort_values(["game_id" if "game_id" in p.columns else "old_game_id", "play_id" if "play_id" in p.columns else p.index.name or p.index])
+        # order plays per game/possession chronology
+        order_cols = [c for c in ["game_id","old_game_id","drive","play_id","index"] if c in p.columns]
+        if not order_cols: order_cols = [p.index.name] if p.index.name else [p.index]
+        p = p.sort_values(order_cols)
         p["sec"] = _safe_num(p[sec_rem])
         p["delta"] = -p.groupby([posteam])[ "sec" ].diff().fillna(np.nan)
         pace = p.groupby(posteam, as_index=False)["delta"].median()
         pace = pace.rename(columns={posteam:"team","delta":"sec_per_play_neutral"})
         env = env.merge(pace, on="team", how="left")
-        # negative pace→plays per 60 = 3600 / sec/play; store "pace" as negative seconds for old code compatibility
         env["pace"] = env["sec_per_play_neutral"].fillna(env["sec_per_play_neutral"].median())
         env["pace"] = -env["pace"].fillna(28.0)  # default ~28 sec/play
 
-    # --- PROE (pass rate - expected pass rate by down/distance/field) ---
+    # --- PROE (league expectation by down/dist/field/score/quarter/time) ---
     down = _pick(["down"], pbp)
     ytg  = _pick(["ydstogo","yards_to_go","yds_to_go"], pbp)
     yline= _pick(["yardline_100","yardline"], pbp)
+    time = sec_rem
     proe_week = pd.DataFrame(columns=["team","week","proe"])
     env["proe"] = 0.0
     if down and ytg and yline and weekcol:
         df = pbp.loc[pbp[posteam].notna() & pbp[down].notna(), [posteam, weekcol, down, ytg, yline]].copy()
         df["is_pass"] = pass_flag.loc[df.index].astype(int)
-        # coarse buckets
+
+        # bins
         df["down_b"]   = df[down].clip(1,4)
         df["ytg_b"]    = pd.cut(_safe_num(df[ytg]), bins=[-1,2,6,10,25,99], labels=["short","med","long","xlong","hail"])
         df["yl_b"]     = pd.cut(_safe_num(df[yline]), bins=[-1,20,50,80,110], labels=["rz","mid","deep","backed"])
-        # league baseline expectation
+
+        # add score bins, quarter bins, time bins (more expressive expectation)
+        if score_diff in pbp.columns:
+            df2 = pbp.loc[df.index, [score_diff]].copy()
+            df["score_b"] = pd.cut(_safe_num(df2[score_diff]), bins=[-99,-14,-7,-3,3,7,14,99],
+                                   labels=["<-14","-14..-7","-7..-3","-3..3","3..7","7..14",">14"])
+        else:
+            df["score_b"] = "0"
+
+        if qtr:
+            qmap = pd.Series(pbp[qtr], index=pbp.index).reindex(df.index)
+            df["qtr_b"] = qmap.clip(1,4).fillna(1).astype(int)
+        else:
+            df["qtr_b"] = 1
+
+        if time:
+            tmap = pd.Series(_safe_num(pbp[time]), index=pbp.index).reindex(df.index)
+            # bins emphasize late/early situations
+            df["time_b"] = pd.cut(tmap, bins=[-1,120,600,1200,1800,3600], labels=["last2m","late","Q3","Q2","Q1"])
+        else:
+            df["time_b"] = "Q1"
+
+        # league baseline expectation across multi-dim buckets
+        exp_keys = ["down_b","ytg_b","yl_b","score_b","qtr_b","time_b"]
         exp_tbl = (
-            df.groupby(["down_b","ytg_b","yl_b"], as_index=False)["is_pass"]
+            df.groupby(exp_keys, as_index=False)["is_pass"]
               .mean()
               .rename(columns={"is_pass":"exp_pass"})
         )
-        # join expectation
-        df = df.merge(exp_tbl, on=["down_b","ytg_b","yl_b"], how="left")
+        df = df.merge(exp_tbl, on=exp_keys, how="left")
+        # if a rare bucket is NaN (no league history), back off to simpler (down_b, ytg_b, yl_b)
+        if df["exp_pass"].isna().any():
+            exp_tbl_simple = (
+                df.groupby(["down_b","ytg_b","yl_b"], as_index=False)["is_pass"]
+                  .mean()
+                  .rename(columns={"is_pass":"exp_pass_simple"})
+            )
+            df = df.merge(exp_tbl_simple, on=["down_b","ytg_b","yl_b"], how="left")
+            df["exp_pass"] = df["exp_pass"].fillna(df["exp_pass_simple"]).fillna(df["is_pass"].mean())
+            df = df.drop(columns=["exp_pass_simple"], errors="ignore")
+
         grp = df.groupby([posteam, weekcol], as_index=False)[["is_pass","exp_pass"]].mean()
         grp["proe"] = grp["is_pass"] - grp["exp_pass"]
         grp = grp.rename(columns={posteam: "team", weekcol: "week"})
@@ -317,12 +356,33 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         proe_season = grp.groupby("team", as_index=False)["proe"].mean()
         env = env.merge(proe_season, on="team", how="left")
 
-    # --- plays_est from pace ---
-    env["plays_est"] = (3600.0 / env["sec_per_play_neutral"].replace(0, np.nan)).fillna(0.0)
+    # --- Red-zone trip rate (first entries per game) ---
+    # define entry when yardline_100 <= 20 and previous play for same team+game was >20 or different game/team
+    yline_use = yline
+    env["rz_rate"] = 0.0
+    if yline_use:
+        df = pbp.loc[pbp[posteam].notna() & pbp[yline_use].notna(), [game_id, posteam, yline_use]].copy()
+        df = df.rename(columns={posteam:"team"})
+        # sort by game sequence if available
+        order_cols = [c for c in ["game_id","old_game_id","drive","play_id","index"] if c in pbp.columns]
+        if order_cols:
+            df = pbp.loc[df.index, [game_id, posteam, yline_use] + order_cols].copy().rename(columns={posteam:"team"})
+            df = df.sort_values(order_cols)
+        df["is_rz"] = _safe_num(df[yline_use]) <= 20
+        # first entry boolean using shift within team+game
+        df["prev_is_rz"] = df.groupby([game_id, "team"])["is_rz"].shift(1).fillna(False)
+        df["rz_entry"] = df["is_rz"] & (~df["prev_is_rz"])
+        trips = df.groupby([game_id, "team"], as_index=False)["rz_entry"].sum().rename(columns={"rz_entry":"rz_trips"})
+        # games played per team
+        games = df.groupby(["team", game_id], as_index=False).size().groupby("team", as_index=False).size().rename(columns={"size":"games"})
+        rz = trips.groupby("team", as_index=False)["rz_trips"].mean().rename(columns={"rz_trips":"rz_trips_per_game"})
+        env = env.merge(rz, on="team", how="left")
+        env["rz_rate"] = env["rz_trips_per_game"].fillna(0.0)
 
-    # keep only required columns (others used for intermediate calcs)
-    # NOTE: light/heavy box rates filled elsewhere (addons/box_counts or left NaN)
-    # NOTE: rz_rate stays NaN unless you want me to derive red-zone trips here (easy add).
+    # --- plays_est from pace ---
+    env["plays_est"] = (3600.0 / env["sec_per_play_neutral"].replace(0, np.nan)).fillna(0.0) if "sec_per_play_neutral" in env.columns else 0.0
+
+    # final assemble
     out = pd.DataFrame({
         "team": env["team"],
         "def_pressure_rate_z": 0.0,  # no free NGS; keep z of 0
@@ -335,7 +395,7 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         "ay_per_att_z": _z(env["ay_per_att"].fillna(0.0)),
         "plays_est": env["plays_est"].fillna(0.0),
         "proe": env["proe"].fillna(0.0),
-        "rz_rate": 0.0,
+        "rz_rate": env["rz_rate"].fillna(0.0),
     })
 
     return out, proe_week
@@ -355,7 +415,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame) -> pd.DataFrame:
         ])
 
     posteam = _pick(["posteam","offense_team"], pbp) or "posteam"
-    defteam = _pick(["defteam","defense_team"], pbp) or "defteam"
     weekcol = _pick(["week","game_week"], pbp) or "week"
 
     # Names (nflfastR cols)
@@ -364,16 +423,14 @@ def derive_player_from_pbp(pbp: pd.DataFrame) -> pd.DataFrame:
     pass_name = _pick(["passer_player_name","passer","passer_name","qb_player_name"], pbp)
 
     yards_gained = _pick(["yards_gained","yards"], pbp)
-    air = _pick(["air_yards"], pbp)
+    rush_yards_col = yards_gained  # on rush plays, yards_gained is rush yards
     yac = _pick(["yards_after_catch","yac"], pbp)
-    ytg = _pick(["ydstogo","yards_to_go","yds_to_go"], pbp)
     yline= _pick(["yardline_100","yardline"], pbp)
 
     pass_flag = _bool_col(pbp, ["pass","is_pass","qb_dropback"])
     rush_flag = _bool_col(pbp, ["rush","is_rush"]) & ~pass_flag
 
     # --- team totals for shares ---
-    # Targets: each pass w/ identified receiver counts as a target
     targ_df = pd.DataFrame()
     if rec_name:
         targ_df = (pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name]]
@@ -382,14 +439,13 @@ def derive_player_from_pbp(pbp: pd.DataFrame) -> pd.DataFrame:
                       .rename(columns={posteam:"team", rec_name:"player"}))
 
     team_tgts = targ_df.groupby("team", as_index=False)["tgt"].sum() if _ok(targ_df) else pd.DataFrame(columns=["team","tgt"])
-    # Rushes
+
     rush_df = pd.DataFrame()
     if rush_name:
         rush_df = (pbp.loc[rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name]]
                       .assign(rush=1)
                       .groupby([posteam, rush_name], as_index=False)["rush"].sum()
                       .rename(columns={posteam:"team", rush_name:"player"}))
-
     team_rush = rush_df.groupby("team", as_index=False)["rush"].sum() if _ok(rush_df) else pd.DataFrame(columns=["team","rush"])
 
     # --- red-zone shares (yardline_100 <= 20) ---
@@ -413,7 +469,7 @@ def derive_player_from_pbp(pbp: pd.DataFrame) -> pd.DataFrame:
                         .rename(columns={posteam:"team", rush_name:"player"}))
     team_rz_car = rz_car_df.groupby("team", as_index=False)["rz_car"].sum() if _ok(rz_car_df) else pd.DataFrame(columns=["team","rz_car"])
 
-    # --- efficiency proxies ---
+    # --- efficiency: receiving yards, YAC; rushing yards for YPC ---
     rec_yds_df = pd.DataFrame()
     if rec_name and yards_gained:
         rec_yds_df = (pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name, yards_gained]]
@@ -424,17 +480,22 @@ def derive_player_from_pbp(pbp: pd.DataFrame) -> pd.DataFrame:
         yac_df = (pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name, yac]]
                      .groupby([posteam, rec_name], as_index=False)[yac].sum()
                      .rename(columns={posteam:"team", rec_name:"player", yac:"yac_sum"}))
+    rush_yds_df = pd.DataFrame()
+    if rush_name and rush_yards_col:
+        rush_yds_df = (pbp.loc[rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name, rush_yards_col]]
+                          .groupby([posteam, rush_name], as_index=False)[rush_yards_col].sum()
+                          .rename(columns={posteam:"team", rush_name:"player", rush_yards_col:"rush_yards"}))
 
     # merge per-player frame
     pf = pd.DataFrame(columns=["player","team"])
-    for base in [targ_df, rush_df, rz_tgt_df, rz_car_df, rec_yds_df, yac_df]:
+    for base in [targ_df, rush_df, rz_tgt_df, rz_car_df, rec_yds_df, yac_df, rush_yds_df]:
         if _ok(base):
             pf = pf.merge(base, on=["team","player"], how="outer") if _ok(pf) else base.copy()
     if not _ok(pf):
-        pf = pd.DataFrame(columns=["player","team","tgt","rush","rz_tgt","rz_car","rec_yards","yac_sum"])
+        pf = pd.DataFrame(columns=["player","team","tgt","rush","rz_tgt","rz_car","rec_yards","yac_sum","rush_yards"])
 
     # fill NaNs
-    for c in ["tgt","rush","rz_tgt","rz_car","rec_yards","yac_sum"]:
+    for c in ["tgt","rush","rz_tgt","rz_car","rec_yards","yac_sum","rush_yards"]:
         if c not in pf.columns: pf[c] = 0.0
         pf[c] = _safe_num(pf[c]).fillna(0.0)
 
@@ -448,9 +509,8 @@ def derive_player_from_pbp(pbp: pd.DataFrame) -> pd.DataFrame:
 
     # ypt / ypc / yprr_proxy
     pf["ypt"] = pf["rec_yards"] / pf["tgt"].replace(0, np.nan)
-    pf["ypc"] = 0.0  # need rush yards; if available, compute like yds/rush
-    # we don't have routes in free data; proxy yprr with ypt for stability
-    pf["yprr_proxy"] = pf["ypt"]
+    pf["ypc"] = pf["rush_yards"] / pf["rush"].replace(0, np.nan)
+    pf["yprr_proxy"] = pf["ypt"]  # stable proxy without routes
 
     # QB YPA (by passer)
     qb = pd.DataFrame(columns=["player","team","qb_ypa"])
@@ -503,7 +563,7 @@ def compose_team_form(season: int, cache: Dict[str, pd.DataFrame]) -> Tuple[pd.D
         tf_der["light_box_rate_z"] = _z(tf_der["def_light_box_rate"].fillna(0.0))
         tf_der["heavy_box_rate_z"] = _z(tf_der["def_heavy_box_rate"].fillna(0.0))
 
-    # prefer addon PROE season if present (otherwise use derived)
+    # prefer addon PROE season if present (otherwise derived)
     if _ok(proe) and {"team","proe"} <= set(proe.columns):
         p = proe.groupby("team", as_index=False)["proe"].mean()
         tf_der = tf_der.drop(columns=["proe"], errors="ignore").merge(p, on="team", how="left")
