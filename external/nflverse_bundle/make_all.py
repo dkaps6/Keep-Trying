@@ -61,6 +61,7 @@ nflverse = _import_or_none("scripts.providers.nflverse")
 msf  = _import_or_none("scripts.providers.msf")
 apis = _import_or_none("scripts.providers.apisports")
 gsis = _import_or_none("scripts.providers.nflgsis")
+espn = _import_or_none("scripts.providers.espn_pbp")
 
 # ----------------------------
 # IO helpers
@@ -161,6 +162,7 @@ FALLBACKS: Dict[str, List] = {
     ],
     "pbp": [
         (lambda s: nflverse.pbp(s)) if nflverse else None,
+        (lambda s: espn.pbp(s)) if espn else None,   # <— add this
     ],
     "team_stats_week": [
         (lambda s: nflverse.team_stats_week(s)) if nflverse else None,
