@@ -430,7 +430,20 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         env["rz_rate"] = env["rz_trips_per_game"].fillna(0.0)
 
     # --- plays_est from pace ---
-    env["plays_est"] = (3600.0 / env["sec_per_play_neutral"].replace(0, np.nan)).fillna(0.0) if "sec_per_play_neutral" in env.columns else 0.0
+    env["plays_est"] = (
+        3600.0 / env["sec_per_play_neutral"].replace(0, np.nan)
+    ).fillna(0.0) if "sec_per_play_neutral" in env.columns else 0.0
+
+    # SAFETY: make sure these columns exist even if upstream bins/inputs were missing
+    for col, default in [
+        ("sec_per_play_neutral", np.nan),
+        ("pace", np.nan),
+        ("ay_per_att", np.nan),
+        ("proe", 0.0),
+        ("rz_rate", 0.0),
+    ]:
+        if col not in env.columns:
+            env[col] = default
 
     # final assemble
     out = pd.DataFrame({
