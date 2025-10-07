@@ -189,4 +189,80 @@ def compose_player_form(out_root: Path, season: int) -> None:
 
     # ensure exact order
     out_df = out_df[EXPECT]
-    out =
+    out = out_root / "metrics" / "player_form.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(out, index=False)
+    print(f"[compose] wrote {out} ({len(out_df)} rows)")
+
+
+# ---------- optional (paid) sources — safe stubs that won’t crash ----------
+def fetch_msf(season: int) -> None:
+    key = os.getenv("MSF_KEY")
+    pw  = os.getenv("MSF_PASSWORD")
+    if not (key and pw):
+        print("[msf] secrets not set; skipping")
+        return
+    # TODO: add your MSF pulls here (this is a safe placeholder to avoid failing CI)
+    print("[msf] creds found; add your MSF endpoints here when ready.")
+
+def fetch_gsis(season: int) -> None:
+    u = os.getenv("NFLGSIS_USERNAME")
+    p = os.getenv("NFLGSIS_PASSWORD")
+    if not (u and p):
+        print("[gsis] secrets not set; skipping")
+        return
+    # TODO: add your GSIS client here (partner access only)
+    print("[gsis] creds found; add GSIS client calls here if you have partner endpoints.")
+
+def fetch_odds(season: int) -> None:
+    k = os.getenv("THE_ODDS_API_KEY")
+    if not k:
+        print("[odds] THE_ODDS_API_KEY not set; skipping")
+        return
+    # TODO: add odds pulls if you want them staged in outputs/
+    print("[odds] key found; add Odds API calls here if needed.")
+
+
+# ---------- main ----------
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--season", type=int, default=2025)
+    ap.add_argument("--skip-pbp", action="store_true")
+    ap.add_argument("--out", default="outputs")
+    args = ap.parse_args()
+
+    repo = Path(__file__).resolve().parent
+    out_root = repo / args.out
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # 1) free data fetcher (nflverse + addons)
+    fetcher = repo / "nflverse_csv_fetcher" / "make_all.py"
+    if fetcher.exists():
+        cmd = [sys.executable, str(fetcher), "--season", str(args.season)]
+        if args.skip_pbp:
+            cmd.append("--skip-pbp")
+        run(cmd)
+    else:
+        print("::warning ::nflverse_csv_fetcher/make_all.py missing — skipping free fetch.")
+
+    # 2) optional paid feeds (no-ops if secrets are absent)
+    fetch_msf(args.season)
+    fetch_gsis(args.season)
+    fetch_odds(args.season)
+
+    # 3) compose model-ready CSVs
+    compose_team_form(out_root, args.season)
+    compose_player_form(out_root, args.season)
+
+    # 4) sanity check
+    must = [out_root / "metrics" / "team_form.csv", out_root / "metrics" / "player_form.csv"]
+    for m in must:
+        if not exists_nonempty(m):
+            print(f"::error ::missing or empty {m}")
+            return 1
+    print("✅ make_all completed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
