@@ -162,7 +162,10 @@ FALLBACKS: Dict[str, List] = {
     ],
     "pbp": [
         (lambda s: nflverse.pbp(s)) if nflverse else None,
-        (lambda s: espn.pbp(s)) if espn else None,   # <— add this
+        (lambda s: msf.pbp(s)) if msf and hasattr(msf, "pbp") else None,
+        (lambda s: apis.pbp(s)) if apis and hasattr(apis, "pbp") else None,
+        (lambda s: gsis.pbp(s)) if gsis and hasattr(gsis, "pbp") else None,
+        (lambda s: espn.pbp(s)) if espn else None,
     ],
     "team_stats_week": [
         (lambda s: nflverse.team_stats_week(s)) if nflverse else None,
@@ -228,11 +231,87 @@ def _compute_proxy(key: str, season: int, cache: Dict[str, pd.DataFrame]) -> Opt
             return wk.groupby(keys, as_index=False).sum(numeric_only=True)
     return None
 
+def _normalize_pbp_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Map various provider column names → the canonical names our composers expect."""
+    if not _ok(df):
+        return df
+
+    col_map = {}
+    # teams
+    if "posteam" not in df.columns:
+        for a in ["offense_team", "team_offense", "poss_team", "possession_team"]:
+            if a in df.columns: col_map[a] = "posteam"; break
+    if "defteam" not in df.columns:
+        for a in ["defense_team", "team_defense"]:
+            if a in df.columns: col_map[a] = "defteam"; break
+
+    # ids / week
+    if "game_id" not in df.columns:
+        for a in ["old_game_id","gameid","gameId","gameId_str","game_identifier"]:
+            if a in df.columns: col_map[a] = "game_id"; break
+    if "week" not in df.columns:
+        for a in ["game_week","week_number","wk"]:
+            if a in df.columns: col_map[a] = "week"; break
+
+    # receiver/rusher/passer
+    if "receiver_player_name" not in df.columns:
+        for a in ["receiver","receiver_name","receiver_full_name","target_player_name"]:
+            if a in df.columns: col_map[a] = "receiver_player_name"; break
+    if "rusher_player_name" not in df.columns:
+        for a in ["rusher","rusher_name","runner_name"]:
+            if a in df.columns: col_map[a] = "rusher_player_name"; break
+    if "passer_player_name" not in df.columns:
+        for a in ["passer","passer_name","qb_player_name","quarterback_name"]:
+            if a in df.columns: col_map[a] = "passer_player_name"; break
+
+    # yardline / yards
+    if "yardline_100" not in df.columns:
+        for a in ["yardline","yard_line_100","yards_to_goal","yardlineNumber"]:
+            if a in df.columns: col_map[a] = "yardline_100"; break
+    if "yards_gained" not in df.columns and "yards" in df.columns:
+        col_map["yards"] = "yards_gained"
+
+    # pass/rush flags
+    if "pass" not in df.columns:
+        for a in ["is_pass","qb_dropback","pass_flag"]:
+            if a in df.columns: col_map[a] = "pass"; break
+    if "rush" not in df.columns:
+        for a in ["is_rush","rush_flag"]:
+            if a in df.columns: col_map[a] = "rush"; break
+
+    if col_map:
+        df = df.rename(columns=col_map)
+
+    # types
+    for c in ["week","down"]:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    for c in ["yardline_100","yards_gained","ydstogo"]:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Best-effort defteam inference if missing: "other team in same game"
+    if "defteam" in df.columns and df["defteam"].isna().all() and {"game_id","posteam"}.issubset(df.columns):
+        # per game, collect teams appeared as offense; infer defense as the other team seen in that game
+        try:
+            teams_by_game = (df[["game_id","posteam"]].dropna().groupby("game_id")["posteam"]
+                              .agg(lambda x: list(pd.unique(x))).to_dict())
+            def infer_def(row):
+                plist = teams_by_game.get(row["game_id"], [])
+                if len(plist) == 2 and row["posteam"] in plist:
+                    return plist[1] if plist[0] == row["posteam"] else plist[0]
+                return np.nan
+            df["defteam"] = df.apply(infer_def, axis=1)
+        except Exception:
+            pass
+
+    return df
+
 def resolve_table(key: str, season: int, cache: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     # 1) primary
     for p in PRIMARY_PATHS.get(key, lambda s: [])(season):
         df = _read_csv(p)
-        if _ok(df): return df
+        if _ok(df):
+            return _normalize_pbp_cols(df) if key == "pbp" else df
+
     # 2) providers
     for fn in FALLBACKS.get(key, []):
         if fn is None: continue
@@ -240,10 +319,14 @@ def resolve_table(key: str, season: int, cache: Dict[str, pd.DataFrame]) -> pd.D
             df = fn(season)
         except Exception:
             df = None
-        if _ok(df): return df
+        if _ok(df):
+            return _normalize_pbp_cols(df) if key == "pbp" else df
+
     # 3) computed
     df = _compute_proxy(key, season, cache)
-    if _ok(df): return df
+    if _ok(df):
+        return _normalize_pbp_cols(df) if key == "pbp" else df
+
     return pd.DataFrame()
 
 # ============================
