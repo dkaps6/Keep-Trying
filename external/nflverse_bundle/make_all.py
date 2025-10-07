@@ -75,6 +75,14 @@ def _z(col: pd.Series) -> pd.Series:
     except Exception:
         return pd.Series(np.zeros(len(col)), index=col.index)
 
+# ---------- safe resolver (avoid DataFrame truthiness in `or`) ----------
+def _get_or_resolve(name: str, season: int, cache: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    df = cache.get(name, None)
+    if df is None or (hasattr(df, "empty") and df.empty):
+        df = resolve_table(name, season, cache)
+    cache[name] = df
+    return df
+
 # ---------- primary bundle paths ----------
 PRIMARY_PATHS: Dict[str, Callable[[int], List[Path]]] = {
     "schedules":        lambda s: [OUT_BUNDLE / "schedules" / f"schedules_{s}.csv"],
@@ -89,7 +97,12 @@ PRIMARY_PATHS: Dict[str, Callable[[int], List[Path]]] = {
     "rosters_weekly":   lambda s: [OUT_BUNDLE / "rosters_weekly" / f"rosters_weekly_{s}.csv"],
     "participation":    lambda s: [OUT_BUNDLE / "participation" / f"participation_{s}.csv"],
     "pbp":              lambda s: [OUT_BUNDLE / "pbp" / f"pbp_{s}_{s}.csv"],
-    "proe_week":        lambda s: [ROOT / "outputs" / "proe" / f"proe_week_{s}.csv"],
+    # expanded to find your artifacts:
+    "proe_week":        lambda s: [
+        ROOT / "outputs" / "proe" / f"proe_week_{s}.csv",
+        ROOT / "outputs" / "proe" / f"team_proe_week_{s}.csv",
+        ROOT / "outputs" / "proe" / f"team_proe_season_{s}.csv",
+    ],
     "box_week":         lambda s: [OUT_BUNDLE / "box_counts" / f"defense_box_rates_week_{s}.csv"],
 }
 
@@ -309,7 +322,7 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         df["ytg_b"]    = pd.cut(_safe_num(df[ytg]), bins=[-1,2,6,10,25,99], labels=["short","med","long","xlong","hail"])
         df["yl_b"]     = pd.cut(_safe_num(df[yline]), bins=[-1,20,50,80,110], labels=["rz","mid","deep","backed"])
 
-        # add score bins, quarter bins, time bins (more expressive expectation)
+        # add score bins, quarter bins, time bins
         if score_diff in pbp.columns:
             df2 = pbp.loc[df.index, [score_diff]].copy()
             df["score_b"] = pd.cut(_safe_num(df2[score_diff]), bins=[-99,-14,-7,-3,3,7,14,99],
@@ -325,12 +338,11 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
 
         if time:
             tmap = pd.Series(_safe_num(pbp[time]), index=pbp.index).reindex(df.index)
-            # bins emphasize late/early situations
             df["time_b"] = pd.cut(tmap, bins=[-1,120,600,1200,1800,3600], labels=["last2m","late","Q3","Q2","Q1"])
         else:
             df["time_b"] = "Q1"
 
-        # league baseline expectation across multi-dim buckets
+        # league baseline expectation
         exp_keys = ["down_b","ytg_b","yl_b","score_b","qtr_b","time_b"]
         exp_tbl = (
             df.groupby(exp_keys, as_index=False)["is_pass"]
@@ -338,7 +350,6 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
               .rename(columns={"is_pass":"exp_pass"})
         )
         df = df.merge(exp_tbl, on=exp_keys, how="left")
-        # if a rare bucket is NaN (no league history), back off to simpler (down_b, ytg_b, yl_b)
         if df["exp_pass"].isna().any():
             exp_tbl_simple = (
                 df.groupby(["down_b","ytg_b","yl_b"], as_index=False)["is_pass"]
@@ -357,23 +368,19 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         env = env.merge(proe_season, on="team", how="left")
 
     # --- Red-zone trip rate (first entries per game) ---
-    # define entry when yardline_100 <= 20 and previous play for same team+game was >20 or different game/team
     yline_use = yline
     env["rz_rate"] = 0.0
     if yline_use:
         df = pbp.loc[pbp[posteam].notna() & pbp[yline_use].notna(), [game_id, posteam, yline_use]].copy()
         df = df.rename(columns={posteam:"team"})
-        # sort by game sequence if available
         order_cols = [c for c in ["game_id","old_game_id","drive","play_id","index"] if c in pbp.columns]
         if order_cols:
             df = pbp.loc[df.index, [game_id, posteam, yline_use] + order_cols].copy().rename(columns={posteam:"team"})
             df = df.sort_values(order_cols)
         df["is_rz"] = _safe_num(df[yline_use]) <= 20
-        # first entry boolean using shift within team+game
         df["prev_is_rz"] = df.groupby([game_id, "team"])["is_rz"].shift(1).fillna(False)
         df["rz_entry"] = df["is_rz"] & (~df["prev_is_rz"])
         trips = df.groupby([game_id, "team"], as_index=False)["rz_entry"].sum().rename(columns={"rz_entry":"rz_trips"})
-        # games played per team
         games = df.groupby(["team", game_id], as_index=False).size().groupby("team", as_index=False).size().rename(columns={"size":"games"})
         rz = trips.groupby("team", as_index=False)["rz_trips"].mean().rename(columns={"rz_trips":"rz_trips_per_game"})
         env = env.merge(rz, on="team", how="left")
@@ -385,7 +392,7 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
     # final assemble
     out = pd.DataFrame({
         "team": env["team"],
-        "def_pressure_rate_z": 0.0,  # no free NGS; keep z of 0
+        "def_pressure_rate_z": 0.0,
         "def_pass_epa_z": _z(env["def_pass_epa"].fillna(0.0)),
         "def_rush_epa_z": _z(env["def_rush_epa"].fillna(0.0)),
         "def_sack_rate_z": 0.0,
@@ -534,7 +541,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame) -> pd.DataFrame:
         if c not in pf.columns: pf[c] = np.nan
         pf2[c] = pf[c].astype(float)
 
-    # clean NaN -> 0 where appropriate
     for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]:
         pf2[c] = pf2[c].fillna(0.0)
 
@@ -549,12 +555,12 @@ def compose_team_form(season: int, cache: Dict[str, pd.DataFrame]) -> Tuple[pd.D
     Returns team_form and proe_week (for optional export)
     """
     # Resolve pbp early for derivations
-    pbp = cache.get("pbp") or resolve_table("pbp", season, cache); cache["pbp"] = pbp
+    pbp = _get_or_resolve("pbp", season, cache)
     tf_der, proe_week = derive_team_from_pbp(pbp)
 
     # Optional sources for box rates, etc.
-    box   = cache.get("box_week")        or resolve_table("box_week",        season, cache); cache["box_week"]        = box
-    proe  = cache.get("proe_week")       or resolve_table("proe_week",       season, cache); cache["proe_week"]       = proe
+    box   = _get_or_resolve("box_week", season, cache)
+    proe  = _get_or_resolve("proe_week", season, cache)
 
     # integrate box rates if present
     if _ok(box) and {"team","def_light_box_rate","def_heavy_box_rate"} <= set(box.columns):
@@ -581,13 +587,13 @@ def compose_team_form(season: int, cache: Dict[str, pd.DataFrame]) -> Tuple[pd.D
 
 def compose_player_form(season: int, cache: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     # Start from PBP-derived player form
-    pbp = cache.get("pbp") or resolve_table("pbp", season, cache); cache["pbp"] = pbp
+    pbp = _get_or_resolve("pbp", season, cache)
     pf = derive_player_from_pbp(pbp)
 
     # Merge optional addons
     roles = _read_csv(ROOT / "outputs" / "roles" / f"roles_{season}.csv")
     rbm   = _read_csv(ROOT / "outputs" / "rb_metrics" / f"rb_metrics_{season}.csv")
-    inj   = cache.get("injuries") or resolve_table("injuries", season, cache); cache["injuries"] = inj
+    inj   = _get_or_resolve("injuries", season, cache)
 
     if _ok(roles):
         # where roles provide position & overrides for shares, prefer them
@@ -681,7 +687,7 @@ def main() -> int:
     for s in seasons:
         print(f"[compose] season {s}")
         cache: Dict[str, pd.DataFrame] = {}
-        cache["pbp"] = resolve_table("pbp", s, cache)  # early for proxies
+        cache["pbp"] = _get_or_resolve("pbp", s, cache)  # early for proxies
 
         team_form, proe_week = compose_team_form(s, cache)
         player_form = compose_player_form(s, cache)
