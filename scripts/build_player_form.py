@@ -280,6 +280,20 @@ def build_player_form(season: int, history: str) -> pd.DataFrame:
     _, p = msf_tables(season)
     pf = _from_weekly(p)
     return pf
+        # 6) NFLGSIS (very best-effort)
+    try:
+        from .sources.nflgsis import login_session, list_games, team_player_tables as gsis_tables
+        s = login_session()
+        games = list_games(s)
+        if games:
+            _, p = gsis_tables(s, [g["id"] for g in games], limit=30)
+            pf = _from_weekly(p)  # re-use our weekly aggregator schema
+            if not pf.empty:
+                print("[build_player_form] ⚠️ Using NFLGSIS fallback for player shares")
+                return pf
+    except Exception as e:
+        warnings.warn(f"NFLGSIS player fallback failed: {type(e).__name__}: {e}")
+
 
 def main():
     ap = argparse.ArgumentParser()
