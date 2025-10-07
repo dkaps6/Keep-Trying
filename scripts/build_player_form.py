@@ -22,6 +22,25 @@ except Exception:
 from .sources.apisports import season_team_player_tables as apisports_tables
 from .sources.mysportsfeeds import season_team_player_tables as msf_tables
 
+# --- NFLGSIS import shim (works in GitHub Actions and local) ---
+import sys, os
+from pathlib import Path as _PathShim
+_REPO_ROOT = _PathShim(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(_REPO_ROOT / "scripts" / "sources"))
+try:
+    from scripts.sources.nflgsis import (
+        login_session, list_games, team_player_tables as gsis_team_player_tables
+    )
+except Exception:
+    try:
+        from nflgsis import (  # type: ignore
+            login_session, list_games, team_player_tables as gsis_team_player_tables
+        )
+    except Exception:
+        login_session = list_games = gsis_team_player_tables = None
+# --- end NFLGSIS shim ---
+
 # -------- ESPN helpers (shared with fetcher) --------
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
 ESPN_BOX = "https://site.api.espn.com/apis/v2/sports/football/nfl/boxscore"
@@ -160,7 +179,7 @@ def _from_pbp(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
     if cur.empty:
         return pd.DataFrame()
     cur["is_pass"] = (cur.get("pass", 0) == 1) if "pass" in cur.columns else cur.get("play_type","").astype(str).str.contains("pass", case=False, na=False)
-    cur["is_rush"] = (cur.get("rush", 0) == 1) if "rush" in cur.columns else cur.get("play_type","").astype(str).str.contains("rush", case=False, na=False)
+    cur["is_rush"] = (cur.get("rush", 0) == 1) if "rush" in cur.columns else cur.get("play_type","").astype(str).str.contains("rush|run", case=False, na=False)
     cur["is_rz"]   = (cur.get("yardline_100", 100) <= 20)
 
     rec = (cur[cur["is_pass"]]
@@ -259,44 +278,60 @@ def build_player_form(season: int, history: str) -> pd.DataFrame:
     pf  = _from_pbp(pbp, season)
     if not pf.empty:
         return pf
+
     # 2) Weekly (nflverse tables)
     wk = _load_weekly(season)
     pf = _from_weekly(wk)
     if not pf.empty:
         return pf
+
     # 3) ESPN
     print("[build_player_form] ⚠️ Using ESPN fallback for player shares/efficiency")
     pf = _espn_players_table(season)
     if not pf.empty:
         return pf
+
     # 4) API-SPORTS
     print("[build_player_form] ⚠️ Using API-SPORTS fallback for player shares")
     _, p = apisports_tables(season)
     pf = _from_weekly(p)  # schema-compatible aggregator
     if not pf.empty:
         return pf
+
     # 5) MySportsFeeds
     print("[build_player_form] ⚠️ Using MySportsFeeds fallback for player shares")
     _, p = msf_tables(season)
     pf = _from_weekly(p)
-    return pf
-        # 6) NFLGSIS (very best-effort)
-    # NFLGSIS import shim (package/script-safe)
+    if not pf.empty:
+        return pf
+
+    # 6) NFLGSIS (authenticated, best-effort)
     try:
-    from .sources.nflgsis import (
-        login_session, list_games, team_player_tables as gsis_team_player_tables
-    )
-    except Exception:
-    try:
-        from sources.nflgsis import (
-            login_session, list_games, team_player_tables as gsis_team_player_tables
-        )
-    except Exception:
-        import os, sys
-        sys.path.append(os.path.join(os.path.dirname(__file__), "sources"))
-        from nflgsis import (  # type: ignore
-            login_session, list_games, team_player_tables as gsis_team_player_tables
-        )
+        print("[build_player_form] ⚠️ Using NFLGSIS fallback for player shares/efficiency")
+        if login_session is not None:
+            s = login_session()
+            games = list_games(s)
+            if games:
+                game_ids = [g["id"] for g in games][:30]
+                _, p = gsis_team_player_tables(s, game_ids, limit=30)
+                # Map to weekly-like schema if needed
+                if "player_name" not in p.columns and "player" in p.columns:
+                    p = p.rename(columns={"player": "player_name"})
+                if "recent_team" not in p.columns and "team" in p.columns:
+                    p = p.rename(columns={"team": "recent_team"})
+                # Use the weekly aggregator shape
+                p = p.rename(columns={
+                    "player_name": "player",
+                    "recent_team": "team"
+                })
+                pf = _from_weekly(p) if "_from_weekly" in globals() else p
+                if pf is not None and not pf.empty:
+                    return pf
+    except Exception as e:
+        warnings.warn(f"NFLGSIS player fallback failed: {type(e).__name__}: {e}")
+
+    # If absolutely everything failed, return empty (downstream handles neutrals)
+    return pd.DataFrame()
 
 def main():
     ap = argparse.ArgumentParser()
@@ -312,3 +347,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
