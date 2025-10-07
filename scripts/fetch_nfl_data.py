@@ -1,9 +1,28 @@
 # scripts/fetch_nfl_data.py
 from __future__ import annotations
-import argparse, warnings, time, requests
+import argparse, warnings, time, requests, sys
 from pathlib import Path
 from typing import Iterable
 import pandas as pd
+
+# --- ensure pandas helper (handles Polars results from some libs) ---
+try:
+    import polars as _pl  # optional
+except Exception:
+    _pl = None
+
+def _to_pd(df):
+    if df is None:
+        return pd.DataFrame()
+    if _pl is not None and isinstance(df, _pl.DataFrame):
+        return df.to_pandas()
+    if hasattr(df, "to_pandas"):
+        try:
+            return df.to_pandas()
+        except Exception:
+            pass
+    return df
+# --- end helper ---
 
 # ---- Primary (nflverse) sources ----
 try:
@@ -73,7 +92,6 @@ from .sources.apisports import season_team_player_tables as apisports_tables
 from .sources.mysportsfeeds import season_team_player_tables as msf_tables
 
 # --- NFLGSIS import shim (works in GitHub Actions and local) ---
-import sys, os
 from pathlib import Path as _PathShim
 _REPO_ROOT = _PathShim(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
@@ -112,7 +130,8 @@ def _load_pbp(seasons: Iterable[int]) -> pd.DataFrame:
     if HAS_NFLREADPY:
         try:
             print(f"[fetch_nfl_data] USING PBP (nflreadpy) for {seasons}")
-            df = nrp.load_pbp(seasons=seasons)
+            df = nrp.load_pbp(seasons=seasons)  # may be Polars
+            df = _to_pd(df)
             if "season" not in df.columns and len(seasons) == 1:
                 df["season"] = seasons[0]
             return df
@@ -121,13 +140,15 @@ def _load_pbp(seasons: Iterable[int]) -> pd.DataFrame:
     if HAS_NFL_DATA_PY:
         try:
             print(f"[fetch_nfl_data] FALLBACK PBP (nfl_data_py) for {seasons}")
-            return nfl.import_pbp_data(seasons)
+            df = nfl.import_pbp_data(seasons)
+            return _to_pd(df)
         except Exception as e:
             warnings.warn(f"nfl_data_py.import_pbp_data failed: {type(e).__name__}: {e}")
     return pd.DataFrame()
 
 # ---------- team form builders ----------
 def _team_form_from_tables(team_df: pd.DataFrame) -> pd.DataFrame:
+    team_df = _to_pd(team_df)
     if team_df is None or team_df.empty:
         return pd.DataFrame()
     team = (team_df.groupby("team")
@@ -164,7 +185,7 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
     # Prefer true PBP if available
     cur = pd.DataFrame()
     if pbp_all is not None and not pbp_all.empty:
-        cur = pbp_all.copy()
+        cur = _to_pd(pbp_all).copy()
         if "season" in cur.columns:
             cur = cur[cur["season"] == current_season].copy()
 
@@ -269,6 +290,7 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
             if games:
                 gids = [g["id"] for g in games][:40]
                 team_df, _ = gsis_team_player_tables(s, gids, limit=40)
+                team_df = _to_pd(team_df)
                 if not team_df.empty:
                     print("[fetch_nfl_data] using NFLGSIS team table")
                     return _team_form_from_tables(team_df)
@@ -295,6 +317,9 @@ def main():
 
     pbp_hist = _load_pbp(hist)
     pbp_cur  = _load_pbp([args.season])
+
+    pbp_hist = _to_pd(pbp_hist)
+    pbp_cur  = _to_pd(pbp_cur)
     pbp_all  = pd.concat([pbp_hist, pbp_cur], ignore_index=True, sort=False)
 
     df = compute_team_form(pbp_all, args.season)
@@ -303,4 +328,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
