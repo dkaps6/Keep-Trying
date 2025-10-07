@@ -2,43 +2,113 @@
 from __future__ import annotations
 import argparse, warnings
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable
 import pandas as pd
 
-# Primaries (when available)
+# ---- Primary (nflverse) sources ----
 try:
     import nflreadpy as nrp
     HAS_NFLREADPY = True
 except Exception:
     HAS_NFLREADPY = False
+
 try:
     import nfl_data_py as nfl
     HAS_NFL_DATA_PY = True
 except Exception:
     HAS_NFL_DATA_PY = False
 
-# ESPN fallback (lightweight)
-from .build_player_form import _is_pass, _is_rush, _neutral_filter  # reuse helpers
-from .build_player_form import _espn_players_table  # used for player shares if needed
+# ---- Fallback sources ----
+# ESPN team-table builder (lightweight) – we implement locally here
+import time, requests
+ESPN_SCOREBOARD = "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
+ESPN_BOX = "https://site.api.espn.com/apis/v2/sports/football/nfl/boxscore"
 
-# New sources
+def _http_json(url: str, params: dict | None = None, tries: int = 3, backoff: float = 0.7):
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params or {}, timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 404:
+                return None
+        except Exception:
+            pass
+        time.sleep(backoff * (2**i))
+    return None
+
+def _espn_week_events(season: int, week: int) -> list[str]:
+    data = _http_json(ESPN_SCOREBOARD, params={"week": week, "seasontype": 2, "dates": season})
+    if not data:
+        return []
+    return [e.get("id") for e in data.get("events", []) if e.get("id")]
+
+def _espn_box(event_id: str):
+    return _http_json(ESPN_BOX, params={"event": event_id})
+
+def _espn_team_table(season: int) -> pd.DataFrame:
+    rows = []
+    for wk in range(1, 23):
+        evts = _espn_week_events(season, wk)
+        if not evts and wk > 3:
+            break
+        for eid in evts:
+            box = _espn_box(eid) or {}
+            for t in box.get("teams", []):
+                abbr = (t.get("team", {}) or {}).get("abbreviation") or (t.get("team", {}) or {}).get("displayName")
+                pass_att = 0.0; rush_att = 0.0
+                for grp in t.get("players", []):
+                    for pl in grp.get("athletes", []):
+                        for s in pl.get("stats", []):
+                            nm = (s.get("name") or "").lower()
+                            st = s.get("statistics") or {}
+                            if nm == "passing":
+                                pass_att += float(st.get("attempts") or 0)
+                            elif nm == "rushing":
+                                rush_att += float(st.get("attempts") or st.get("carries") or 0)
+                rows.append({
+                    "team": abbr,
+                    "pass_att": pass_att,
+                    "rush_att": rush_att,
+                    "plays": pass_att + rush_att,
+                    "event_id": eid
+                })
+            time.sleep(0.05)
+    return pd.DataFrame(rows)
+
+# API-SPORTS & MySportsFeeds fallbacks
 from .sources.apisports import season_team_player_tables as apisports_tables
 from .sources.mysportsfeeds import season_team_player_tables as msf_tables
 
-# -------------- nflverse loaders --------------
+
+# ---------- Local helpers (no cross-module imports) ----------
+def _is_pass(df: pd.DataFrame) -> pd.Series:
+    return (df.get("pass", 0) == 1) if "pass" in df.columns \
+        else df.get("play_type","").astype(str).str.contains("pass", case=False, na=False)
+
+def _is_rush(df: pd.DataFrame) -> pd.Series:
+    return (df.get("rush", 0) == 1) if "rush" in df.columns \
+        else df.get("play_type","").astype(str).str.contains("rush", case=False, na=False)
+
+def _neutral_filter(cur: pd.DataFrame) -> pd.Series:
+    qtr = cur.get("qtr", pd.Series([0]*len(cur)))
+    hs  = cur.get("half_seconds_remaining", pd.Series([0]*len(cur)))
+    ytg = cur.get("ydstogo", pd.Series([10]*len(cur)))
+    return (qtr.between(1,3)) | ((qtr==4) & (hs>300) & (ytg<=10))
+
+
+# ---------- nflverse loaders ----------
 def _load_pbp(seasons: Iterable[int]) -> pd.DataFrame:
     seasons = list(seasons)
-    # nflreadpy first
     if HAS_NFLREADPY:
         try:
             print(f"[fetch_nfl_data] USING PBP (nflreadpy) for {seasons}")
-            df = nrp.load_pbp(seasons=seasons)
+            df = nrp.load_pbp(seasons=seasons)  # v0.1.3
             if "season" not in df.columns and len(seasons) == 1:
                 df["season"] = seasons[0]
             return df
         except Exception as e:
             warnings.warn(f"nflreadpy.load_pbp failed: {type(e).__name__}: {e}")
-    # nfl_data_py fallback
     if HAS_NFL_DATA_PY:
         try:
             print(f"[fetch_nfl_data] FALLBACK PBP (nfl_data_py) for {seasons}")
@@ -47,7 +117,8 @@ def _load_pbp(seasons: Iterable[int]) -> pd.DataFrame:
             warnings.warn(f"nfl_data_py.import_pbp_data failed: {type(e).__name__}: {e}")
     return pd.DataFrame()
 
-# -------------- ESPN/alt team tables --------------
+
+# ---------- team form using best-available source ----------
 def _team_form_from_tables(team_df: pd.DataFrame) -> pd.DataFrame:
     if team_df is None or team_df.empty:
         return pd.DataFrame()
@@ -59,32 +130,21 @@ def _team_form_from_tables(team_df: pd.DataFrame) -> pd.DataFrame:
     team["pass_rate"] = team["pass_att"] / (team["pass_att"] + team["rush_att"]).replace({0: pd.NA})
     league_pass = float(team["pass_rate"].mean(skipna=True))
     team["proe"] = (team["pass_rate"] - league_pass).fillna(0.0)
-    team["rz_rate"] = 0.20
+    team["rz_rate"] = 0.20  # proxy until richer data available
+
     out = team[["team","plays_est","proe","rz_rate"]].copy()
-    for c in ["def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z","pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z"]:
+    for c in ["def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
+              "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z"]:
         out[c] = 0.0
+    out["opp_team"] = pd.NA
+    out["event_id"] = pd.NA
     return out[[
-        "team",
+        "team","opp_team","event_id",
         "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
         "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
         "plays_est","proe","rz_rate"
     ]]
 
-def _espn_team_table(season: int) -> pd.DataFrame:
-    # reuse ESPN player scrape to build team table if needed
-    from .build_player_form import _espn_week_events, _espn_box_players, _parse_box_to_rows
-    all_team = []
-    for wk in range(1, 23):
-        evts = _espn_week_events(season, wk)
-        if not evts and wk > 3:
-            break
-        for eid in evts:
-            tdf, _ = _parse_box_to_rows(eid, _espn_box_players(eid))
-            if not tdf.empty:
-                all_team.append(tdf)
-    return pd.concat(all_team, ignore_index=True) if all_team else pd.DataFrame()
-
-# -------------- main compute --------------
 def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFrame:
     cols = [
         "team","opp_team","event_id",
@@ -93,7 +153,7 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
         "plays_est","proe","rz_rate"
     ]
 
-    # If we have PBP for the current season, use it (best fidelity)
+    # If we have PBP for current season → use it
     cur = pd.DataFrame()
     if pbp_all is not None and not pbp_all.empty:
         cur = pbp_all.copy()
@@ -131,6 +191,7 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
         off = off.merge(games, on="team", how="left")
         off["plays_est"] = (off["plays"] / off["games"].clip(lower=1)).fillna(off["plays"])
 
+        # minimal defensive proxies (true PBP-derived EPA if columns exist)
         g_pass = (cur[cur["is_pass"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_pass_epa"}))
         g_rush = (cur[cur["is_rush"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_rush_epa"}))
         g_cnt  = (cur.groupby("defteam", as_index=False).size().rename(columns={"size":"def_plays"}))
@@ -155,17 +216,21 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
         team["ay_per_att_z"]      = 0.0
 
         out = team[[
-            "team",
-            "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
+            "team","def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
             "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
             "plays_est","proe","rz_rate"
         ]].copy()
         for c in ["plays_est","proe","rz_rate"]:
             out[c] = out[c].fillna(0.0)
         out["opp_team"] = pd.NA; out["event_id"] = pd.NA
-        return out
+        return out[[
+            "team","opp_team","event_id",
+            "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
+            "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
+            "plays_est","proe","rz_rate"
+        ]]
 
-    # No PBP: fallbacks ESPN -> API-SPORTS -> MSF
+    # No PBP → try ESPN, then API-SPORTS, then MSF
     espn_team = _espn_team_table(current_season)
     if not espn_team.empty:
         return _team_form_from_tables(espn_team)
@@ -178,8 +243,9 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
     if not msf_team.empty:
         return _team_form_from_tables(msf_team)
 
-    # last resort neutral
+    # last resort: empty (downstream will handle)
     return pd.DataFrame(columns=cols)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -189,6 +255,7 @@ def main():
     args = ap.parse_args()
 
     Path(args.write).parent.mkdir(parents=True, exist_ok=True)
+
     if "-" in args.history:
         lo, hi = [int(x) for x in args.history.split("-")]
         hist = list(range(lo, hi+1))
