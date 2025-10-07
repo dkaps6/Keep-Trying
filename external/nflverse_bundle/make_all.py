@@ -376,18 +376,36 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
     yline_use = yline
     env["rz_rate"] = 0.0
     if yline_use:
-        # start with the minimal columns we need
-        df = pbp.loc[
-            pbp[posteam].notna() & pbp[yline_use].notna(),
-            [game_id, posteam, yline_use]
-        ].copy().rename(columns={posteam: "team"})
+        # minimal columns we always need
+        base_cols = [game_id, posteam, yline_use]
 
-        # ensure a stable chronological order if these columns exist
-        order_cols = [c for c in ["game_id", "old_game_id", "drive", "play_id", "index"] if c in pbp.columns]
-        order_cols = list(dict.fromkeys(order_cols))  # de-dup to avoid "label is not unique"
+        df = (
+            pbp.loc[
+                pbp[posteam].notna() & pbp[yline_use].notna(),
+                base_cols
+            ]
+            .copy()
+            .rename(columns={posteam: "team"})
+        )
+
+        # build optional ordering cols, but avoid duplicating base columns
+        order_cols = [
+            c for c in ["game_id", "old_game_id", "drive", "play_id", "index"]
+            if c in pbp.columns and c not in base_cols
+        ]
+        # de-dup while preserving order (just in case)
+        order_cols = list(dict.fromkeys(order_cols))
+
         if order_cols:
-            # re-pull with the ordering columns then sort
-            df = pbp.loc[df.index, [game_id, posteam, yline_use] + order_cols].copy().rename(columns={posteam: "team"})
+            # rebuild with the ordering columns (no duplicates), then sort
+            df = (
+                pbp.loc[
+                    df.index,
+                    base_cols + order_cols
+                ]
+                .copy()
+                .rename(columns={posteam: "team"})
+            )
             df = df.sort_values(order_cols)
 
         # mark red-zone on each play
@@ -397,12 +415,16 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         df["rz_entry"] = df["is_rz"] & (~df["prev_is_rz"])
 
         # trips per game, then average across games
-        trips = (df.groupby([game_id, "team"], as_index=False)["rz_entry"]
-                   .sum()
-                   .rename(columns={"rz_entry": "rz_trips"}))
-        rz = (trips.groupby("team", as_index=False)["rz_trips"]
-                  .mean()
-                  .rename(columns={"rz_trips": "rz_trips_per_game"}))
+        trips = (
+            df.groupby([game_id, "team"], as_index=False)["rz_entry"]
+              .sum()
+              .rename(columns={"rz_entry": "rz_trips"})
+        )
+        rz = (
+            trips.groupby("team", as_index=False)["rz_trips"]
+                 .mean()
+                 .rename(columns={"rz_trips": "rz_trips_per_game"})
+        )
 
         env = env.merge(rz, on="team", how="left")
         env["rz_rate"] = env["rz_trips_per_game"].fillna(0.0)
