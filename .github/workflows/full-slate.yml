@@ -65,6 +65,66 @@ jobs:
           # >>> This is the extra line you asked about <<<
           pip install --upgrade pyarrow nflreadpy
 
+          jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install -r requirements.txt
+
+      #####################################################
+      #  ⬇⬇⬇  INSERT THE NEW STEPS HERE  ⬇⬇⬇
+      #####################################################
+
+      - name: Fetch free data + compose (nflverse + addons)
+        env:
+          THE_ODDS_API_KEY:   ${{ secrets.THE_ODDS_API_KEY }}
+          APISPORTS_KEY:      ${{ secrets.APISPORTS_KEY }}
+          MSF_KEY:            ${{ secrets.MSF_KEY }}
+          MSF_PASSWORD:       ${{ secrets.MSF_PASSWORD }}
+          NFLGSIS_USERNAME:   ${{ secrets.NFLGSIS_USERNAME }}
+          NFLGSIS_PASSWORD:   ${{ secrets.NFLGSIS_PASSWORD }}
+        run: |
+          . .venv/bin/activate
+          python make_all.py --season 2025
+
+      - name: Validate data pack outputs
+        run: |
+          . .venv/bin/activate
+          python scripts/validate_inputs.py
+
+      # (optional safety net)
+      - name: Build player_form (safe fallback)
+        run: |
+          . .venv/bin/activate
+          python scripts/build_player_form_safe.py --season 2025 --write data/player_form.csv || true
+
+      #####################################################
+      #  ⬆⬆⬆  END OF NEW INSERTS  ⬆⬆⬆
+      #####################################################
+
+      # everything below this line is your existing job:
+      - name: Run pricing engine
+        run: |
+          . .venv/bin/activate
+          python run_model.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-outputs
+          path: outputs/**
+
       - name: Check Odds API key present
         run: |
           python - <<'PY'
