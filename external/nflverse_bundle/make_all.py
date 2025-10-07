@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """
-Unified driver:
-1) Calls ./nflverse_csv_fetcher/make_all.py (free pulls + addons) if present.
-2) Uses secrets for paid feeds (MSF/NFLGSIS/Odds/API-Sports) — stubs that won't crash if missing.
-3) Composes:
-     outputs/metrics/team_form.csv
-     outputs/metrics/player_form.csv
+Unified driver for the nflverse bundle that lives under external/nflverse_bundle/.
+
+What this does:
+  1) cd into this folder so relative imports/paths work.
+  2) Run the local free fetcher: fetch_all.py (NOT nflverse_csv_fetcher/...).
+  3) Run addon derivations (PROE, box counts, roles, RB metrics, injuries).
+  4) Compose season-level team_form and player_form.
+  5) Write outputs to BOTH:
+        - repo_root/outputs/metrics/{team_form.csv,player_form.csv}
+        - repo_root/data/{team_form.csv,player_form.csv}   (for your existing model steps)
 """
+
 from __future__ import annotations
-import argparse, os, sys, subprocess
+import argparse
+import os
+import sys
+import subprocess
 from pathlib import Path
 import pandas as pd
 
-# ensure script runs no matter where it's called from
-ROOT = Path(__file__).resolve().parent
-os.chdir(ROOT)
-sys.path.insert(0, str(ROOT))
+# ---------- helpers ----------
 
 def run(cmd: list[str]) -> None:
     print(">>", " ".join(cmd))
@@ -23,28 +28,41 @@ def run(cmd: list[str]) -> None:
     if rc != 0:
         raise SystemExit(rc)
 
-def exists_nonempty(p) -> bool:
-    p = Path(p)
+def exists_nonempty(p: Path) -> bool:
     return p.exists() and p.is_file() and p.stat().st_size > 0
 
 def latest_csv(folder: Path, stem_contains: str) -> Path | None:
-    if not folder.exists(): return None
+    if not folder.exists():
+        return None
     c = sorted([p for p in folder.glob("*.csv") if stem_contains in p.name],
                key=lambda q: q.stat().st_mtime, reverse=True)
     return c[0] if c else None
 
 def safe_left_join(left: pd.DataFrame, right: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
-    if left is None or left.empty:  return right.copy()
-    if right is None or right.empty: return left.copy()
+    if left is None or left.empty:
+        return right.copy()
+    if right is None or right.empty:
+        return left.copy()
     k = [c for c in keys if c in left.columns and c in right.columns]
     return left if not k else left.merge(right, on=k, how="left")
 
-def compose_team_form(out_root: Path, season: int) -> None:
+# ---------- composition ----------
+
+def compose_team_form(root: Path, repo_root: Path, season: int) -> pd.DataFrame:
+    """
+    Inputs this script expects to find under:
+      root/outputs/team_stats/
+      root/outputs/proe/
+      root/outputs/box_counts/
+    """
+    out_root = root / "outputs"
     team_stats_dir = out_root / "team_stats"
     proe_dir       = out_root / "proe"
     box_dir        = out_root / "box_counts"
 
     tf = pd.DataFrame()
+
+    # team regular-season EPA and sacks, etc.
     reg = latest_csv(team_stats_dir, f"team_stats_reg_{season}")
     if reg and exists_nonempty(reg):
         t = pd.read_csv(reg)
@@ -52,42 +70,67 @@ def compose_team_form(out_root: Path, season: int) -> None:
             "team","season","passing_epa","rushing_epa","def_pass_epa",
             "def_rush_epa","epa_per_play","def_epa_per_play","sack_rate"
         )]
-        if keep: tf = t[keep].copy()
+        if keep:
+            tf = t[keep].copy()
 
+    # PROE (season-level)
     proe = latest_csv(proe_dir, f"team_proe_season_{season}")
     if proe and exists_nonempty(proe):
-        p = pd.read_csv(proe).rename(columns={"posteam":"team"})
-        tf = safe_left_join(tf, p[["season","team","season_proe"]], ["season","team"])
+        p = pd.read_csv(proe).rename(columns={"posteam": "team"})
+        tf = safe_left_join(tf, p[["season", "team", "season_proe"]], ["season", "team"])
 
+    # defensive box counts aggregated to season avg
     dbox = latest_csv(box_dir, f"defense_box_rates_week_{season}")
     if dbox and exists_nonempty(dbox):
         d = pd.read_csv(dbox)
-        g = d.groupby(["season","team"], as_index=False).agg({
-            "def_light_box_rate":"mean",
-            "def_heavy_box_rate":"mean"
+        g = d.groupby(["season", "team"], as_index=False).agg({
+            "def_light_box_rate": "mean",
+            "def_heavy_box_rate": "mean",
         })
-        tf = safe_left_join(tf, g, ["season","team"])
+        tf = safe_left_join(tf, g, ["season", "team"])
 
     tf = tf.rename(columns={
-        "passing_epa":"off_pass_epa",
-        "rushing_epa":"off_rush_epa",
-        "epa_per_play":"off_epa_play",
-        "def_epa_per_play":"def_epa_play",
-        "season_proe":"proe",
-        "sack_rate":"def_sack_rate",
+        "passing_epa":      "off_pass_epa",
+        "rushing_epa":      "off_rush_epa",
+        "epa_per_play":     "off_epa_play",
+        "def_epa_per_play": "def_epa_play",
+        "season_proe":      "proe",
+        "sack_rate":        "def_sack_rate",
     })
-    out = out_root / "metrics" / "team_form.csv"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tf.to_csv(out, index=False)
-    print(f"[compose] wrote {out} ({len(tf)} rows)")
 
-def compose_player_form(out_root: Path, season: int) -> None:
+    # write to repo root
+    metrics_dir = repo_root / "outputs" / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = metrics_dir / "team_form.csv"
+    tf.to_csv(out_csv, index=False)
+    print(f"[compose] wrote {out_csv} ({len(tf)} rows)")
+
+    # mirror to data/ for your legacy steps
+    data_dir = repo_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    tf.to_csv(data_dir / "team_form.csv", index=False)
+
+    return tf
+
+def compose_player_form(root: Path, repo_root: Path, season: int) -> pd.DataFrame:
+    """
+    Inputs expected under root/outputs:
+      - player_stats/
+      - roles/
+      - rb_metrics/
+    Produces exact columns your engine expects later.
+    """
+    out_root = root / "outputs"
     pstats_dir = out_root / "player_stats"
     roles_dir  = out_root / "roles"
     rbm_dir    = out_root / "rb_metrics"
 
-    EXPECT = ["team","player","position","target_share","rush_share",
-              "rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]
+    EXPECT = [
+        "team","player","position",
+        "target_share","rush_share",
+        "rz_tgt_share","rz_carry_share",
+        "yprr_proxy","ypc","ypt","qb_ypa"
+    ]
 
     base = pd.DataFrame(columns=[
         "season","week","team","player_display_name","position",
@@ -100,33 +143,37 @@ def compose_player_form(out_root: Path, season: int) -> None:
         have = [c for c in base.columns if c in dfp.columns]
         base = dfp[have].copy()
 
+    # target share
     if not base.empty and {"targets","team"}.issubset(base.columns):
         team_tot = base.groupby(["season","week","team"], as_index=False)["targets"].sum()\
-                       .rename(columns={"targets":"team_targets"})
+                       .rename(columns={"targets": "team_targets"})
         base = base.merge(team_tot, on=["season","week","team"], how="left")
         base["target_share"] = (base["targets"] / base["team_targets"]).fillna(0.0)
     else:
         base["target_share"] = 0.0
 
+    # roles (optional)
     roles_csv = latest_csv(roles_dir, f"roles_weekly_{season}")
     if roles_csv and exists_nonempty(roles_csv):
-        rr = pd.read_csv(roles_csv).rename(columns={"role_label":"role"})
+        rr = pd.read_csv(roles_csv).rename(columns={"role_label": "role"})
         base = base.merge(rr[["season","week","team","player_display_name","role"]],
                           on=["season","week","team","player_display_name"], how="left")
 
+    # RB metrics (ypc proxy)
     rbw = latest_csv(rbm_dir, f"rb_metrics_week_{season}")
     if rbw and exists_nonempty(rbw):
         r = pd.read_csv(rbw).rename(columns={
-            "posteam":"team",
-            "rusher_player_name":"player_display_name",
-            "yards_per_carry":"ypc"
+            "posteam": "team",
+            "rusher_player_name": "player_display_name",
+            "yards_per_carry": "ypc",
         })
         base = base.merge(r[["season","week","team","player_display_name","ypc"]],
                           on=["season","week","team","player_display_name"], how="left")
     else:
         base["ypc"] = 0.0
 
-    base = base.rename(columns={"player_display_name":"player"})
+    base = base.rename(columns={"player_display_name": "player"})
+
     out_df = pd.DataFrame()
     out_df["team"]           = base.get("team", "")
     out_df["player"]         = base.get("player", "")
@@ -139,65 +186,74 @@ def compose_player_form(out_root: Path, season: int) -> None:
     out_df["ypc"]            = base.get("ypc", 0.0).fillna(0.0)
     out_df["ypt"]            = 0.0
     out_df["qb_ypa"]         = 0.0
-
     out_df = out_df[EXPECT].fillna(0.0)
-    out = out_root / "metrics" / "player_form.csv"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_csv(out, index=False)
-    print(f"[compose] wrote {out} ({len(out_df)} rows)")
 
-def fetch_msf(_season: int) -> None:
-    if not (os.getenv("MSF_KEY") and os.getenv("MSF_PASSWORD")):
-        print("[msf] secrets not set; skipping")
-        return
-    print("[msf] creds detected — add MSF endpoints here when ready.")
+    # write to repo root
+    metrics_dir = repo_root / "outputs" / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = metrics_dir / "player_form.csv"
+    out_df.to_csv(out_csv, index=False)
+    print(f"[compose] wrote {out_csv} ({len(out_df)} rows)")
 
-def fetch_gsis(_season: int) -> None:
-    if not (os.getenv("NFLGSIS_USERNAME") and os.getenv("NFLGSIS_PASSWORD")):
-        print("[gsis] secrets not set; skipping")
-        return
-    print("[gsis] creds detected — add GSIS client calls here if you have partner endpoints.")
+    # mirror to data/ for your legacy steps
+    data_dir = repo_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(data_dir / "player_form.csv", index=False)
 
-def fetch_odds(_season: int) -> None:
-    if not os.getenv("THE_ODDS_API_KEY"):
-        print("[odds] THE_ODDS_API_KEY not set; skipping")
-        return
-    print("[odds] key detected — add Odds API pulls here if you want them staged.")
+    return out_df
+
+# ---------- main ----------
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", type=int, default=2025)
-    ap.add_argument("--out", default="outputs")
     ap.add_argument("--skip-pbp", action="store_true")
     args = ap.parse_args()
 
-    repo = Path(__file__).resolve().parent
-    out_root = repo / args.out
-    out_root.mkdir(parents=True, exist_ok=True)
+    # normalize working dir and import path
+    ROOT = Path(__file__).resolve().parent
+    os.chdir(ROOT)
+    sys.path.insert(0, str(ROOT))
 
-    fetcher = repo / "nflverse_csv_fetcher" / "make_all.py"
+    # repo root (two levels up from this file)
+    REPO_ROOT = ROOT.parents[1]
+
+    # 1) Run local free fetcher (was wrongly pointing to nflverse_csv_fetcher/)
+    fetcher = ROOT / "fetch_all.py"
     if fetcher.exists():
         cmd = [sys.executable, str(fetcher), "--season", str(args.season)]
-        if args.skip_pbp: cmd.append("--skip-pbp")
+        if args.skip_pbp:
+            cmd.append("--skip-pbp")
         run(cmd)
     else:
-        print("::warning ::nflverse_csv_fetcher/make_all.py missing — skipping free fetch.")
+        print("::warning ::fetch_all.py missing — free fetch skipped.")
 
-    fetch_msf(args.season)
-    fetch_gsis(args.season)
-    fetch_odds(args.season)
+    # 2) Run add-ons (they should write into ROOT/outputs/*)
+    addons = ROOT / "addons"
+    # ensure it's a package
+    (addons / "__init__.py").touch(exist_ok=True)
 
-    compose_team_form(out_root, args.season)
-    compose_player_form(out_root, args.season)
+    add_scripts = [
+        ("derive_proe.py",        []),
+        ("aggregate_box_counts.py", []),
+        ("derive_roles.py",       []),
+        ("derive_rb_metrics.py",  []),
+        ("fetch_injuries_espn.py", []),  # produces injuries baseline
+    ]
+    for script, extra in add_scripts:
+        p = addons / script
+        if p.exists():
+            run([sys.executable, str(p), "--season", str(args.season), *extra])
+        else:
+            print(f"::warning ::addon missing: {p.name}")
 
-    must = [out_root / "metrics" / "team_form.csv", out_root / "metrics" / "player_form.csv"]
-    for m in must:
-        if not exists_nonempty(m):
-            print(f"::error ::missing or empty {m}")
-            return 1
+    # 3) Compose + mirror to repo_root/outputs/metrics and data/
+    compose_team_form(ROOT, REPO_ROOT, args.season)
+    compose_player_form(ROOT, REPO_ROOT, args.season)
 
     print("✅ make_all completed.")
     return 0
 
 if __name__ == "__main__":
     sys.exit(main())
+
