@@ -1,67 +1,70 @@
 # scripts/volume.py
-# Volume estimator for player × market rows using team plays + PROE + player shares.
-
 from __future__ import annotations
 import pandas as pd
-from typing import Any
+from pathlib import Path
 
-DEF_PLAYS = 60.0    # conservative default team plays/gm
-DEF_PROE  = 0.00    # neutral pass rate over expectation
-DEF_RZ    = 0.20
-DEF_TGT   = 0.18
-DEF_RSH   = 0.40
-DEF_YPT   = 7.8
-DEF_YPC   = 4.2
-DEF_YPA   = 7.1
+TEAM_FORM_PREFERRED = Path("outputs/metrics/team_form.csv")
 
-def _f(x, default):
-    try:
-        if x is None: return float(default)
-        v = float(x)
-        if v != v: return float(default)  # NaN
-        return v
-    except Exception:
-        return float(default)
+def _safe_read(p: Path) -> pd.DataFrame:
+    if p.exists():
+        try:
+            return pd.read_csv(p)
+        except Exception:
+            pass
+    return pd.DataFrame()
 
-def _cap(x, lo, hi):
-    return max(lo, min(hi, x))
-
-def estimate_volume(row: pd.Series) -> float:
-    mk = str(row.get("market_internal", "")).strip()
-    plays = _f(row.get("plays_est"), DEF_PLAYS)
-    proe  = _f(row.get("proe"), DEF_PROE)
-    rz    = _f(row.get("rz_rate"), DEF_RZ)
-
-    base_pass = 0.56 + proe
-    pass_rate = _cap(base_pass, 0.40, 0.70)
-    rush_rate = 1.0 - pass_rate
-
-    tgt_share  = _f(row.get("target_share"), DEF_TGT)
-    rush_share = _f(row.get("rush_share"),  DEF_RSH)
-    ypt = _f(row.get("ypt"), DEF_YPT)
-
-    if mk in ("receptions","rec_yards","rush_rec_yards","pass_yards","pass_tds"):
-        attempts = plays * pass_rate
-        if mk == "receptions":
-            # receptions ~= targets * catch%; catch% proxy from ypt/9
-            catch_pct = _cap(ypt / 9.0, 0.45, 0.80)
-            return attempts * tgt_share * catch_pct
-        elif mk in ("rec_yards","rush_rec_yards"):
-            # volume here is "targets"; efficiency applied in pricing
-            return attempts * tgt_share
-        elif mk == "pass_yards":
-            return attempts
-        elif mk == "pass_tds":
-            return attempts * (rz * (0.30 + proe * 0.5))
-    elif mk in ("rush_att","rush_yards"):
-        carries = plays * rush_rate * rush_share
-        return max(carries, 0.0)
-    return 0.0
-
-def add_volume(df: pd.DataFrame) -> pd.DataFrame:
+def load_team_form() -> pd.DataFrame:
+    df = _safe_read(TEAM_FORM_PREFERRED)
     if df.empty:
-        df["volume_est"] = []
-        return df
-    df = df.copy()
-    df["volume_est"] = df.apply(estimate_volume, axis=1)
+        df = _safe_read(Path("data/team_form.csv"))
+    if df.empty:
+        return pd.DataFrame()
+    for c in ["team","pace","proe"]:
+        if c not in df.columns:
+            df[c] = 0.0 if c != "team" else ""
+    df["team"] = df["team"].astype(str).str.upper()
     return df
+
+def estimate_plays(team_form: pd.DataFrame) -> pd.DataFrame:
+    """
+    Conservative plays model:
+      plays_est = base_plays * (1 + 0.5*(Z(pace_off) + Z(pace_def))) if you supply both.
+    If only single 'pace' is present (bundle), we z-score within league and use that.
+    """
+    if team_form.empty:
+        return pd.DataFrame()
+
+    df = team_form.copy()
+    # Use 'pace' column directly; make a league z-score
+    if "pace" not in df.columns:
+        df["pace"] = 0.0
+    mean = float(df["pace"].mean()) if len(df) else 0.0
+    std  = float(df["pace"].std()) if len(df) else 1.0
+    if std == 0: std = 1.0
+    df["pace_z"] = (df["pace"] - mean) / std
+
+    base_plays = 120.0  # combined snaps per game baseline (both teams)
+    df["plays_est"] = base_plays * (1.0 + 0.5 * df["pace_z"].clip(-2, 2))
+
+    # PROE tilt guides pass/run split later; keep it attached
+    if "proe" not in df.columns:
+        df["proe"] = 0.0
+    return df[["team","pace","pace_z","proe","plays_est"]]
+
+def build_volume_features() -> pd.DataFrame:
+    team = load_team_form()
+    if team.empty:
+        return pd.DataFrame()
+    return estimate_plays(team)
+
+def main():
+    out = build_volume_features()
+    if out.empty:
+        print("[volume] No team form → no volume features.")
+        return
+    Path("data").mkdir(parents=True, exist_ok=True)
+    out.to_csv("data/volume_features.csv", index=False)
+    print(f"[volume] ✅ wrote {len(out)} rows → data/volume_features.csv")
+
+if __name__ == "__main__":
+    main()
