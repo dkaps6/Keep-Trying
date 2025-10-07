@@ -294,7 +294,6 @@ def build_player_form(season: int, history: str) -> pd.DataFrame:
     except Exception as e:
         warnings.warn(f"NFLGSIS player fallback failed: {type(e).__name__}: {e}")
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", type=int, required=True)
