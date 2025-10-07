@@ -152,73 +152,131 @@ def _agg_team(df: pd.DataFrame, side_col: str) -> pd.DataFrame:
 
 def compute_team_form(pbp: pd.DataFrame, current_season: int) -> pd.DataFrame:
     """
-    Compute offense & defense aggregates, then produce DEF z-scores per your model.
+    Compute offense & defense aggregates, then produce DEF z-scores and team volume features.
+    Safe when current season has no PBP yet (returns schema with rows for teams seen in history).
     """
-    if pbp.empty:
-        return pd.DataFrame(columns=[
-            "team","opp_team","event_id",
-            "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
-            "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
-            "plays_est","proe","rz_rate"
-        ])
-
-    # Offense perspective
-    off = _agg_team(pbp[pbp["season"] == current_season], "posteam")
-    # Defense perspective: compute offense stats vs each defense, then attribute to defense
-    opp = (pbp[pbp["season"] == current_season]
-           .assign(is_pass=_is_pass(pbp), is_rush=_is_rush(pbp))
-           .groupby("defteam")
-           .apply(lambda g: pd.Series({
-               "def_pass_epa": g.loc[g["is_pass"], "epa"].mean(skipna=True),
-               "def_rush_epa": g.loc[g["is_rush"], "epa"].mean(skipna=True),
-               "def_plays": len(g),
-               # proxies for boxes/pressure if you later wire true sources:
-               "light_box_rate": 0.0,
-               "heavy_box_rate": 0.0,
-               "def_sack_rate": 0.0,
-           }))
-           .reset_index()
-           .rename(columns={"defteam": "team"}))
-
-    # Join offense neutral pass rate to compute PROE:
-    # PROE ≈ team neutral pass rate - league neutral pass rate (current season)
-    league_neutral = float(off["neutral_pass_rate"].mean(skipna=True)) if not off.empty else float("nan")
-    off["proe"] = off["neutral_pass_rate"] - league_neutral
-
-    # Plays estimate per game (current season only)
-    # Rough: plays per game (all plays by offense / games played)
-    games = (pbp[pbp["season"] == current_season][["game_id", "posteam"]]
-             .drop_duplicates()
-             .groupby("posteam").size()
-             .rename("games")).reset_index().rename(columns={"posteam":"team"})
-    off = off.merge(games, on="team", how="left")
-    off["plays_est"] = (off["plays"] / off["games"].clip(lower=1)).fillna(off["plays"])
-    off["rz_rate"] = off["rz_rate"].fillna(0.0)
-
-    team = off.merge(opp, on="team", how="outer")
-
-    # z-scores for the columns your pricing consumes as *_z (defense-oriented):
-    def _z(col):
-        s = team[col]
-        return (s - s.mean(skipna=True)) / (s.std(ddof=0, skipna=True) or 1.0)
-
-    team["def_pass_epa_z"] = _z("def_pass_epa")
-    team["def_rush_epa_z"] = _z("def_rush_epa")
-    team["def_sack_rate_z"] = _z("def_sack_rate")       # currently zeros; placeholder until you wire real pressure
-    team["def_pressure_rate_z"] = 0.0                   # placeholder until wired
-    team["pace_z"] = _z("pace_sec_play")
-    team["light_box_rate_z"] = _z("light_box_rate")
-    team["heavy_box_rate_z"] = _z("heavy_box_rate")
-    team["ay_per_att_z"] = 0.0                          # placeholder (air yards/team)
-
-    # keep schema your pricing expects
-    keep = [
-        "team",
+    cols = [
+        "team","opp_team","event_id",
         "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
         "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
         "plays_est","proe","rz_rate"
     ]
-    out = team[keep].copy()
+    if pbp.empty:
+        return pd.DataFrame(columns=cols)
+
+    # ---- slice current season; if empty, we will still emit rows (using teams seen in history) ----
+    cur = pbp[pbp["season"] == current_season].copy()
+    if cur.empty:
+        # Build a team list from the most recent season present in pbp
+        most_recent = int(pbp["season"].max())
+        teams = sorted(set(pbp[pbp["season"] == most_recent]["posteam"].dropna()))
+        out = pd.DataFrame({"team": teams})
+        # neutral defaults so downstream code keeps working
+        for c in ["def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
+                  "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
+                  "plays_est","proe","rz_rate"]:
+            out[c] = 0.0
+        out["opp_team"] = pd.NA
+        out["event_id"] = pd.NA
+        return out[cols]
+
+    # flags
+    cur["is_pass"] = _is_pass(cur)
+    cur["is_rush"] = _is_rush(cur)
+    cur["is_rz"]   = (cur.get("yardline_100", 100) <= 20)
+
+    # ---------- OFFENSE (by posteam) ----------
+    off = (cur
+           .groupby("posteam", as_index=False)
+           .agg(
+               plays=("posteam", "size"),
+               pass_plays=("is_pass", "sum"),
+               rush_plays=("is_rush", "sum"),
+               epa_mean=("epa", "mean"),
+               epa_pass=("epa", lambda s: cur.loc[s.index & cur["is_pass"], "epa"].mean()),
+               epa_rush=("epa", lambda s: cur.loc[s.index & cur["is_rush"], "epa"].mean()),
+               rz_rate=("is_rz", "mean"),
+           )
+           .rename(columns={"posteam": "team"}))
+
+    # neutral filter for PROE
+    neutral_mask = _neutral_filter(cur)
+    league_neutral = float(
+        (cur.loc[neutral_mask, "is_pass"].mean())
+        if neutral_mask.any() else 0.56
+    )
+    team_neutral = (cur.loc[neutral_mask]
+                      .groupby("posteam")["is_pass"].mean()
+                      .rename("neutral_pass_rate")).reset_index().rename(columns={"posteam":"team"})
+    off = off.merge(team_neutral, on="team", how="left")
+    off["neutral_pass_rate"] = off["neutral_pass_rate"].fillna(league_neutral)
+    off["proe"] = off["neutral_pass_rate"] - league_neutral
+
+    # Pace & plays per game estimate
+    # (median time between plays as a crude pace proxy)
+    d = cur.sort_values(["game_id", "game_seconds_remaining"]).copy()
+    d["dt"] = d.groupby("game_id")["game_seconds_remaining"].diff(-1).abs()
+    pace_sec = d.groupby("posteam")["dt"].median().rename("pace_sec_play").reset_index().rename(columns={"posteam":"team"})
+    off = off.merge(pace_sec, on="team", how="left")
+
+    games = (cur[["game_id","posteam"]].drop_duplicates()
+             .groupby("posteam").size().rename("games")
+             ).reset_index().rename(columns={"posteam":"team"})
+    off = off.merge(games, on="team", how="left")
+    off["plays_est"] = (off["plays"] / off["games"].clip(lower=1)).fillna(off["plays"])
+
+    # ---------- DEFENSE (by defteam) ----------
+    # Avoid the reset_index/duplicate-column bug: build with as_index=False + separate pass/rush means
+    g_pass = (cur[cur["is_pass"]]
+              .groupby("defteam", as_index=False)["epa"]
+              .mean().rename(columns={"epa":"def_pass_epa"}))
+    g_rush = (cur[cur["is_rush"]]
+              .groupby("defteam", as_index=False)["epa"]
+              .mean().rename(columns={"epa":"def_rush_epa"}))
+    g_count = (cur.groupby("defteam", as_index=False)
+               .size().rename(columns={"size":"def_plays"}))
+
+    opp = g_count.merge(g_pass, on="defteam", how="left").merge(g_rush, on="defteam", how="left")
+    # placeholders; wire real sources later
+    opp["light_box_rate"] = 0.0
+    opp["heavy_box_rate"] = 0.0
+    opp["def_sack_rate"]  = 0.0
+    opp = opp.rename(columns={"defteam": "team"})
+
+    # ---------- Combine + Z-scores ----------
+    team = off.merge(opp, on="team", how="outer")
+
+    def _z(name):
+        s = team[name].astype(float)
+        mu = s.mean(skipna=True)
+        sd = s.std(ddof=0, skipna=True)
+        if sd == 0 or pd.isna(sd):
+            return s*0.0
+        return (s - mu) / sd
+
+    team["def_pass_epa_z"]    = _z("def_pass_epa")
+    team["def_rush_epa_z"]    = _z("def_rush_epa")
+    team["def_sack_rate_z"]   = _z("def_sack_rate")
+    team["def_pressure_rate_z"]= 0.0
+    team["pace_z"]            = _z("pace_sec_play")
+    team["light_box_rate_z"]  = _z("light_box_rate")
+    team["heavy_box_rate_z"]  = _z("heavy_box_rate")
+    team["ay_per_att_z"]      = 0.0
+
+    # keep schema your pricing expects
+    out = team[[
+        "team",
+        "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
+        "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
+        "plays_est","proe","rz_rate"
+    ]].copy()
+
+    # fill any missing numerics with 0 so downstream joins don’t break
+    for c in ["plays_est","proe","rz_rate"]:
+        if c not in out.columns:
+            out[c] = 0.0
+        out[c] = out[c].fillna(0.0)
+
     return out
 
 def main():
