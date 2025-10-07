@@ -1,214 +1,397 @@
 #!/usr/bin/env python3
 """
-Fetch nflverse data via nflreadpy and write CSVs.
+Fetch all (nflverse bundle) — version-tolerant
+
+- Works with recent nflreadpy/nfl_data_py where `file_type` is no longer accepted.
+- Gracefully skips datasets if a loader isn't available in your installed version.
+- Writes CSVs under external/nflverse_bundle/outputs/<dataset_group>/...
+
+Usage:
+  python external/nflverse_bundle/fetch_all.py --season 2025
+  python external/nflverse_bundle/fetch_all.py --start 2019 --end 2025
+  python external/nflverse_bundle/fetch_all.py --seasons 2019,2020,2021
+  python external/nflverse_bundle/fetch_all.py --skip-pbp
 """
+
 from __future__ import annotations
+
 import argparse
+import sys
 import os
-from typing import Iterable, List
+from pathlib import Path
+from typing import Iterable, List, Dict, Any, Callable, Optional
 
-# nflreadpy uses Polars under the hood
-import polars as pl
-import nflreadpy as nfl
+import pandas as pd
 
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+# ------------------------------------------------------------------------------
+# Imports: prefer nflreadpy, fall back to nfl_data_py if needed
+# ------------------------------------------------------------------------------
+nfl = None  # type: ignore
+_load_source = "unknown"
 
-def write_csv(df: "pl.DataFrame", path: str) -> None:
-    if df is None or (hasattr(df, "height") and df.height == 0):
+try:
+    import nflreadpy as nfl  # modern wrapper
+    _load_source = "nflreadpy"
+except Exception:
+    try:
+        import nfl_data_py as nfl  # older lib
+        _load_source = "nfl_data_py"
+    except Exception:
+        nfl = None  # type: ignore
+
+
+# ------------------------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------------------------
+
+def safe_mkdir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def write_csv(df: Optional[pd.DataFrame], out_path: Path) -> None:
+    """Write df to CSV (or create a 0-row file with headers if df is None/empty)."""
+    safe_mkdir(out_path.parent)
+    if df is None:
+        # create an empty file (no headers) so downstream validators can flag it
+        out_path.write_text("")
+        print(f"[write] empty → {out_path}")
         return
-    # ensure parent exists
-    ensure_dir(os.path.dirname(path))
-    df.write_csv(path)
+    try:
+        if df.empty:
+            # write header if present, so pandas can read columns later
+            df.head(0).to_csv(out_path, index=False)
+            print(f"[write] 0 rows (headers only) → {out_path}")
+        else:
+            df.to_csv(out_path, index=False)
+            print(f"[write] {len(df):,} rows → {out_path}")
+    except Exception as e:
+        print(f"[write] failed {out_path.name}: {e}")
+        out_path.write_text("")
 
-def seasons_from_args(vals: List[str]) -> List[int]:
-    out: List[int] = []
-    for v in vals:
-        out.append(int(v))
-    return out
 
-def save_team_stats(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "team_stats")
-    ensure_dir(base)
-    for level, suffix in [("week","week"), ("reg","reg"), ("post","post")]:
+def safe_load(func: Callable[..., pd.DataFrame], **kwargs) -> Optional[pd.DataFrame]:
+    """
+    Try with file_type=csv for old versions, fallback to no file_type for new versions.
+    Returns a DataFrame or None (on failure).
+    """
+    try:
+        # some very old versions expect file_type
+        return func(**kwargs, file_type="csv")
+    except TypeError:
+        # modern versions don't accept file_type
         try:
-            df = nfl.load_team_stats(seasons=seasons, summary_level=level, file_type="csv")
-            write_csv(df, os.path.join(base, f"team_stats_{suffix}_{'-'.join(map(str,seasons))}.csv"))
+            kwargs.pop("file_type", None)
+            return func(**kwargs)
         except Exception as e:
-            print(f"[team_stats/{level}] skipped: {e}")
-
-def save_player_stats(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "player_stats")
-    ensure_dir(base)
-    for level, suffix in [("week","week"), ("reg","reg"), ("post","post")]:
-        try:
-            df = nfl.load_player_stats(seasons=seasons, summary_level=level, file_type="csv")
-            write_csv(df, os.path.join(base, f"player_stats_{suffix}_{'-'.join(map(str,seasons))}.csv"))
-        except Exception as e:
-            print(f"[player_stats/{level}] skipped: {e}")
-
-def save_nextgen(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "nextgen")
-    ensure_dir(base)
-    for stat_type in ["passing","receiving","rushing"]:
-        try:
-            df = nfl.load_nextgen_stats(seasons=seasons, stat_type=stat_type, file_type="csv")
-            write_csv(df, os.path.join(base, f"nextgen_{stat_type}_{'-'.join(map(str,seasons))}.csv"))
-        except Exception as e:
-            print(f"[nextgen/{stat_type}] skipped: {e}")
-
-def save_ftn_charting(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "ftn_charting")
-    ensure_dir(base)
-    try:
-        df = nfl.load_ftn_charting(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"ftn_charting_{'-'.join(map(str,seasons))}.csv"))
+            print(f"[load] {getattr(func, '__name__', 'callable')} failed: {e}")
+            return None
     except Exception as e:
-        print(f"[ftn_charting] skipped: {e}")
+        print(f"[load] {getattr(func, '__name__', 'callable')} failed: {e}")
+        return None
 
-def save_injuries(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "injuries")
-    ensure_dir(base)
-    try:
-        df = nfl.load_injuries(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"injuries_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[injuries] skipped: {e}")
 
-def save_depth_charts(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "depth_charts")
-    ensure_dir(base)
-    try:
-        df = nfl.load_depth_charts(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"depth_charts_weekly_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[depth_charts] skipped: {e}")
+def try_call(module: Any, name: str) -> Optional[Callable[..., pd.DataFrame]]:
+    """Return a callable if it exists on the module else None."""
+    if module is None:
+        return None
+    fn = getattr(module, name, None)
+    if callable(fn):
+        return fn
+    return None
 
-def save_snap_counts(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "snap_counts")
-    ensure_dir(base)
-    try:
-        df = nfl.load_snap_counts(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"snap_counts_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[snap_counts] skipped: {e}")
 
-def save_rosters(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "rosters")
-    ensure_dir(base)
-    try:
-        df = nfl.load_rosters(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"rosters_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[rosters] skipped: {e}")
-    try:
-        dfw = nfl.load_rosters_weekly(seasons=seasons, file_type="csv")
-        write_csv(dfw, os.path.join(base, f"rosters_weekly_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[rosters_weekly] skipped: {e}")
+def seasons_from_args(args) -> List[int]:
+    if args.seasons:
+        return [int(s.strip()) for s in args.seasons.split(",") if s.strip()]
+    if args.start and args.end:
+        return list(range(int(args.start), int(args.end) + 1))
+    return [int(args.season)]
 
-def save_schedules(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "schedules")
-    ensure_dir(base)
-    try:
-        df = nfl.load_schedules(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"schedules_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[schedules] skipped: {e}")
 
-def save_pfr_advstats(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "pfr_advstats")
-    ensure_dir(base)
-    try:
-        df = nfl.load_pfr_advstats(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"pfr_advstats_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[pfr_advstats] skipped: {e}")
+# ------------------------------------------------------------------------------
+# Fetch groups
+# ------------------------------------------------------------------------------
 
-def save_espn_qbr(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "espn_qbr")
-    ensure_dir(base)
-    try:
-        df = nfl.load_espn_qbr(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"espn_qbr_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[espn_qbr] skipped: {e}")
+def fetch_team_stats(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "team_stats"
+    safe_mkdir(outdir)
 
-def save_participation(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "participation")
-    ensure_dir(base)
-    try:
-        df = nfl.load_participation(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"participation_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[participation] skipped: {e}")
+    for scope, fname in [
+        ("week", "team_stats_week_{season}.csv"),
+        ("reg",  "team_stats_reg_{season}.csv"),
+        ("post", "team_stats_post_{season}.csv"),
+    ]:
+        fn = try_call(nfl, "load_team_stats")
+        if fn is None:
+            print(f"[team_stats/{scope}] skipped: loader not available in {_load_source}")
+            continue
+        for season in seasons:
+            try:
+                df = safe_load(fn, seasons=[season], scope=scope)
+                write_csv(df, outdir / fname.format(season=season))
+            except TypeError as te:
+                # older API may not support scope kw; try without it
+                print(f"[team_stats/{scope}] retry without scope: {te}")
+                df = safe_load(fn, seasons=[season])
+                write_csv(df, outdir / fname.format(season=season))
 
-def save_officials(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "officials")
-    ensure_dir(base)
-    try:
-        df = nfl.load_officials(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"officials_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[officials] skipped: {e}")
 
-def save_trades(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "trades")
-    ensure_dir(base)
-    try:
-        df = nfl.load_trades(seasons=seasons, file_type="csv")
-        write_csv(df, os.path.join(base, f"trades_{'-'.join(map(str,seasons))}.csv"))
-    except Exception as e:
-        print(f"[trades] skipped: {e}")
+def fetch_player_stats(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "player_stats"
+    safe_mkdir(outdir)
 
-def save_pbp(seasons: List[int], outdir: str) -> None:
-    base = os.path.join(outdir, "pbp")
-    ensure_dir(base)
+    for scope, fname in [
+        ("week", "player_stats_week_{season}.csv"),
+        ("reg",  "player_stats_reg_{season}.csv"),
+        ("post", "player_stats_post_{season}.csv"),
+    ]:
+        fn = try_call(nfl, "load_player_stats")
+        if fn is None:
+            print(f"[player_stats/{scope}] skipped: loader not available in {_load_source}")
+            continue
+        for season in seasons:
+            try:
+                df = safe_load(fn, seasons=[season], scope=scope)
+                write_csv(df, outdir / fname.format(season=season))
+            except TypeError as te:
+                print(f"[player_stats/{scope}] retry without scope: {te}")
+                df = safe_load(fn, seasons=[season])
+                write_csv(df, outdir / fname.format(season=season))
+
+
+def fetch_nextgen(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "nextgen"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_nextgen_stats")
+    if fn is None:
+        print(f"[nextgen/*] skipped: loader not available in {_load_source}")
+        return
+
+    # Some newer libs want stat_type, others have separate functions. We try stat_type first.
+    for stat_type, fname in [
+        ("passing",   "nextgen_passing_{season}.csv"),
+        ("receiving", "nextgen_receiving_{season}.csv"),
+        ("rushing",   "nextgen_rushing_{season}.csv"),
+    ]:
+        for season in seasons:
+            try:
+                df = safe_load(fn, seasons=[season], stat_type=stat_type)
+                write_csv(df, outdir / fname.format(season=season))
+            except TypeError as te:
+                print(f"[nextgen/{stat_type}] retry without stat_type: {te}")
+                df = safe_load(fn, seasons=[season])
+                write_csv(df, outdir / fname.format(season=season))
+
+
+def fetch_depth_charts(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "depth_charts"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_depth_charts")
+    if fn is None:
+        print(f"[depth_charts] skipped: loader not available in {_load_source}")
+        return
+    for season in seasons:
+        df = safe_load(fn, seasons=[season])
+        write_csv(df, outdir / f"depth_charts_{season}.csv")
+
+
+def fetch_snap_counts(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "snap_counts"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_snap_counts")
+    if fn is None:
+        print(f"[snap_counts] skipped: loader not available in {_load_source}")
+        return
+    for season in seasons:
+        df = safe_load(fn, seasons=[season])
+        write_csv(df, outdir / f"snap_counts_{season}.csv")
+
+
+def fetch_rosters(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "rosters"
+    safe_mkdir(outdir)
+
+    fn = try_call(nfl, "load_rosters")
+    if fn is None:
+        print(f"[rosters] skipped: loader not available in {_load_source}")
+    else:
+        for season in seasons:
+            df = safe_load(fn, seasons=[season])
+            write_csv(df, outdir / f"rosters_{season}.csv")
+
+    fn_weekly = try_call(nfl, "load_rosters_weekly")
+    if fn_weekly is None:
+        print(f"[rosters_weekly] skipped: loader not available in {_load_source}")
+    else:
+        outdir_w = root / "outputs" / "rosters_weekly"
+        safe_mkdir(outdir_w)
+        for season in seasons:
+            df = safe_load(fn_weekly, seasons=[season])
+            write_csv(df, outdir_w / f"rosters_weekly_{season}.csv")
+
+
+def fetch_schedules(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "schedules"
+    safe_mkdir(outdir)
+    # different libs name it differently
+    fn = (try_call(nfl, "load_schedules")
+          or try_call(nfl, "import_schedules"))
+    if fn is None:
+        print(f"[schedules] skipped: loader not available in {_load_source}")
+        return
+    for season in seasons:
+        df = safe_load(fn, seasons=[season])
+        write_csv(df, outdir / f"schedules_{season}.csv")
+
+
+def fetch_pfr_advstats(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "pfr_advstats"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_pfr_advstats")
+    if fn is None:
+        print(f"[pfr_advstats] skipped: loader not available in {_load_source}")
+        return
+    for season in seasons:
+        df = safe_load(fn, seasons=[season])
+        write_csv(df, outdir / f"pfr_advstats_{season}.csv")
+
+
+def fetch_espn_qbr(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "espn_qbr"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_espn_qbr")
+    if fn is None:
+        print(f"[espn_qbr] skipped: loader not available in {_load_source}")
+        return
+    for season in seasons:
+        df = safe_load(fn, seasons=[season])
+        write_csv(df, outdir / f"espn_qbr_{season}.csv")
+
+
+def fetch_participation(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "participation"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_participation")
+    if fn is None:
+        print(f"[participation] skipped: loader not available in {_load_source}")
+        return
+    for season in seasons:
+        df = safe_load(fn, seasons=[season])
+        write_csv(df, outdir / f"participation_{season}.csv")
+
+
+def fetch_officials(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "officials"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_officials")
+    if fn is None:
+        print(f"[officials] skipped: loader not available in {_load_source}")
+        return
+    for season in seasons:
+        df = safe_load(fn, seasons=[season])
+        write_csv(df, outdir / f"officials_{season}.csv")
+
+
+def fetch_trades(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "trades"
+    safe_mkdir(outdir)
+    # Some versions want year, some want seasons
+    fn = try_call(nfl, "load_trades") or try_call(nfl, "import_transactions")
+    if fn is None:
+        print(f"[trades] skipped: loader not available in {_load_source}")
+        return
     for season in seasons:
         try:
-            df = nfl.load_pbp(seasons=[season], file_type="csv")
-            write_csv(df, os.path.join(base, f"pbp_{season}.csv"))
-        except Exception as e:
-            print(f"[pbp/{season}] skipped: {e}")
+            df = safe_load(fn, seasons=[season])
+        except TypeError:
+            df = safe_load(fn, year=season)
+        write_csv(df, outdir / f"trades_{season}.csv")
 
-def main():
-    ap = argparse.ArgumentParser(description="Fetch nflverse datasets to CSV via nflreadpy")
-    ap.add_argument("--season", nargs="+", default=["2025"], help="Season(s) to fetch (e.g., 2025 or 2024 2025)")
-    ap.add_argument("--out", default="outputs", help="Output directory")
-    ap.add_argument("--file-type", default="csv", choices=["csv","parquet","rds","qs"], help="Preferred file type to request upstream (we still write CSV)")
-    ap.add_argument("--skip-pbp", action="store_true", help="Skip play-by-play (large files)")
+
+def fetch_pbp(root: Path, seasons: List[int], enabled: bool) -> None:
+    if not enabled:
+        print("[pbp] skipped by flag --skip-pbp")
+        return
+    outdir = root / "outputs" / "pbp"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_pbp") or try_call(nfl, "import_pbp")
+    if fn is None:
+        print(f"[pbp] skipped: loader not available in {_load_source}")
+        return
+    # Many versions accept a list for seasons
+    df = safe_load(fn, seasons=seasons)
+    write_csv(df, outdir / f"pbp_{min(seasons)}_{max(seasons)}.csv")
+
+
+def fetch_ftn_charting(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "ftn_charting"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_ftn_charting")
+    if fn is None:
+        print(f"[ftn_charting] skipped: loader not available in {_load_source}")
+        return
+    for season in seasons:
+        df = safe_load(fn, seasons=[season])
+        write_csv(df, outdir / f"ftn_charting_{season}.csv")
+
+
+def fetch_injuries(root: Path, seasons: List[int]) -> None:
+    outdir = root / "outputs" / "injuries"
+    safe_mkdir(outdir)
+    fn = try_call(nfl, "load_injuries")
+    if fn is None:
+        print(f"[injuries] skipped: loader not available in {_load_source}")
+        return
+    for season in seasons:
+        df = safe_load(fn, seasons=[season])
+        write_csv(df, outdir / f"injuries_{season}.csv")
+
+
+# ------------------------------------------------------------------------------
+# Orchestration
+# ------------------------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--season", type=int, default=2025, help="Single season (if start/end/seasons not provided)")
+    ap.add_argument("--start", type=int, default=None, help="Start season (inclusive)")
+    ap.add_argument("--end", type=int, default=None, help="End season (inclusive)")
+    ap.add_argument("--seasons", type=str, default=None, help="Comma-separated seasons (e.g. 2019,2020,2021)")
+    ap.add_argument("--skip-pbp", action="store_true", help="Skip play-by-play fetch (big file)")
     args = ap.parse_args()
 
-    seasons = seasons_from_args(args.season)
-    outdir = args.out
-    ensure_dir(outdir)
+    ROOT = Path(__file__).resolve().parent
+    os.chdir(ROOT)
 
-    # Team / player aggregates
-    save_team_stats(seasons, outdir)
-    save_player_stats(seasons, outdir)
+    if nfl is None:
+        print("::error ::Neither nflreadpy nor nfl_data_py could be imported. Install one in requirements.txt")
+        return 2
 
-    # NGS & FTN
-    save_nextgen(seasons, outdir)
-    save_ftn_charting(seasons, outdir)
+    seasons = seasons_from_args(args)
+    print(f"[env] loader={_load_source}, seasons={seasons}")
 
-    # Roster / injuries / depth / snaps / schedules
-    save_injuries(seasons, outdir)
-    save_depth_charts(seasons, outdir)
-    save_snap_counts(seasons, outdir)
-    save_rosters(seasons, outdir)
-    save_schedules(seasons, outdir)
+    try:
+        fetch_team_stats(ROOT, seasons)
+        fetch_player_stats(ROOT, seasons)
+        fetch_nextgen(ROOT, seasons)
+        fetch_depth_charts(ROOT, seasons)
+        fetch_snap_counts(ROOT, seasons)
+        fetch_rosters(ROOT, seasons)
+        fetch_schedules(ROOT, seasons)
+        fetch_pfr_advstats(ROOT, seasons)
+        fetch_espn_qbr(ROOT, seasons)
+        fetch_participation(ROOT, seasons)
+        fetch_officials(ROOT, seasons)
+        fetch_trades(ROOT, seasons)
+        fetch_pbp(ROOT, seasons, enabled=(not args.skip_pbp))
+        fetch_ftn_charting(ROOT, seasons)
+        fetch_injuries(ROOT, seasons)
+        print("✅ Done. CSVs saved under: outputs")
+        return 0
+    except Exception as e:
+        print(f"::error ::fetch_all failed: {e}")
+        return 1
 
-    # Advanced summaries
-    save_pfr_advstats(seasons, outdir)
-    save_espn_qbr(seasons, outdir)
-    save_participation(seasons, outdir)
-    save_officials(seasons, outdir)
-    save_trades(seasons, outdir)
-
-    if not args.skip_pbp:
-        save_pbp(seasons, outdir)
-
-    print(f"✅ Done. CSVs saved under: {outdir}")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
