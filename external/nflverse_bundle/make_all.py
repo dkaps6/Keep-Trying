@@ -151,14 +151,14 @@ FALLBACKS: Dict[str, List] = {
     "schedules": [
         (lambda s: nflverse.schedules(s)) if nflverse else None,
         (lambda s: msf.schedules(s)) if msf and hasattr(msf, "schedules") else None,
-        (lambda s: apis.schedules(s)) if apis else None,
-        (lambda s: gsis.schedules(s)) if gsis else None,
+        (lambda s: apis.schedules(s)) if apis and hasattr(apis, "schedules") else None,
+        (lambda s: gsis.schedules(s)) if gsis and hasattr(gsis, "schedules") else None,
     ],
     "injuries": [
         (lambda s: nflverse.injuries(s)) if nflverse and hasattr(nflverse, "injuries") else None,
-        (lambda s: msf.injuries(s)) if msf else None,
-        (lambda s: apis.injuries(s)) if apis else None,
-        (lambda s: gsis.injuries(s)) if gsis else None,
+        (lambda s: msf.injuries(s)) if msf and hasattr(msf, "injuries") else None,
+        (lambda s: apis.injuries(s)) if apis and hasattr(apis, "injuries") else None,
+        (lambda s: gsis.injuries(s)) if gsis and hasattr(gsis, "injuries") else None,
     ],
     "pbp": [
         (lambda s: nflverse.pbp(s)) if nflverse else None,
@@ -168,40 +168,54 @@ FALLBACKS: Dict[str, List] = {
         (lambda s: espn.pbp(s)) if espn else None,
     ],
     "team_stats_week": [
-        (lambda s: nflverse.team_stats_week(s)) if nflverse else None,
-        (lambda s: msf.team_stats_week(s)) if msf else None,
+        (lambda s: nflverse.team_stats_week(s)) if nflverse and hasattr(nflverse, "team_stats_week") else None,
+        (lambda s: msf.team_stats_week(s)) if msf and hasattr(msf, "team_stats_week") else None,
+        (lambda s: apis.team_stats_week(s)) if apis and hasattr(apis, "team_stats_week") else None,
+        (lambda s: gsis.team_stats_week(s)) if gsis and hasattr(gsis, "team_stats_week") else None,
     ],
     "team_stats_reg": [
-        (lambda s: nflverse.team_stats_reg(s)) if nflverse else None,
-        (lambda s: msf.team_stats_reg(s)) if msf else None,
+        (lambda s: nflverse.team_stats_reg(s)) if nflverse and hasattr(nflverse, "team_stats_reg") else None,
+        (lambda s: msf.team_stats_reg(s)) if msf and hasattr(msf, "team_stats_reg") else None,
+        (lambda s: apis.team_stats_reg(s)) if apis and hasattr(apis, "team_stats_reg") else None,
+        (lambda s: gsis.team_stats_reg(s)) if gsis and hasattr(gsis, "team_stats_reg") else None,
     ],
     "player_stats_week": [
-        (lambda s: nflverse.player_stats_week(s)) if nflverse else None,
-        (lambda s: msf.player_stats_week(s)) if msf else None,
+        (lambda s: nflverse.player_stats_week(s)) if nflverse and hasattr(nflverse, "player_stats_week") else None,
+        (lambda s: msf.player_stats_week(s)) if msf and hasattr(msf, "player_stats_week") else None,
+        (lambda s: apis.player_stats_week(s)) if apis and hasattr(apis, "player_stats_week") else None,
+        (lambda s: gsis.player_stats_week(s)) if gsis and hasattr(gsis, "player_stats_week") else None,
     ],
     "player_stats_reg": [
-        (lambda s: nflverse.player_stats_reg(s)) if nflverse else None,
-        (lambda s: msf.player_stats_reg(s)) if msf else None,
+        (lambda s: nflverse.player_stats_reg(s)) if nflverse and hasattr(nflverse, "player_stats_reg") else None,
+        (lambda s: msf.player_stats_reg(s)) if msf and hasattr(msf, "player_stats_reg") else None,
+        (lambda s: apis.player_stats_reg(s)) if apis and hasattr(apis, "player_stats_reg") else None,
+        (lambda s: gsis.player_stats_reg(s)) if gsis and hasattr(gsis, "player_stats_reg") else None,
     ],
     "rosters": [
-        (lambda s: nflverse.rosters(s)) if nflverse else None,
+        (lambda s: nflverse.rosters(s)) if nflverse and hasattr(nflverse, "rosters") else None,
         (lambda s: msf.rosters(s)) if msf and hasattr(msf, "rosters") else None,
+        (lambda s: apis.rosters(s)) if apis and hasattr(apis, "rosters") else None,
+        (lambda s: gsis.rosters(s)) if gsis and hasattr(gsis, "rosters") else None,
     ],
     "rosters_weekly": [
-        (lambda s: nflverse.rosters_weekly(s)) if nflverse else None,
+        (lambda s: nflverse.rosters_weekly(s)) if nflverse and hasattr(nflverse, "rosters_weekly") else None,
+        (lambda s: msf.rosters_weekly(s)) if msf and hasattr(msf, "rosters_weekly") else None,
     ],
     "depth_charts": [
-        (lambda s: nflverse.depth_charts(s)) if nflverse else None,
-        (lambda s: gsis.depth_charts(s)) if gsis else None,
+        (lambda s: nflverse.depth_charts(s)) if nflverse and hasattr(nflverse, "depth_charts") else None,
+        (lambda s: msf.depth_charts(s)) if msf and hasattr(msf, "depth_charts") else None,
+        (lambda s: gsis.depth_charts(s)) if gsis and hasattr(gsis, "depth_charts") else None,
     ],
     "snap_counts": [
-        (lambda s: nflverse.snap_counts(s)) if nflverse else None,
+        (lambda s: nflverse.snap_counts(s)) if nflverse and hasattr(nflverse, "snap_counts") else None,
+        (lambda s: msf.snap_counts(s)) if msf and hasattr(msf, "snap_counts") else None,
     ],
     "participation": [
-        (lambda s: nflverse.participation(s)) if nflverse else None,
+        (lambda s: nflverse.participation(s)) if nflverse and hasattr(nflverse, "participation") else None,
+        (lambda s: msf.participation(s)) if msf and hasattr(msf, "participation") else None,
     ],
-    "proe_week": [],
-    "box_week":  [],
+    "proe_week": [],  # derived addon (kept empty; you already have an addon for this)
+    "box_week":  [],  # derived addon (kept empty)
 }
 
 # ----------------------------
@@ -305,14 +319,179 @@ def _normalize_pbp_cols(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+# --- helpers ---
+def _alias(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> pd.DataFrame:
+    if not _ok(df): return df
+    ren = {}
+    for canon, alts in mapping.items():
+        if canon in df.columns: continue
+        for a in alts:
+            if a in df.columns:
+                ren[a] = canon
+                break
+    return df.rename(columns=ren)
+
+def _ensure_types(df: pd.DataFrame, ints: List[str]=None, nums: List[str]=None) -> pd.DataFrame:
+    ints = ints or []; nums = nums or []
+    for c in ints:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    for c in nums:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+def _require(df: pd.DataFrame, cols: List[str], key: str) -> pd.DataFrame:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"[normalize:{key}] Missing required columns: {missing}")
+    return df
+
+# --- per-table normalizers ---
+def _normalize_pbp_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if not _ok(df): return df
+    df = _alias(df, {
+        "posteam": ["offense_team","team_offense","poss_team","possession_team"],
+        "defteam": ["defense_team","team_defense"],
+        "game_id": ["old_game_id","gameid","gameId","game_identifier"],
+        "week":    ["game_week","week_number","wk"],
+        "receiver_player_name": ["receiver","receiver_name","receiver_full_name","target_player_name"],
+        "rusher_player_name":   ["rusher","rusher_name","runner_name"],
+        "passer_player_name":   ["passer","passer_name","qb_player_name","quarterback_name"],
+        "yardline_100":         ["yardline","yard_line_100","yards_to_goal","yardlineNumber"],
+        "yards_gained":         ["yards","gained_yards"],
+        "pass":                 ["is_pass","qb_dropback","pass_flag"],
+        "rush":                 ["is_rush","rush_flag"],
+        "down":                 ["downs","down_number"],
+        "ydstogo":              ["yards_to_go","ydstogo","distance"],
+    })
+    df = _ensure_types(df, ints=["week","down"], nums=["yardline_100","yards_gained","ydstogo"])
+    # infer defteam if entirely missing/NaN
+    if "defteam" in df.columns and df["defteam"].isna().all() and {"game_id","posteam"}.issubset(df.columns):
+        try:
+            pairs = (df[["game_id","posteam"]].dropna()
+                     .groupby("game_id")["posteam"].agg(lambda x: list(pd.unique(x))).to_dict())
+            df["defteam"] = df.apply(lambda r: (pairs.get(r["game_id"], [None,None])[1]
+                                                if pairs.get(r["game_id"], [None,None])[0] == r["posteam"]
+                                                else pairs.get(r["game_id"], [None,None])[0]), axis=1)
+        except Exception:
+            pass
+    return _require(df, ["posteam","week","game_id","yardline_100","receiver_player_name"], "pbp")
+
+def _normalize_schedules(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {
+        "game_id": ["old_game_id","gameid","gid","gameId"],
+        "week":    ["game_week","wk"],
+        "home_team": ["home","homeTeam","team_home"],
+        "away_team": ["away","awayTeam","team_away"],
+        "start_time": ["start","game_start","start_date_time","game_datetime"],
+        "event_id": ["eid","event","match_id"],
+    })
+    return _require(df, ["game_id","week","home_team","away_team"], "schedules")
+
+def _normalize_injuries(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {
+        "player": ["player_name","athlete","name"],
+        "team":   ["team_abbr","team_name","club"],
+        "status": ["injury_status","game_status","designation"],
+    })
+    return _require(df, ["player","team","status"], "injuries")
+
+def _normalize_rosters(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {
+        "player":   ["player_name","name"],
+        "team":     ["team_abbr","team_name","club"],
+        "position": ["pos","position_group"],
+    })
+    return _require(df, ["player","team"], "rosters")
+
+def _normalize_rosters_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {
+        "player": ["player_name","name"],
+        "team":   ["team_abbr","team_name","club"],
+        "week":   ["wk","game_week"],
+    })
+    return _require(df, ["player","team","week"], "rosters_weekly")
+
+def _normalize_depth(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {
+        "player": ["player_name","name"],
+        "team":   ["team_abbr","team_name","club"],
+        "position": ["pos","position_group"],
+        "depth": ["depth_order","chart_pos","slot"],
+    })
+    return _require(df, ["player","team","position"], "depth_charts")
+
+def _normalize_snaps(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {
+        "player": ["player_name","name"],
+        "team":   ["team_abbr","team_name","club"],
+        "week":   ["wk","game_week"],
+        "offense_snaps": ["off_snaps","offensive_snaps","snaps_offense"],
+        "routes": ["routes_run","route_runs"],
+    })
+    return _require(df, ["player","team","week"], "snap_counts")
+
+def _normalize_participation(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {
+        "player": ["player_name","name"],
+        "team":   ["team_abbr","team_name","club"],
+        "week":   ["wk","game_week"],
+        "on_field": ["participation","active","played"],
+    })
+    return _require(df, ["player","team","week"], "participation")
+
+def _normalize_team_stats(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {"team":["team_abbr","club","abbr"]})
+    return _require(df, ["team"], "team_stats")
+
+def _normalize_player_stats(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {
+        "player":["player_name","name"],
+        "team":  ["team_abbr","club","abbr"],
+        "position":["pos","position_group"]
+    })
+    return _require(df, ["player","team"], "player_stats")
+
+def _normalize_box_week(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {
+        "team": ["defense_team","team_abbr","club"],
+        "def_light_box_rate": ["light_box_rate","def_light_box_pct"],
+        "def_heavy_box_rate": ["heavy_box_rate","def_heavy_box_pct"],
+        "week": ["wk","game_week"],
+    })
+    return _require(df, ["team","week"], "box_week")
+
+def _normalize_proe_week(df: pd.DataFrame) -> pd.DataFrame:
+    df = _alias(df, {"team":["team_abbr","club"], "week":["wk","game_week"]})
+    return _require(df, ["team","week","proe"], "proe_week")
+
+# registry
+NORMALIZERS: Dict[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
+    "pbp": _normalize_pbp_cols,
+    "schedules": _normalize_schedules,
+    "injuries": _normalize_injuries,
+    "rosters": _normalize_rosters,
+    "rosters_weekly": _normalize_rosters_weekly,
+    "depth_charts": _normalize_depth,
+    "snap_counts": _normalize_snaps,
+    "participation": _normalize_participation,
+    "team_stats_week": _normalize_team_stats,
+    "team_stats_reg":  _normalize_team_stats,
+    "player_stats_week": _normalize_player_stats,
+    "player_stats_reg":  _normalize_player_stats,
+    "box_week": _normalize_box_week,
+    "proe_week": _normalize_proe_week,
+}
+
 def resolve_table(key: str, season: int, cache: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    # 1) primary
+    norm = NORMALIZERS.get(key, lambda d: d)
+
+    # 1) primary cache/files
     for p in PRIMARY_PATHS.get(key, lambda s: [])(season):
         df = _read_csv(p)
         if _ok(df):
-            return _normalize_pbp_cols(df) if key == "pbp" else df
+            return norm(df)
 
-    # 2) providers
+    # 2) providers (fallback chain)
     for fn in FALLBACKS.get(key, []):
         if fn is None: continue
         try:
@@ -320,12 +499,12 @@ def resolve_table(key: str, season: int, cache: Dict[str, pd.DataFrame]) -> pd.D
         except Exception:
             df = None
         if _ok(df):
-            return _normalize_pbp_cols(df) if key == "pbp" else df
+            return norm(df)
 
-    # 3) computed
+    # 3) computed last-resort
     df = _compute_proxy(key, season, cache)
     if _ok(df):
-        return _normalize_pbp_cols(df) if key == "pbp" else df
+        return norm(df)
 
     return pd.DataFrame()
 
