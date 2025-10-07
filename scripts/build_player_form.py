@@ -1,31 +1,12 @@
 # scripts/build_player_form.py
 from __future__ import annotations
-import argparse, warnings, time, sys, os
+import argparse, warnings, time
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 import pandas as pd
 import requests
 
-# --- ensure pandas helper (handles Polars results from some libs) ---
-try:
-    import polars as _pl  # optional
-except Exception:
-    _pl = None
-
-def _to_pd(df):
-    if df is None:
-        return pd.DataFrame()
-    if _pl is not None and isinstance(df, _pl.DataFrame):
-        return df.to_pandas()
-    if hasattr(df, "to_pandas"):
-        try:
-            return df.to_pandas()
-        except Exception:
-            pass
-    return df
-# --- end helper ---
-
-# Primaries
+# Optional primaries
 try:
     import nflreadpy as nrp
     HAS_NFLREADPY = True
@@ -37,45 +18,88 @@ try:
 except Exception:
     HAS_NFL_DATA_PY = False
 
-# New sources
+# Fallbacks already present in your repo
 from .sources.apisports import season_team_player_tables as apisports_tables
 from .sources.mysportsfeeds import season_team_player_tables as msf_tables
 
-# --- NFLGSIS import shim (works in GitHub Actions and local) ---
-from pathlib import Path as _PathShim
-_REPO_ROOT = _PathShim(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO_ROOT))
-sys.path.insert(0, str(_REPO_ROOT / "scripts" / "sources"))
-try:
-    from scripts.sources.nflgsis import (
-        login_session, list_games, team_player_tables as gsis_team_player_tables
-    )
-except Exception:
-    try:
-        from nflgsis import (  # type: ignore
-            login_session, list_games, team_player_tables as gsis_team_player_tables
-        )
-    except Exception:
-        login_session = list_games = gsis_team_player_tables = None
-# --- end NFLGSIS shim ---
+# Bundle outputs we prefer
+BUNDLE_PLAYER_FORM = Path("outputs/metrics/player_form.csv")
 
-# -------- ESPN helpers (shared with fetcher) --------
+# ESPN (light fallback when nflverse isn’t present for current year)
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard"
 ESPN_BOX = "https://site.api.espn.com/apis/v2/sports/football/nfl/boxscore"
 
-def _http_json(url: str, params: Dict[str, Any] | None = None, tries: int = 3, backoff: float = 0.7) -> Dict[str, Any] | None:
+
+# -----------------------------
+# Shared helpers
+# -----------------------------
+def _to_pandas(obj):
+    try:
+        import polars as pl  # type: ignore
+        if isinstance(obj, pl.DataFrame):
+            return obj.to_pandas()
+    except Exception:
+        pass
+    return obj
+
+
+def _http_json(url: str, params=None, tries=3, backoff=0.6):
+    params = params or {}
     for i in range(tries):
         try:
-            r = requests.get(url, params=params or {}, timeout=20)
+            r = requests.get(url, params=params, timeout=20)
             if r.status_code == 200:
                 return r.json()
             if r.status_code == 404:
                 return None
         except Exception:
             pass
-        time.sleep(backoff * (2**i))
+        time.sleep(backoff * (2 ** i))
     return None
 
+
+# -----------------------------
+# nflverse loaders
+# -----------------------------
+def _load_pbp(season: int) -> pd.DataFrame:
+    if HAS_NFLREADPY:
+        try:
+            print(f"[build_player_form] USING PBP (nflreadpy) {season}")
+            df = nrp.load_pbp(seasons=[season])
+            return _to_pandas(df)
+        except Exception as e:
+            warnings.warn(f"nflreadpy.load_pbp failed: {type(e).__name__}: {e}")
+    if HAS_NFL_DATA_PY:
+        try:
+            print(f"[build_player_form] FALLBACK PBP (nfl_data_py) {season}")
+            df = nfl.import_pbp_data([season])
+            return _to_pandas(df)
+        except Exception as e:
+            warnings.warn(f"nfl_data_py.import_pbp_data failed: {type(e).__name__}: {e}")
+    return pd.DataFrame()
+
+
+def _load_weekly(season: int) -> pd.DataFrame:
+    if HAS_NFLREADPY:
+        try:
+            print(f"[build_player_form] USING WEEKLY (nflreadpy) {season}")
+            df = nrp.load_player_stats(seasons=[season])
+            return _to_pandas(df)
+        except Exception as e:
+            warnings.warn(f"nflreadpy.load_player_stats failed: {type(e).__name__}: {e}")
+    if HAS_NFL_DATA_PY:
+        try:
+            print(f"[build_player_form] FALLBACK WEEKLY (nfl_data_py) {season}")
+            df = nfl.import_weekly_data([season])
+            return _to_pandas(df)
+        except Exception as e:
+            warnings.warn(f"nfl_data_py.import_weekly_data failed: {type(e).__name__}: {e}")
+    return pd.DataFrame()
+
+
+# -----------------------------
+# ESPN lightweight fallback
+# -----------------------------
 def _espn_week_events(season: int, week: int) -> List[str]:
     data = _http_json(ESPN_SCOREBOARD, params={"week": week, "seasontype": 2, "dates": season})
     if not data:
@@ -122,6 +146,7 @@ def _parse_box_to_rows(event_id: str, box: Dict[str, Any] | None) -> Tuple[pd.Da
 
 def _espn_players_table(season: int) -> pd.DataFrame:
     rows = []
+    # scan weeks conservatively
     for wk in range(1, 23):
         evts = _espn_week_events(season, wk)
         if not evts and wk > 3:
@@ -131,11 +156,11 @@ def _espn_players_table(season: int) -> pd.DataFrame:
             if not pdf.empty:
                 pdf["week"] = wk
                 rows.append(pdf)
-            time.sleep(0.1)
+            time.sleep(0.08)
     if not rows:
         return pd.DataFrame()
     df = pd.concat(rows, ignore_index=True)
-    # shares & efficiencies
+
     team_tot = (df.groupby("team")
                 .agg(team_targets=("targets", "sum"),
                      team_rushes=("carries", "sum"),
@@ -156,52 +181,19 @@ def _espn_players_table(season: int) -> pd.DataFrame:
         if c not in out.columns: out[c] = 0.0
     return out[keep].fillna(0.0).sort_values(["team","player"]).reset_index(drop=True)
 
-# ---------- primary weekly/PBP loaders ----------
-def _load_pbp(season: int) -> pd.DataFrame:
-    if HAS_NFLREADPY:
-        try:
-            print(f"[build_player_form] USING PBP (nflreadpy) {season}")
-            df = nrp.load_pbp(seasons=[season])
-            df = _to_pd(df)
-            if "season" not in df.columns: df["season"] = season
-            return df
-        except Exception as e:
-            warnings.warn(f"nflreadpy.load_pbp failed: {type(e).__name__}: {e}")
-    if HAS_NFL_DATA_PY:
-        try:
-            print(f"[build_player_form] FALLBACK PBP (nfl_data_py) {season}")
-            df = nfl.import_pbp_data([season])
-            return _to_pd(df)
-        except Exception as e:
-            warnings.warn(f"nfl_data_py.import_pbp_data failed: {type(e).__name__}: {e}")
-    return pd.DataFrame()
 
-def _load_weekly(season: int) -> pd.DataFrame:
-    if HAS_NFLREADPY:
-        try:
-            print(f"[build_player_form] USING WEEKLY (nflreadpy) {season}")
-            df = nrp.load_player_stats(seasons=[season])
-            return _to_pd(df)
-        except Exception as e:
-            warnings.warn(f"nflreadpy.load_player_stats failed: {type(e).__name__}: {e}")
-    if HAS_NFL_DATA_PY:
-        try:
-            print(f"[build_player_form] FALLBACK WEEKLY (nfl_data_py) {season}")
-            df = nfl.import_weekly_data([season])
-            return _to_pd(df)
-        except Exception as e:
-            warnings.warn(f"nfl_data_py.import_weekly_data failed: {type(e).__name__}: {e}")
-    return pd.DataFrame()
-
-# ---------- transforms ----------
+# -----------------------------
+# Transforms from nflverse tables
+# -----------------------------
 def _from_pbp(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
-    cur = _to_pd(pbp).copy()
+    cur = pbp.copy()
     if "season" in cur.columns:
         cur = cur[cur["season"] == season].copy()
     if cur.empty:
         return pd.DataFrame()
+
     cur["is_pass"] = (cur.get("pass", 0) == 1) if "pass" in cur.columns else cur.get("play_type","").astype(str).str.contains("pass", case=False, na=False)
-    cur["is_rush"] = (cur.get("rush", 0) == 1) if "rush" in cur.columns else cur.get("play_type","").astype(str).str.contains("rush|run", case=False, na=False)
+    cur["is_rush"] = (cur.get("rush", 0) == 1) if "rush" in cur.columns else cur.get("play_type","").astype(str).str.contains("rush", case=False, na=False)
     cur["is_rz"]   = (cur.get("yardline_100", 100) <= 20)
 
     rec = (cur[cur["is_pass"]]
@@ -213,8 +205,8 @@ def _from_pbp(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
     team_attempts = (cur[cur["is_pass"]].groupby("posteam").size().rename("team_attempts")).reset_index().rename(columns={"posteam":"team"})
     rec = rec.merge(team_attempts, on="team", how="left")
     rec["target_share"] = rec["targets"] / rec["team_attempts"].clip(lower=1)
-    rec["ypt"] = rec["rec_yards"] / rec["targets"].clip(lower=1)
-    rec["yprr_proxy"] = rec["rec_yards"] / rec["team_attempts"].clip(lower=1)
+    rec["ypt"]          = rec["rec_yards"] / rec["targets"].clip(lower=1)
+    rec["yprr_proxy"]   = rec["rec_yards"] / rec["team_attempts"].clip(lower=1)
     rec["rz_tgt_share"] = rec["rz_targets"] / rec["targets"].clip(lower=1)
 
     rush = (cur[cur["is_rush"]]
@@ -225,8 +217,8 @@ def _from_pbp(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
             .reset_index().rename(columns={"posteam":"team","rusher_player_name":"player"}))
     team_rushes = (cur[cur["is_rush"]].groupby("posteam").size().rename("team_rushes")).reset_index().rename(columns={"posteam":"team"})
     rush = rush.merge(team_rushes, on="team", how="left")
-    rush["rush_share"] = rush["carries"] / rush["team_rushes"].clip(lower=1)
-    rush["ypc"] = rush["rush_yards"] / rush["carries"].clip(lower=1)
+    rush["rush_share"]   = rush["carries"] / rush["team_rushes"].clip(lower=1)
+    rush["ypc"]          = rush["rush_yards"] / rush["carries"].clip(lower=1)
     rush["rz_carry_share"] = rush["rz_carries"] / rush["carries"].clip(lower=1)
 
     qb = (cur[cur["is_pass"]]
@@ -240,6 +232,7 @@ def _from_pbp(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
                    rush[["player","team","rush_share","rz_carry_share","ypc"]],
                    on=["player","team"], how="outer")
     out = pd.merge(out, qb[["player","team","qb_ypa"]], on=["player","team"], how="outer")
+
     out["position"] = out.apply(lambda r:
         "QB" if pd.notna(r.get("qb_ypa"))
         else ("RB" if pd.notna(r.get("rush_share"))
@@ -248,21 +241,21 @@ def _from_pbp(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
         out[c] = out[c].fillna(0.0)
     return out.sort_values(["team","player"]).reset_index(drop=True)
 
+
 def _from_weekly(wk: pd.DataFrame) -> pd.DataFrame:
-    wk = _to_pd(wk)
     if wk is None or wk.empty:
         return pd.DataFrame()
-    # normalize
-    if "attempts" not in wk.columns and "pass_attempts" in wk.columns:
-        wk = wk.rename(columns={"pass_attempts":"attempts"})
-    if "carries" not in wk.columns and "rush_attempts" in wk.columns:
-        wk = wk.rename(columns={"rush_attempts":"carries"})
-    if "receiving_yards" in wk.columns and "rec_yards" not in wk.columns:
-        wk = wk.rename(columns={"receiving_yards":"rec_yards"})
-    if "rushing_yards" in wk.columns and "rush_yards" not in wk.columns:
-        wk = wk.rename(columns={"rushing_yards":"rush_yards"})
-    if "passing_yards" in wk.columns and "pass_yards" not in wk.columns:
-        wk = wk.rename(columns={"passing_yards":"pass_yards"})
+    # normalize common alt names
+    ren = {
+        "pass_attempts":"attempts",
+        "rush_attempts":"carries",
+        "receiving_yards":"rec_yards",
+        "rushing_yards":"rush_yards",
+        "passing_yards":"pass_yards",
+    }
+    for a,b in ren.items():
+        if a in wk.columns and b not in wk.columns:
+            wk = wk.rename(columns={a:b})
 
     team_tot = (wk.groupby("team")
                   .agg(team_targets=("targets","sum"),
@@ -294,30 +287,58 @@ def _from_weekly(wk: pd.DataFrame) -> pd.DataFrame:
         if c not in out.columns: out[c] = 0.0
     return out[keep].fillna(0.0).sort_values(["team","player"]).reset_index(drop=True)
 
-# ---------- Builder ----------
+
+# -----------------------------
+# Builder (with bundle preference)
+# -----------------------------
+def _maybe_player_form_from_bundle() -> pd.DataFrame:
+    df = pd.DataFrame()
+    if BUNDLE_PLAYER_FORM.exists():
+        df = pd.read_csv(BUNDLE_PLAYER_FORM)
+    if df.empty:
+        return df
+    # Standardize to pipeline schema
+    req = ["player","team","position","target_share","rush_share",
+           "rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]
+    for c in req:
+        if c not in df.columns:
+            df[c] = 0.0
+    if "position" not in df.columns and "role" in df.columns:
+        df["position"] = df["role"].map({
+            "QB":"QB","RB1":"RB","RB2":"RB","WR1":"WR/TE","WR2":"WR/TE","SLOT":"WR/TE","TE1":"WR/TE"
+        }).fillna("")
+    df["team"] = df["team"].astype(str).str.upper()
+    return df[req].fillna(0.0).sort_values(["team","player"]).reset_index(drop=True)
+
+
 def build_player_form(season: int, history: str) -> pd.DataFrame:
-    # 1) PBP (best)
-    pbp = _load_pbp(season)
-    pf  = _from_pbp(pbp, season)
+    # 0) Prefer the bundle
+    pf = _maybe_player_form_from_bundle()
     if not pf.empty:
         return pf
 
-    # 2) Weekly (nflverse tables)
+    # 1) PBP
+    pbp = _load_pbp(season)
+    pf = _from_pbp(pbp, season)
+    if not pf.empty:
+        return pf
+
+    # 2) Weekly
     wk = _load_weekly(season)
     pf = _from_weekly(wk)
     if not pf.empty:
         return pf
 
-    # 3) ESPN
+    # 3) ESPN (light)
     print("[build_player_form] ⚠️ Using ESPN fallback for player shares/efficiency")
     pf = _espn_players_table(season)
     if not pf.empty:
         return pf
 
-    # 4) API-SPORTS
+    # 4) API-Sports
     print("[build_player_form] ⚠️ Using API-SPORTS fallback for player shares")
     _, p = apisports_tables(season)
-    pf = _from_weekly(p)  # schema-compatible aggregator
+    pf = _from_weekly(p)
     if not pf.empty:
         return pf
 
@@ -325,35 +346,12 @@ def build_player_form(season: int, history: str) -> pd.DataFrame:
     print("[build_player_form] ⚠️ Using MySportsFeeds fallback for player shares")
     _, p = msf_tables(season)
     pf = _from_weekly(p)
-    if not pf.empty:
-        return pf
+    return pf
 
-    # 6) NFLGSIS (authenticated, best-effort)
-    try:
-        print("[build_player_form] ⚠️ Using NFLGSIS fallback for player shares/efficiency")
-        if login_session is not None:
-            s = login_session()
-            games = list_games(s)
-            if games:
-                game_ids = [g["id"] for g in games][:30]
-                _, p = gsis_team_player_tables(s, game_ids, limit=30)
-                if not isinstance(p, pd.DataFrame):
-                    p = _to_pd(p)
-                if not p.empty:
-                    # Minimal schema align (player, team, attempts/carries/targets/yards if present)
-                    if "player_name" in p.columns and "player" not in p.columns:
-                        p = p.rename(columns={"player_name": "player"})
-                    if "recent_team" in p.columns and "team" not in p.columns:
-                        p = p.rename(columns={"recent_team": "team"})
-                    pf = _from_weekly(p)
-                    if pf is not None and not pf.empty:
-                        return pf
-    except Exception as e:
-        warnings.warn(f"NFLGSIS player fallback failed: {type(e).__name__}: {e}")
 
-    # If absolutely everything failed, return empty (downstream handles neutrals)
-    return pd.DataFrame()
-
+# -----------------------------
+# CLI
+# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", type=int, required=True)
@@ -366,10 +364,6 @@ def main():
     df.to_csv(args.write, index=False)
     print(f"[build_player_form] ✅ wrote {len(df)} rows → {args.write}")
 
-if __name__ == "__main__":
-    main()
-
 
 if __name__ == "__main__":
     main()
-
