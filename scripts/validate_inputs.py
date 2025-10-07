@@ -6,7 +6,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any  # <- added Any
 
 import pandas as pd
 
@@ -18,6 +18,21 @@ class CheckSpec:
     description: str = ""
 
 REQUIRED: List[CheckSpec] = [
+    # --- NEW: validate outputs from make_all.py right after the fetch+compose step ---
+    CheckSpec(
+        path="outputs/metrics/team_form.csv",
+        required_cols=["team", "season"],
+        allow_empty=False,
+        description="Composed team metrics from data pack (season-level; used as early guard).",
+    ),
+    CheckSpec(
+        path="outputs/metrics/player_form.csv",
+        required_cols=["team", "player", "position", "target_share"],
+        allow_empty=False,
+        description="Composed player metrics from data pack (used as early guard).",
+    ),
+
+    # --- Your original required inputs (kept intact) ---
     CheckSpec(
         path="data/team_form.csv",
         required_cols=[
@@ -80,10 +95,15 @@ REQUIRED: List[CheckSpec] = [
 ]
 
 SOFT_CHECKS = {
-    "data/team_form.csv": {"def_pass_epa_z": 0.4, "def_rush_epa_z": 0.4},
+    # NEW: soft checks for composed outputs (light touch)
+    "outputs/metrics/player_form.csv": {"target_share": 0.9},
+    "outputs/metrics/team_form.csv":   {},
+
+    # Your originals
+    "data/team_form.csv":   {"def_pass_epa_z": 0.4, "def_rush_epa_z": 0.4},
     "data/player_form.csv": {"target_share": 0.6, "rush_share": 0.6},
-    "data/weather.csv": {"wind_mph": 0.8, "temp_f": 0.8},
-    "outputs/props_raw.csv": {"line": 0.15, "price": 0.15},
+    "data/weather.csv":     {"wind_mph": 0.8, "temp_f": 0.8},
+    "outputs/props_raw.csv":{"line": 0.15, "price": 0.15},
 }
 
 def fail_or_warn(msg: str, strict: bool, errors: List[str], warnings: List[str]) -> None:
@@ -133,8 +153,9 @@ def main():
     args = ap.parse_args()
 
     strict = not args.warn
-    errors, warnings = [], []
-    report: Dict[str, Dict[str, any]] = {}
+    errors: List[str] = []
+    warnings: List[str] = []
+    report: Dict[str, Dict[str, Any]] = {}  # <- Any (not any)
 
     for spec in REQUIRED:
         print(f"▶ Checking {spec.path} ...")
@@ -163,7 +184,8 @@ def main():
             json.dump(out, f, indent=2)
         print(f"\nWrote JSON report → {args.json}")
 
-    if errors and strict: sys.exit(2)
+    if errors and strict:
+        sys.exit(2)
     sys.exit(0)
 
 if __name__ == "__main__":
