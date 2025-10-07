@@ -10,6 +10,15 @@ import nflreadpy as nfl
 
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
+def safe_load(func, **kwargs):
+    """Try with file_type=csv for old versions, fallback otherwise."""
+    try:
+        return func(**kwargs, file_type="csv")
+    except TypeError:
+        if "file_type" in kwargs:
+            kwargs.pop("file_type")
+        return func(**kwargs)
+
 def compute_proe(pbp: pl.DataFrame) -> pl.DataFrame:
     # Filter to offensive team pass/run plays (drop penalties, no-plays)
     df = pbp.filter(
