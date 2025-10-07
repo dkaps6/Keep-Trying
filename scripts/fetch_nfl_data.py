@@ -150,10 +150,94 @@ def _agg_team(df: pd.DataFrame, side_col: str) -> pd.DataFrame:
     team["pass_rate"] = team["pass_plays"] / team["plays"].clip(lower=1)
     return team
 
+# --- add at top of file if not present ---
+import pandas as pd
+try:
+    import nfl_data_py as nfl
+    HAS_NFL_DATA_PY = True
+except Exception:
+    HAS_NFL_DATA_PY = False
+
+# ---------- NEW: build team form from weekly (fallback when PBP missing) ----------
+def _team_form_from_weekly(season: int) -> pd.DataFrame:
+    """
+    Fallback using nfl_data_py.import_weekly_data(season).
+    Produces: team, plays_est, proe (proxy), rz_rate (proxy), and neutral 0 z-scores for DEF fields.
+    """
+    if not HAS_NFL_DATA_PY:
+        return pd.DataFrame()
+
+    try:
+        print(f"[fetch_nfl_data] weekly fallback: nfl_data_py.import_weekly_data({season}) ...")
+        wk = nfl.import_weekly_data([season])
+    except Exception as e:
+        print(f"[fetch_nfl_data] weekly fallback failed: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+
+    if wk is None or wk.empty:
+        return pd.DataFrame()
+
+    # Normalize expected columns
+    # Common columns: team, opponent_team, attempts, completions, targets, receptions, carries, rush_yards, rec_yards, pass_yards, week
+    # We'll derive team totals per game then per team per week.
+    # 'team' naming in nfl_data_py weekly is usually team abbreviation.
+    # plays ≈ team pass attempts + team rush attempts
+    # PROE proxy ≈ (team_pass_rate - league_pass_rate)
+    # RZ rate proxy unavailable here → approximate from TD opportunities:
+    cols_needed = ["team","opponent_team","week","attempts","carries","targets","receptions",
+                   "pass_yards","rush_yards","rec_yards","games"]
+    # Compute team totals per week
+    # Many rows per player; sum by team/week
+    grp = (wk.groupby(["team","week"], dropna=True)
+             .agg(team_pass_att=("attempts","sum"),
+                  team_rush_att=("carries","sum"),
+                  team_targets=("targets","sum"),
+                  team_receptions=("receptions","sum"))
+             .reset_index())
+    if grp.empty:
+        return pd.DataFrame()
+
+    grp["team_plays"] = grp["team_pass_att"].fillna(0) + grp["team_rush_att"].fillna(0)
+    # Per-team games played
+    games = grp.groupby("team")["week"].nunique().rename("games").reset_index()
+    team = grp.groupby("team").agg(
+        plays_est=("team_plays", "mean"),
+        pass_att=("team_pass_att","sum"),
+        rush_att=("team_rush_att","sum"),
+    ).reset_index().merge(games, on="team", how="left")
+
+    team["pass_rate"] = team["pass_att"] / (team["pass_att"] + team["rush_att"]).replace({0: pd.NA})
+    league_pass = float(team["pass_rate"].mean(skipna=True))
+    team["proe"] = (team["pass_rate"] - league_pass).fillna(0.0)
+
+    # rz_rate proxy (we don’t have RZ plays here): use receptions near end zone proxy via touchdowns would be better;
+    # keep conservative constant so pipeline runs; pricing still uses weather/script/market anchors.
+    team["rz_rate"] = 0.20
+
+    # Fill defensive z-scores with neutral zeros (until PBP/pressure feeds arrive)
+    out = team[["team","plays_est","proe","rz_rate"]].copy()
+    out["def_pressure_rate_z"] = 0.0
+    out["def_pass_epa_z"] = 0.0
+    out["def_rush_epa_z"] = 0.0
+    out["def_sack_rate_z"] = 0.0
+    out["pace_z"] = 0.0
+    out["light_box_rate_z"] = 0.0
+    out["heavy_box_rate_z"] = 0.0
+    out["ay_per_att_z"] = 0.0
+
+    # Order to your schema
+    out = out[[
+        "team",
+        "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
+        "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
+        "plays_est","proe","rz_rate"
+    ]]
+    return out
+
+# ---------- REPLACE your compute_team_form(...) with this ----------
 def compute_team_form(pbp: pd.DataFrame, current_season: int) -> pd.DataFrame:
     """
-    Compute offense & defense aggregates, then produce DEF z-scores and team volume features.
-    Safe when current season has no PBP yet (returns schema with rows for teams seen in history).
+    Preferred: build from PBP. If current-season PBP is unavailable, fall back to weekly stats.
     """
     cols = [
         "team","opp_team","event_id",
@@ -162,23 +246,100 @@ def compute_team_form(pbp: pd.DataFrame, current_season: int) -> pd.DataFrame:
         "plays_est","proe","rz_rate"
     ]
     if pbp.empty:
+        # No PBP at all → try weekly
+        wk = _team_form_from_weekly(current_season)
+        if not wk.empty:
+            wk["opp_team"] = pd.NA
+            wk["event_id"] = pd.NA
+            return wk[cols]
         return pd.DataFrame(columns=cols)
 
-    # ---- slice current season; if empty, we will still emit rows (using teams seen in history) ----
     cur = pbp[pbp["season"] == current_season].copy()
     if cur.empty:
-        # Build a team list from the most recent season present in pbp
-        most_recent = int(pbp["season"].max())
-        teams = sorted(set(pbp[pbp["season"] == most_recent]["posteam"].dropna()))
+        # Current season missing → weekly fallback just for 2025 while keeping historical priors
+        wk = _team_form_from_weekly(current_season)
+        if not wk.empty:
+            wk["opp_team"] = pd.NA
+            wk["event_id"] = pd.NA
+            return wk[cols]
+        # As a last resort, make neutral rows for all teams seen in pbp
+        teams = sorted(set(pbp["posteam"].dropna()))
         out = pd.DataFrame({"team": teams})
-        # neutral defaults so downstream code keeps working
         for c in ["def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
-                  "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
-                  "plays_est","proe","rz_rate"]:
+                  "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z","plays_est","proe","rz_rate"]:
             out[c] = 0.0
         out["opp_team"] = pd.NA
         out["event_id"] = pd.NA
         return out[cols]
+
+    # ----- your existing PBP-based logic (fixed for defteam collision) -----
+    cur["is_pass"] = (cur.get("pass", 0) == 1) if "pass" in cur.columns else cur.get("play_type","").astype(str).str.contains("pass", case=False, na=False)
+    cur["is_rush"] = (cur.get("rush", 0) == 1) if "rush" in cur.columns else cur.get("play_type","").astype(str).str.contains("rush", case=False, na=False)
+    cur["is_rz"]   = (cur.get("yardline_100", 100) <= 20)
+
+    off = (cur
+           .groupby("posteam", as_index=False)
+           .agg(
+               plays=("posteam", "size"),
+               pass_plays=("is_pass", "sum"),
+               rush_plays=("is_rush", "sum"),
+               rz_rate=("is_rz","mean"),
+           )
+           .rename(columns={"posteam":"team"}))
+
+    # neutral PROE
+    mask_neutral = ((cur.get("qtr",0).between(1,3)) | ((cur.get("qtr",0)==4) & (cur.get("half_seconds_remaining",0)>300))) & (cur.get("ydstogo",10)<=10)
+    league_neutral = float(cur.loc[mask_neutral, "is_pass"].mean()) if mask_neutral.any() else 0.56
+    team_neutral = (cur.loc[mask_neutral].groupby("posteam")["is_pass"].mean()
+                    .rename("neutral_pass_rate")).reset_index().rename(columns={"posteam":"team"})
+    off = off.merge(team_neutral, on="team", how="left")
+    off["neutral_pass_rate"] = off["neutral_pass_rate"].fillna(league_neutral)
+    off["proe"] = off["neutral_pass_rate"] - league_neutral
+
+    # pace proxy
+    d = cur.sort_values(["game_id","game_seconds_remaining"]).copy()
+    d["dt"] = d.groupby("game_id")["game_seconds_remaining"].diff(-1).abs()
+    pace = d.groupby("posteam")["dt"].median().rename("pace_sec_play").reset_index().rename(columns={"posteam":"team"})
+    off = off.merge(pace, on="team", how="left")
+
+    games = (cur[["game_id","posteam"]].drop_duplicates().groupby("posteam").size()
+             .rename("games")).reset_index().rename(columns={"posteam":"team"})
+    off = off.merge(games, on="team", how="left")
+    off["plays_est"] = (off["plays"] / off["games"].clip(lower=1)).fillna(off["plays"])
+
+    # defense without collision
+    g_pass = (cur[cur["is_pass"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_pass_epa"}))
+    g_rush = (cur[cur["is_rush"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_rush_epa"}))
+    g_cnt  = (cur.groupby("defteam", as_index=False).size().rename(columns={"size":"def_plays"}))
+    opp = g_cnt.merge(g_pass, on="defteam", how="left").merge(g_rush, on="defteam", how="left").rename(columns={"defteam":"team"})
+    opp["light_box_rate"] = 0.0; opp["heavy_box_rate"] = 0.0; opp["def_sack_rate"] = 0.0
+
+    team = off.merge(opp, on="team", how="outer")
+
+    def _z(name):
+        s = team[name].astype(float)
+        mu = s.mean(skipna=True); sd = s.std(ddof=0, skipna=True)
+        if sd == 0 or pd.isna(sd): return s*0.0
+        return (s - mu) / sd
+
+    team["def_pass_epa_z"] = _z("def_pass_epa")
+    team["def_rush_epa_z"] = _z("def_rush_epa")
+    team["def_sack_rate_z"] = _z("def_sack_rate")
+    team["def_pressure_rate_z"] = 0.0
+    team["pace_z"] = _z("pace_sec_play")
+    team["light_box_rate_z"] = _z("light_box_rate")
+    team["heavy_box_rate_z"] = _z("heavy_box_rate")
+    team["ay_per_att_z"] = 0.0
+
+    out = team[[
+        "team",
+        "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
+        "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
+        "plays_est","proe","rz_rate"
+    ]].copy()
+    for c in ["plays_est","proe","rz_rate"]:
+        out[c] = out[c].fillna(0.0)
+    return out
 
     # flags
     cur["is_pass"] = _is_pass(cur)
