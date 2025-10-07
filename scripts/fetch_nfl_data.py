@@ -1,4 +1,4 @@
-# === BEGIN scripts/fetch_nfl_data.py (patched full) ===
+# scripts/fetch_nfl_data.py
 from __future__ import annotations
 import argparse, warnings, time, requests
 from pathlib import Path
@@ -136,7 +136,7 @@ def _team_form_from_tables(team_df: pd.DataFrame) -> pd.DataFrame:
                  rush_att=("rush_att","sum"))
             .reset_index())
     team["pass_rate"] = team["pass_att"] / (team["pass_att"] + team["rush_att"]).replace({0: pd.NA})
-    league_pass = float(team["pass_rate"].mean(skipna=True))
+    league_pass = float(team["pass_rate"].mean(skipna=True)) if not team["pass_rate"].isna().all() else 0.56
     team["proe"] = (team["pass_rate"] - league_pass).fillna(0.0)
     team["rz_rate"] = 0.20  # proxy when RZ not known
     out = team[["team","plays_est","proe","rz_rate"]].copy()
@@ -200,8 +200,12 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
         off["plays_est"] = (off["plays"] / off["games"].clip(lower=1)).fillna(off["plays"])
 
         # Defensive z-proxies if EPA exists
-        g_pass = (cur[cur["is_pass"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_pass_epa"}))
-        g_rush = (cur[cur["is_rush"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_rush_epa"}))
+        if "epa" in cur.columns:
+            g_pass = (cur[cur["is_pass"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_pass_epa"}))
+            g_rush = (cur[cur["is_rush"]].groupby("defteam", as_index=False)["epa"].mean().rename(columns={"epa":"def_rush_epa"}))
+        else:
+            g_pass = pd.DataFrame({"defteam": off["team"], "def_pass_epa": 0.0})
+            g_rush = pd.DataFrame({"defteam": off["team"], "def_rush_epa": 0.0})
         g_cnt  = (cur.groupby("defteam", as_index=False).size().rename(columns={"size":"def_plays"}))
         opp = g_cnt.merge(g_pass, on="defteam", how="left").merge(g_rush, on="defteam", how="left").rename(columns={"defteam":"team"})
         opp["light_box_rate"] = 0.0; opp["heavy_box_rate"] = 0.0; opp["def_sack_rate"] = 0.0
@@ -259,14 +263,15 @@ def compute_team_form(pbp_all: pd.DataFrame, current_season: int) -> pd.DataFram
     # NFLGSIS (authenticated)
     try:
         print("[fetch_nfl_data] trying NFLGSIS fallback …")
-        s = login_session()
-        games = list_games(s)
-        if games:
-            gids = [g["id"] for g in games]
-            team_df, _ = gsis_team_player_tables(s, gids, limit=40)
-            if not team_df.empty:
-                print("[fetch_nfl_data] using NFLGSIS team table")
-                return _team_form_from_tables(team_df)
+        if login_session is not None:
+            s = login_session()
+            games = list_games(s)
+            if games:
+                gids = [g["id"] for g in games][:40]
+                team_df, _ = gsis_team_player_tables(s, gids, limit=40)
+                if not team_df.empty:
+                    print("[fetch_nfl_data] using NFLGSIS team table")
+                    return _team_form_from_tables(team_df)
     except Exception as e:
         warnings.warn(f"NFLGSIS fallback failed: {type(e).__name__}: {e}")
 
@@ -298,4 +303,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# === END scripts/fetch_nfl_data.py ===
+
