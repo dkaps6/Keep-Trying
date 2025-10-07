@@ -41,19 +41,13 @@ on:
         default: ""
 
 jobs:
-  run:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 40
-
     env:
       THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
-      ODDS_API_KEY:     ${{ secrets.THE_ODDS_API_KEY }}  # keep alias if code uses it
-      MU_BLEND_WEIGHT:  "0.35"
-      APISPORTS_KEY:    ${{ secrets.APISPORTS_KEY }}
-      MSF_KEY:          ${{ secrets.MSF_KEY }}
-      MSF_PASSWORD:     ${{ secrets.MSF_PASSWORD }}
-      NFLGSIS_USERNAME: ${{ secrets.NFLGSIS_USERNAME }}
-      NFLGSIS_PASSWORD: ${{ secrets.NFLGSIS_PASSWORD }}
+      ODDS_API_KEY:     ${{ secrets.THE_ODDS_API_KEY }}
+      MU_BLEND_WEIGHT: "0.35"
 
     steps:
       - name: Checkout repository
@@ -63,105 +57,54 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # extra libs you use
           pip install --upgrade pyarrow nflreadpy
 
-      # ========= NEW: Fetch + Compose (free + optional paid) =========
+      #####################################################
+      #  FETCH + COMPOSE (NFLVERSE + ADDONS)
+      #####################################################
       - name: Fetch free data + compose (nflverse + addons)
+        env:
+          THE_ODDS_API_KEY:   ${{ secrets.THE_ODDS_API_KEY }}
+          APISPORTS_KEY:      ${{ secrets.APISPORTS_KEY }}
+          MSF_KEY:            ${{ secrets.MSF_KEY }}
+          MSF_PASSWORD:       ${{ secrets.MSF_PASSWORD }}
+          NFLGSIS_USERNAME:   ${{ secrets.NFLGSIS_USERNAME }}
+          NFLGSIS_PASSWORD:   ${{ secrets.NFLGSIS_PASSWORD }}
         run: |
           set -e
           echo "Repo root: $(pwd)"
           ls -la
+
           if [ -f make_all.py ]; then
-            echo "Found root make_all.py"
+            echo "Found: ./make_all.py"
             python make_all.py --season "${{ github.event.inputs.season }}"
           elif [ -f nflverse_csv_fetcher/make_all.py ]; then
-            echo "Found nflverse_csv_fetcher/make_all.py"
+            echo "Found: nflverse_csv_fetcher/make_all.py"
             python nflverse_csv_fetcher/make_all.py --season "${{ github.event.inputs.season }}"
+          elif [ -f external/nflverse_bundle/make_all.py ]; then
+            echo "Found: external/nflverse_bundle/make_all.py"
+            python external/nflverse_bundle/make_all.py --season "${{ github.event.inputs.season }}"
           else
-            echo "::error ::make_all.py not found at repo root or nflverse_csv_fetcher/"
+            echo "::error ::make_all.py not found in ./, nflverse_csv_fetcher/, or external/nflverse_bundle/"
             exit 1
           fi
 
-      # ========= NEW: Validate outputs from the data pack =========
       - name: Validate data pack outputs
         run: |
           python scripts/validate_inputs.py
 
-      # Optional safety net — won’t fail if unnecessary
       - name: Build player_form (safe fallback)
         run: |
-          python scripts/build_player_form_safe.py --season "${{ github.event.inputs.season }}" --write data/player_form.csv || true
+          python scripts/build_player_form_safe.py --season 2025 --write data/player_form.csv || true
 
-      # ---------- your existing steps (unchanged) ----------
-      - name: Check Odds API key present
-        run: |
-          python - <<'PY'
-          import os, sys
-          k1 = os.getenv("THE_ODDS_API_KEY")
-          if not k1:
-              print("❌ THE_ODDS_API_KEY is missing (add it under Settings → Secrets and variables → Actions)")
-              sys.exit(1)
-          print("✅ THE_ODDS_API_KEY loaded (len =", len(k1), ")")
-          PY
-
-      - name: Build team context (team_form.csv)
-        run: |
-          set -euo pipefail
-          mkdir -p data outputs logs
-          python -m scripts.fetch_nfl_data \
-            --history 2019-2024 \
-            --season "${{ github.event.inputs.season }}" \
-            --write data/team_form.csv
-          head -n 5 data/team_form.csv || true
-
-      - name: Build player form (player_form.csv)
-        run: |
-          set -euo pipefail
-          python -m scripts.build_player_form \
-            --history 2019-2024 \
-            --season "${{ github.event.inputs.season }}" \
-            --write data/player_form.csv
-          head -n 5 data/player_form.csv || true
-
-      - name: Fetch weather (data/weather.csv)
-        run: |
-          set -euo pipefail
-          python -m scripts.fetch_weather \
-            --hours "${{ github.event.inputs.window_hours }}" \
-            --out data/weather.csv
-          head -n 5 data/weather.csv || true
-
-      - name: Dump props (props_raw.csv)
-        env:
-          DATE:      ${{ github.event.inputs.date }}
-          SEASON:    ${{ github.event.inputs.season }}
-          WINDOW:    ${{ github.event.inputs.window_hours }}
-          BOOKS:     ${{ github.event.inputs.books }}
-          MARKETS:   ${{ github.event.inputs.markets }}
-          ORDER:     ${{ github.event.inputs.order }}
-          TEAMS:     ${{ github.event.inputs.teams }}
-          SELECTION: ${{ github.event.inputs.selection }}
-        run: |
-          set -euo pipefail
-          ARGS=( --date "$DATE" --season "$SEASON" --hours "$WINDOW" --books "$BOOKS" )
-          [ -n "$MARKETS" ]   && ARGS+=( --markets "$MARKETS" )
-          [ -n "$ORDER" ]     && ARGS+=( --order "$ORDER" )
-          [ -n "$TEAMS" ]     && ARGS+=( --team-filter "$TEAMS" )
-          python -m scripts.props_to_csv "${ARGS[@]}"
-          head -n 5 outputs/props_raw.csv || true
-
-      - name: Validate inputs (strict)
-        run: |
-          set -euo pipefail
-          python -m scripts.validate_inputs --json logs/validate_report.json
-
+      #####################################################
+      #  RUN MAIN MODEL
+      #####################################################
       - name: Run model
         env:
           DATE:       ${{ github.event.inputs.date }}
@@ -182,6 +125,9 @@ jobs:
           [ -n "$SELECTION" ]&& ARGS+=( --selection "$SELECTION" )
           python run_model.py "${ARGS[@]}"
 
+      #####################################################
+      #  UPLOAD ARTIFACTS
+      #####################################################
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
