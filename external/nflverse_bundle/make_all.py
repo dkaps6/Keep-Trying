@@ -518,9 +518,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
       player, team, position (blank), target_share, rush_share, rz_tgt_share, rz_carry_share,
       yprr_proxy, ypc, ypt, qb_ypa
     """
-    # ---- configuration: hard-fail on missing RZ components by default
-    STRICT_RZ = True
-
     if not _ok(pbp):
         raise DataQualityError("[derive_player_from_pbp] PBP table is empty — cannot compute player shares")
 
@@ -535,88 +532,80 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     yac         = _pick(["yards_after_catch","yac"], pbp)
     yline       = _pick(["yardline_100","yardline"], pbp)
 
-    # hard requirements
+    # Hard requirements for the stats you asked to model
     missing_bits = []
-    if not rec_name and not rush_name:
-        missing_bits.append("receiver/rusher names")
+    if not rec_name:
+        missing_bits.append("receiver name column (receiver_player_name/receiver/receiver_name)")
+    if not rush_name:
+        missing_bits.append("rusher name column (rusher_player_name/rusher/rusher_name)")
     if not yline:
         missing_bits.append("yardline_100/yardline (needed for red-zone shares)")
+
     if missing_bits:
+        # You prefer not to proceed with missing inputs → fail fast
         raise DataQualityError("[derive_player_from_pbp] Missing required PBP columns: " + ", ".join(missing_bits))
 
     pass_flag = _bool_col(pbp, ["pass","is_pass","qb_dropback"])
     rush_flag = _bool_col(pbp, ["rush","is_rush"]) & ~pass_flag
 
     # ---------- per-player counting tables ----------
-    targ_df = pd.DataFrame()
-    if rec_name:
-        targ_df = (
-            pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name]]
-               .assign(tgt=1)
-               .groupby([posteam, rec_name], as_index=False)["tgt"].sum()
-               .rename(columns={posteam:"team", rec_name:"player"})
-        )
+    targ_df = (
+        pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name]]
+           .assign(tgt=1)
+           .groupby([posteam, rec_name], as_index=False)["tgt"].sum()
+           .rename(columns={posteam:"team", rec_name:"player"})
+    )
 
-    rush_df = pd.DataFrame()
-    if rush_name:
-        rush_df = (
-            pbp.loc[rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name]]
-               .assign(rush=1)
-               .groupby([posteam, rush_name], as_index=False)["rush"].sum()
-               .rename(columns={posteam:"team", rush_name:"player"})
-        )
+    rush_df = (
+        pbp.loc[rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name]]
+           .assign(rush=1)
+           .groupby([posteam, rush_name], as_index=False)["rush"].sum()
+           .rename(columns={posteam:"team", rush_name:"player"})
+    )
 
-    # red-zone shares (yardline_100 <= 20)
+    # red-zone events
     rz_mask = _safe_num(pbp[yline]) <= 20
 
-    rz_tgt_df = pd.DataFrame()
-    if rec_name:
-        rz_tgt_df = (
-            pbp.loc[rz_mask & pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name]]
-               .assign(rz_tgt=1)
-               .groupby([posteam, rec_name], as_index=False)["rz_tgt"].sum()
-               .rename(columns={posteam:"team", rec_name:"player"})
-        )
+    rz_tgt_df = (
+        pbp.loc[rz_mask & pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name]]
+           .assign(rz_tgt=1)
+           .groupby([posteam, rec_name], as_index=False)["rz_tgt"].sum()
+           .rename(columns={posteam:"team", rec_name:"player"})
+    )
 
-    rz_car_df = pd.DataFrame()
-    if rush_name:
-        rz_car_df = (
-            pbp.loc[rz_mask & rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name]]
-               .assign(rz_car=1)
-               .groupby([posteam, rush_name], as_index=False)["rz_car"].sum()
-               .rename(columns={posteam:"team", rush_name:"player"})
-        )
+    rz_car_df = (
+        pbp.loc[rz_mask & rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name]]
+           .assign(rz_car=1)
+           .groupby([posteam, rush_name], as_index=False)["rz_car"].sum()
+           .rename(columns={posteam:"team", rush_name:"player"})
+    )
 
-    # ---------- enforce data presence ----------
+    # Enforce presence of feeders (your preference is to fail clearly)
     feeder_issues = []
-    if rec_name and not _ok(targ_df):   feeder_issues.append("no receiver targets found")
-    if rush_name and not _ok(rush_df):  feeder_issues.append("no rusher attempts found")
-    if rec_name and not _ok(rz_tgt_df): feeder_issues.append("no receiver red-zone targets found")
-    if rush_name and not _ok(rz_car_df):feeder_issues.append("no rusher red-zone carries found")
-
+    if not _ok(targ_df):   feeder_issues.append("no receiver targets found")
+    if not _ok(rush_df):   feeder_issues.append("no rusher attempts found")
+    if not _ok(rz_tgt_df): feeder_issues.append("no receiver red-zone targets found")
+    if not _ok(rz_car_df): feeder_issues.append("no rusher red-zone carries found")
     if feeder_issues:
-        msg = "[derive_player_from_pbp] Missing feeder data: " + "; ".join(feeder_issues)
-        if STRICT_RZ:
-            raise DataQualityError(msg)
-        issues.append(msg)
+        raise DataQualityError("[derive_player_from_pbp] Missing feeder data: " + "; ".join(feeder_issues))
 
     # ---------- efficiency tables ----------
     rec_yds_df = pd.DataFrame()
-    if rec_name and yards_gained:
+    if yards_gained:
         rec_yds_df = (
             pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name, yards_gained]]
                .groupby([posteam, rec_name], as_index=False)[yards_gained].sum()
                .rename(columns={posteam:"team", rec_name:"player", yards_gained:"rec_yards"})
         )
     yac_df = pd.DataFrame()
-    if rec_name and yac:
+    if yac:
         yac_df = (
             pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name, yac]]
                .groupby([posteam, rec_name], as_index=False)[yac].sum()
                .rename(columns={posteam:"team", rec_name:"player", yac:"yac_sum"})
         )
     rush_yds_df = pd.DataFrame()
-    if rush_name and yards_gained:
+    if yards_gained:
         rush_yds_df = (
             pbp.loc[rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name, yards_gained]]
                .groupby([posteam, rush_name], as_index=False)[yards_gained].sum()
@@ -631,16 +620,16 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     if not _ok(pf):
         raise DataQualityError("[derive_player_from_pbp] No player rows produced after merges")
 
-    # ensure numeric base cols
+    # ensure numeric base cols ALWAYS exist before shares
     for c in ["tgt","rush","rz_tgt","rz_car","rec_yards","yac_sum","rush_yards"]:
         if c not in pf.columns: pf[c] = 0.0
         pf[c] = _safe_num(pf[c]).fillna(0.0)
 
-    # team totals
-    team_tgts   = targ_df.groupby("team", as_index=False)["tgt"].sum()      if _ok(targ_df)   else pd.DataFrame(columns=["team","tgt"])
-    team_rush   = rush_df.groupby("team", as_index=False)["rush"].sum()     if _ok(rush_df)   else pd.DataFrame(columns=["team","rush"])
-    team_rz_tgt = rz_tgt_df.groupby("team", as_index=False)["rz_tgt"].sum() if _ok(rz_tgt_df) else pd.DataFrame(columns=["team","rz_tgt"])
-    team_rz_car = rz_car_df.groupby("team", as_index=False)["rz_car"].sum() if _ok(rz_car_df) else pd.DataFrame(columns=["team","rz_car"])
+    # team totals and ensure *_team cols exist
+    team_tgts   = targ_df.groupby("team", as_index=False)["tgt"].sum()
+    team_rush   = rush_df.groupby("team", as_index=False)["rush"].sum()
+    team_rz_tgt = rz_tgt_df.groupby("team", as_index=False)["rz_tgt"].sum()
+    team_rz_car = rz_car_df.groupby("team", as_index=False)["rz_car"].sum()
 
     pf = pf.merge(team_tgts,   on="team", how="left", suffixes=("","_team"))
     pf = pf.merge(team_rush,   on="team", how="left", suffixes=("","_team"))
@@ -651,28 +640,24 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     rename_map = {"tgt_y":"tgt_team","rush_y":"rush_team","rz_tgt_y":"rz_tgt_team","rz_car_y":"rz_car_team"}
     pf = pf.rename(columns={k:v for k,v in rename_map.items() if k in pf.columns})
 
-    # make sure totals exist (or fail)
+    # assert totals exist & are non-zero somewhere
     required_totals = ["tgt_team","rush_team","rz_tgt_team","rz_car_team"]
     missing_totals = [c for c in required_totals if c not in pf.columns]
     if missing_totals:
         raise DataQualityError("[derive_player_from_pbp] Missing team total columns: " + ", ".join(missing_totals))
     for c in required_totals:
         pf[c] = _safe_num(pf[c]).fillna(0.0)
-
-    # if strict, reject zero totals across-the-board (indicates broken source)
-    zero_totals = [c for c in required_totals if (pf[c].fillna(0.0) == 0).all()]
-    if zero_totals and STRICT_RZ:
-        raise DataQualityError("[derive_player_from_pbp] Team totals are zero for: " + ", ".join(zero_totals))
+    if all((pf["rz_tgt_team"] == 0)):  # the one you’re tripping over
+        raise DataQualityError("[derive_player_from_pbp] rz_tgt_team is zero for all teams — red-zone targets missing in PBP")
 
     # ---------- shares ----------
-    # If STRICT_RZ False, guard to zeros so we complete the file.
-    def safe_div(num, den):
-        return num / den.replace(0, np.nan) if isinstance(den, pd.Series) else num / den
+    def sdiv(num, den):
+        return num / den.replace(0, np.nan)
 
-    pf["target_share"]   = safe_div(pf["tgt"],    pf["tgt_team"])
-    pf["rush_share"]     = safe_div(pf["rush"],   pf["rush_team"])
-    pf["rz_tgt_share"]   = safe_div(pf["rz_tgt"], pf["rz_tgt_team"])
-    pf["rz_carry_share"] = safe_div(pf["rz_car"], pf["rz_car_team"])
+    pf["target_share"]   = sdiv(pf["tgt"],    pf["tgt_team"])
+    pf["rush_share"]     = sdiv(pf["rush"],   pf["rush_team"])
+    pf["rz_tgt_share"]   = sdiv(pf["rz_tgt"], pf["rz_tgt_team"])
+    pf["rz_carry_share"] = sdiv(pf["rz_car"], pf["rz_car_team"])
 
     # ---------- efficiency proxies ----------
     pf["ypt"]        = pf["rec_yards"] / pf["tgt"].replace(0, np.nan)
