@@ -1,170 +1,191 @@
-import os
+# scripts/features_external.py
+# Loads and merges external features onto props:
+# - team_form.csv (plays_est, PROE, RZ rate, and *_z splits)
+# - player_form.csv (shares + efficiency proxies)
+# - weather.csv (wind/temp/precip/dome/altitude)
+# - injuries.csv, roles.csv (role-aware caps/redistribution used by pricing)
+# - coverage.csv, cb_assignments.csv (coverage/CB shadow)
+# - game_lines.csv (home_wp/away_wp → script escalators)
+#
+# Exposes:
+#   enrich_props(props: pd.DataFrame) -> pd.DataFrame
+#   main() for optional CLI (reads outputs/props_raw.csv → outputs/props_enriched.csv)
+
+from __future__ import annotations
 import pandas as pd
-from typing import Tuple, Dict, Optional
+from pathlib import Path
+from typing import List, Dict, Any
 
-# ----- helpers ---------------------------------------------------------------
+# -------- helpers --------
 
-def _read_csv(path: str) -> Optional[pd.DataFrame]:
-    """Read CSV if it exists and is non-empty; else return None."""
+def _read_csv(path: str, required: List[str] | None = None) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        return pd.DataFrame(columns=required or [])
     try:
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            return pd.read_csv(path)
+        df = pd.read_csv(p)
     except Exception:
-        pass
-    return None
+        return pd.DataFrame(columns=required or [])
+    if required:
+        for c in required:
+            if c not in df.columns:
+                df[c] = pd.NA
+    return df
 
-def _safe_lower(x):
-    try:
-        return str(x).strip().lower()
-    except Exception:
-        return x
+def _lower_join(a: pd.DataFrame, b: pd.DataFrame, on: List[str]) -> pd.DataFrame:
+    # case-insensitive join fallback for player names
+    a2, b2 = a.copy(), b.copy()
+    for k in on:
+        a2[f"__{k}__"] = a2[k].astype(str).str.lower()
+        b2[f"__{k}__"] = b2[k].astype(str).str.lower()
+    out = a2.merge(
+        b2.drop(columns=[c for c in on if c in b2.columns]),
+        left_on=[f"__{k}__" for k in on],
+        right_on=[f"__{k}__" for k in on],
+        how="left"
+    )
+    out.drop(columns=[f"__{k}__" for k in on], inplace=True, errors="ignore")
+    return out
 
-def _norm_team_col(df: pd.DataFrame, col: str) -> pd.Series:
-    if col not in df.columns:
-        # return a series of Nones to keep merges safe
-        return pd.Series([None] * len(df), index=df.index)
-    return df[col].astype(str).str.strip().str.upper()
+# -------- loaders --------
 
-# ----- public API ------------------------------------------------------------
+def load_team_form(path: str = "data/team_form.csv") -> pd.DataFrame:
+    req = [
+        "team",
+        "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
+        "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
+        "plays_est","proe","rz_rate",
+    ]
+    return _read_csv(path, req)
 
-def merge_external_features(
-    df: pd.DataFrame,
-    *,
-    team_col: str = "team",
-    opp_col: str = "opp_team",
-    week_col: str = "week",
-    team_form_csv: str = "metrics/team_form.csv",
-    player_form_csv: str = "metrics/player_form.csv",
-    id_map_csv: str = "metrics/id_map.csv",    # your fetch writes to metrics/, keep consistent
-    weather_csv: str = "inputs/weather.csv",
-) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """
-    Merge optional external features into df (props or games).
-    Returns (augmented_df, notes). If inputs are missing/empty, it no-ops.
-    """
+def load_player_form(path: str = "data/player_form.csv") -> pd.DataFrame:
+    req = [
+        "player","team","position",
+        "target_share","rush_share","rz_tgt_share","rz_carry_share",
+        "yprr_proxy","ypc","ypt","qb_ypa"
+    ]
+    return _read_csv(path, req)
 
-    notes: Dict[str, str] = {}
-    out = df.copy()
+def load_weather(path: str = "data/weather.csv") -> pd.DataFrame:
+    req = ["event_id","wind_mph","temp_f","precip","altitude_ft","dome","home_team","away_team","commence_time"]
+    return _read_csv(path, req)
 
-    # Normalize keys we might need
-    out["_team_key_"] = _norm_team_col(out, team_col)
-    out["_opp_key_"]  = _norm_team_col(out, opp_col)
+def load_injuries(path: str = "data/injuries.csv") -> pd.DataFrame:
+    req = ["player","team","status"]
+    return _read_csv(path, req)
 
-    # --- load optional sources
-    team_form   = _read_csv(team_form_csv)
-    player_form = _read_csv(player_form_csv)
-    id_map      = _read_csv(id_map_csv)
-    weather     = _read_csv(weather_csv)
+def load_roles(path: str = "data/roles.csv") -> pd.DataFrame:
+    req = ["player","team","role"]
+    return _read_csv(path, req)
 
-    # ---- TEAM FORM (team-level defensive/offensive environment) -------------
-    if team_form is not None and not team_form.empty:
-        # Expect a 'team' column in team_form (uppercase). If not, try to infer.
-        if "team" in team_form.columns:
-            tf = team_form.copy()
-            tf["team"] = tf["team"].astype(str).str.strip().str.upper()
+def load_coverage(path: str = "data/coverage.csv") -> pd.DataFrame:
+    req = ["defense_team","tag"]
+    return _read_csv(path, req)
 
-            # Prefix columns to avoid collisions
-            tf_cols = [c for c in tf.columns if c not in ("team",)]
-            tf = tf[["team"] + tf_cols]
-            tf = tf.rename(columns={c: f"team_{c}" for c in tf_cols})
+def load_cb_assignments(path: str = "data/cb_assignments.csv") -> pd.DataFrame:
+    # either 'quality' or 'penalty' may exist
+    df = _read_csv(path, ["defense_team","receiver"])
+    for c in ("cb","quality","penalty"):
+        if c not in df.columns:
+            df[c] = pd.NA
+    return df
 
-            # Merge for our team
-            out = out.merge(tf, left_on="_team_key_", right_on="team", how="left")
-            out = out.drop(columns=["team"], errors="ignore")
+def load_game_lines(path: str = "outputs/game_lines.csv") -> pd.DataFrame:
+    req = ["event_id","home_team","away_team","home_wp","away_wp","commence_time"]
+    return _read_csv(path, req)
 
-            # Also try merging opponent form as separate features (optional)
-            tf_opp = team_form.copy()
-            tf_opp["team"] = tf_opp["team"].astype(str).str.strip().str.upper()
-            tf_opp_cols = [c for c in tf_opp.columns if c not in ("team",)]
-            tf_opp = tf_opp[["team"] + tf_opp_cols]
-            tf_opp = tf_opp.rename(columns={c: f"opp_{c}" for c in tf_opp_cols})
+# -------- merge entrypoint --------
 
-            out = out.merge(tf_opp, left_on="_opp_key_", right_on="team", how="left")
-            out = out.drop(columns=["team"], errors="ignore")
+def enrich_props(props: pd.DataFrame) -> pd.DataFrame:
+    if props is None or props.empty:
+        return props
 
-            notes["team_form"] = "merged"
-        else:
-            notes["team_form"] = "missing 'team' column; skipped"
+    # Normalize keys
+    if "id" in props.columns and "event_id" not in props.columns:
+        props = props.rename(columns={"id":"event_id"})
+    # market_internal expected from your ingestion
+    for col in ("player","team","market_internal"):
+        if col not in props.columns:
+            props[col] = pd.NA
+
+    # ---- team_form on team ----
+    tf = load_team_form()
+    if not tf.empty:
+        props = props.merge(tf, on="team", how="left")
+
+    # ---- player_form on (player, team) with fallback case-insensitive join ----
+    pf = load_player_form()
+    if not pf.empty:
+        props = props.merge(pf, on=["player","team"], how="left")
+        if props["target_share"].isna().mean() > 0.6:
+            props = _lower_join(props, pf, on=["player","team"])
+
+    # ---- weather on event_id ----
+    wx = load_weather()
+    if not wx.empty:
+        keep = ["event_id","wind_mph","temp_f","precip","altitude_ft","dome"]
+        props = props.merge(wx[keep], on="event_id", how="left")
     else:
-        notes["team_form"] = "unavailable; skipped"
+        for c in ["wind_mph","temp_f","precip","altitude_ft","dome"]:
+            if c not in props.columns:
+                props[c] = pd.NA
 
-    # ---- PLAYER FORM (per-player rolling or weekly features) -----------------
-    if player_form is not None and not player_form.empty:
-        # Try to find a player key to merge on. We support several common names.
-        player_keys = [c for c in ("player", "player_name", "name") if c in out.columns]
-        pf_keys     = [c for c in ("player", "player_name", "name") if c in player_form.columns]
+    # ---- injuries/roles on (player, team) ----
+    inj = load_injuries()
+    if not inj.empty:
+        inj["status"] = inj["status"].fillna("Unknown")
+        props = props.merge(inj, on=["player","team"], how="left", suffixes=("","_inj"))
 
-        if player_keys and pf_keys:
-            left_key  = player_keys[0]
-            right_key = pf_keys[0]
+    rl = load_roles()
+    if not rl.empty:
+        props = props.merge(rl, on=["player","team"], how="left", suffixes=("","_role"))
+        if "role_role" in props.columns and "role" in props.columns:
+            props["role"] = props["role"].fillna(props["role_role"])
+            props.drop(columns=["role_role"], inplace=True, errors="ignore")
 
-            pf = player_form.copy()
-            pf[right_key] = pf[right_key].astype(str).str.strip().str.lower()
+    # ---- coverage tags on defense team (infer from opponent if present) ----
+    # If your props carry 'opp_team', this is trivial; otherwise, skip or infer later in pricing.
+    cov = load_coverage()
+    if not cov.empty and "opp_team" in props.columns:
+        cov_tag = (cov.groupby("defense_team")["tag"]
+                      .apply(lambda s: "|".join(sorted(set(str(x) for x in s if pd.notna(x)))))
+                      .rename("coverage_tags")).reset_index()
+        props = props.merge(cov_tag, left_on="opp_team", right_on="defense_team", how="left")
+        props.drop(columns=["defense_team"], inplace=True, errors="ignore")
 
-            out[left_key] = out[left_key].astype(str).str.strip().str.lower()
-            # Avoid collisions by prefixing pf columns
-            keep_pf_cols = [c for c in pf.columns if c != right_key]
-            pf = pf[[right_key] + keep_pf_cols]
-            pf = pf.rename(columns={c: f"pf_{c}" for c in keep_pf_cols})
-            out = out.merge(pf, left_on=left_key, right_on=right_key, how="left")
-            out = out.drop(columns=[right_key], errors="ignore")
-            notes["player_form"] = f"merged on {left_key}↔{right_key}"
-        else:
-            notes["player_form"] = "no common player key; skipped"
-    else:
-        notes["player_form"] = "unavailable; skipped"
-
-    # ---- ID MAP (optional; helps map names to ids/teams/pos) -----------------
-    if id_map is not None and not id_map.empty:
-        # Heuristic merge: player name if present; otherwise no-op.
-        if "player_name" in id_map.columns:
-            idm = id_map.copy()
-            idm["player_name"] = idm["player_name"].astype(str).str.strip().str.lower()
-            if "player" in out.columns:
-                out["player"] = out["player"].astype(str).str.strip().str.lower()
-                keep_cols = [c for c in idm.columns if c != "player_name"]
-                idm = idm[["player_name"] + keep_cols]
-                idm = idm.rename(columns={c: f"idmap_{c}" for c in keep_cols})
-                out = out.merge(idm, left_on="player", right_on="player_name", how="left")
-                out = out.drop(columns=["player_name"], errors="ignore")
-                notes["id_map"] = "merged on player"
-            else:
-                notes["id_map"] = "no player column; skipped"
-        else:
-            notes["id_map"] = "missing 'player_name' column; skipped"
-    else:
-        notes["id_map"] = "unavailable; skipped"
-
-    # ---- WEATHER (optional; merge by team/week or by game identifiers) -------
-    if weather is not None and not weather.empty:
-        # Try team+week merge if those exist
-        can_merge_by_team_week = (
-            week_col in out.columns and "team" in weather.columns and "week" in weather.columns
+    # ---- CB assignments (receiver matchups) ----
+    cba = load_cb_assignments()
+    if not cba.empty and "opp_team" in props.columns:
+        props = props.merge(
+            cba.rename(columns={"defense_team":"opp_team","receiver":"player"}),
+            on=["opp_team","player"], how="left", suffixes=("","_cb")
         )
-        if can_merge_by_team_week:
-            wx = weather.copy()
-            wx["team"] = wx["team"].astype(str).str.strip().str.upper()
-            wx["week"] = wx["week"]
 
-            # Prefix columns
-            keep_cols = [c for c in wx.columns if c not in ("team", "week")]
-            wx = wx[["team", "week"] + keep_cols]
-            wx = wx.rename(columns={c: f"wx_{c}" for c in keep_cols})
+    # ---- game lines (for script escalators in pricing) ----
+    gl = load_game_lines()
+    if not gl.empty:
+        props = props.merge(gl[["event_id","home_wp","away_wp"]], on="event_id", how="left")
 
-            out = out.merge(
-                wx, left_on=[ "_team_key_", week_col ], right_on=[ "team", "week" ], how="left"
-            )
-            out = out.drop(columns=["team", "week"], errors="ignore")
-            notes["weather"] = "merged on team+week"
-        else:
-            notes["weather"] = "no team+week keys; skipped"
-    else:
-        notes["weather"] = "unavailable; skipped"
+    return props
 
-    # Housekeeping
-    for col in ("_team_key_", "_opp_key_"):
-        if col in out.columns:
-            out = out.drop(columns=[col], errors="ignore")
+# optional CLI: props_raw -> props_enriched
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Enrich props with external features")
+    ap.add_argument("--in-props", default="outputs/props_raw.csv")
+    ap.add_argument("--out", default="outputs/props_enriched.csv")
+    args = ap.parse_args()
 
-    return out, notes
+    df = _read_csv(args.in_props)
+    if df.empty:
+        print(f"[features_external] input empty: {args.in_props}")
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(args.out, index=False)
+        return
+    out = enrich_props(df)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(args.out, index=False)
+    print(f"[features_external] wrote {len(out)} rows → {args.out}")
 
+if __name__ == "__main__":
+    main()
