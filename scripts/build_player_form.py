@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple
 import pandas as pd
 import requests
+import warnings
 
 # Optional primaries
 try:
@@ -291,58 +292,85 @@ def _from_weekly(wk: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 # Builder (with bundle preference)
 # -----------------------------
+# --- REPLACE your current helper with this ---
 def _maybe_player_form_from_bundle() -> pd.DataFrame:
-    df = pd.DataFrame()
-    if BUNDLE_PLAYER_FORM.exists():
-        df = pd.read_csv(BUNDLE_PLAYER_FORM)
+    """
+    Try to read player_form from the external bundle.
+    Returns an empty DataFrame if the file is missing, empty, or malformed.
+    """
+    p = BUNDLE_PLAYER_FORM
+    need = ["player","team","position","target_share","rush_share",
+            "rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]
+
+    # Guard: file present and non-empty?
+    if not p.exists():
+        print(f"[build_player_form] bundle not found at {p} — skipping.")
+        return pd.DataFrame(columns=need)
+    try:
+        if p.stat().st_size < 5:
+            print(f"[build_player_form] bundle is empty at {p} — skipping.")
+            return pd.DataFrame(columns=need)
+    except Exception:
+        pass
+
+    # Read with robust options
+    try:
+        df = pd.read_csv(p)
+    except pd.errors.EmptyDataError:
+        print(f"[build_player_form] bundle {p} is empty — skipping.")
+        return pd.DataFrame(columns=need)
+    except Exception as e:
+        warnings.warn(f"Failed reading {p}: {type(e).__name__}: {e}")
+        return pd.DataFrame(columns=need)
+
     if df.empty:
-        return df
-    # Standardize to pipeline schema
-    req = ["player","team","position","target_share","rush_share",
-           "rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]
-    for c in req:
+        print(f"[build_player_form] bundle {p} produced 0 rows — skipping.")
+        return pd.DataFrame(columns=need)
+
+    # Minimal schema check; fill anything missing so downstream code is safe
+    for c in need:
         if c not in df.columns:
             df[c] = 0.0
-    if "position" not in df.columns and "role" in df.columns:
-        df["position"] = df["role"].map({
-            "QB":"QB","RB1":"RB","RB2":"RB","WR1":"WR/TE","WR2":"WR/TE","SLOT":"WR/TE","TE1":"WR/TE"
-        }).fillna("")
-    df["team"] = df["team"].astype(str).str.upper()
-    return df[req].fillna(0.0).sort_values(["team","player"]).reset_index(drop=True)
+    if "team" in df.columns:
+        df["team"] = df["team"].astype(str).str.upper()
 
+    keep = need + [c for c in df.columns if c not in need and c in ("week","season")]
+    return df[keep].reset_index(drop=True)
 
+# --- In your builder, ensure this exact early branch exists ---
 def build_player_form(season: int, history: str) -> pd.DataFrame:
-    # 0) Prefer the bundle
+    # 0) External bundle (preferred if present)
     pf = _maybe_player_form_from_bundle()
     if not pf.empty:
+        print(f"[build_player_form] ✅ using bundled player_form ({len(pf)} rows)")
         return pf
 
-    # 1) PBP
+    # 1) PBP (best)
     pbp = _load_pbp(season)
-    pf = _from_pbp(pbp, season)
+    pf  = _from_pbp(pbp, season)
     if not pf.empty:
         return pf
 
-    # 2) Weekly
+    # 2) Weekly (nflverse)
     wk = _load_weekly(season)
     pf = _from_weekly(wk)
     if not pf.empty:
         return pf
 
-    # 3) ESPN (light)
+    # 3) ESPN fallback
     print("[build_player_form] ⚠️ Using ESPN fallback for player shares/efficiency")
     pf = _espn_players_table(season)
     if not pf.empty:
         return pf
 
-    # 4) API-Sports
+    # 4) API-SPORTS fallback
     print("[build_player_form] ⚠️ Using API-SPORTS fallback for player shares")
     _, p = apisports_tables(season)
     pf = _from_weekly(p)
     if not pf.empty:
         return pf
 
-    # 5) MySportsFeeds
+    # 5) MySportsFeeds fallback
     print("[build_player_form] ⚠️ Using MySportsFeeds fallback for player shares")
     _, p = msf_tables(season)
     pf = _from_weekly(p)
