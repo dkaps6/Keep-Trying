@@ -1,4 +1,4 @@
-# scripts/fetch_nfl_data.py
+# === BEGIN scripts/fetch_nfl_data.py (patched full) ===
 from __future__ import annotations
 import argparse, warnings, time, requests
 from pathlib import Path
@@ -72,25 +72,24 @@ def _espn_team_table(season: int) -> pd.DataFrame:
 from .sources.apisports import season_team_player_tables as apisports_tables
 from .sources.mysportsfeeds import season_team_player_tables as msf_tables
 
-# ---- NFLGSIS authenticated fallback ----
+# --- NFLGSIS import shim (works in GitHub Actions and local) ---
+import sys, os
+from pathlib import Path as _PathShim
+_REPO_ROOT = _PathShim(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(_REPO_ROOT / "scripts" / "sources"))
 try:
-    # when running as a package: python -m scripts.fetch_nfl_data
-    from .sources.nflgsis import (
+    from scripts.sources.nflgsis import (
         login_session, list_games, team_player_tables as gsis_team_player_tables
     )
 except Exception:
     try:
-        # when running as a script: python scripts/fetch_nfl_data.py
-        from sources.nflgsis import (
-            login_session, list_games, team_player_tables as gsis_team_player_tables
-        )
-    except Exception:
-        # last resort: adjust path dynamically
-        import os, sys
-        sys.path.append(os.path.join(os.path.dirname(__file__), "sources"))
         from nflgsis import (  # type: ignore
             login_session, list_games, team_player_tables as gsis_team_player_tables
         )
+    except Exception:
+        login_session = list_games = gsis_team_player_tables = None
+# --- end NFLGSIS shim ---
 
 # ---------- Local helpers ----------
 def _is_pass(df: pd.DataFrame) -> pd.Series:
@@ -299,3 +298,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# === END scripts/fetch_nfl_data.py ===
