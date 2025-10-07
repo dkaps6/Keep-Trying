@@ -1,80 +1,59 @@
 #!/usr/bin/env python3
 """
-Unified driver that:
-1) Runs nflverse fetches (and addons) via ./nflverse_csv_fetcher/make_all.py
-2) Pulls optional paid feeds when secrets are present (MSF, NFLGSIS, Odds, API-Sports) — stubs here; won’t crash if missing.
-3) Composes model-ready CSVs:
-      outputs/metrics/team_form.csv
-      outputs/metrics/player_form.csv
-4) Validates non-empty outputs (your workflow will also run scripts/validate_inputs.py).
+Unified driver:
+1) Calls ./nflverse_csv_fetcher/make_all.py (free pulls + addons) if present.
+2) Uses secrets for paid feeds (MSF/NFLGSIS/Odds/API-Sports) — stubs that won't crash if missing.
+3) Composes:
+     outputs/metrics/team_form.csv
+     outputs/metrics/player_form.csv
 """
 from __future__ import annotations
 import argparse, os, sys, subprocess
 from pathlib import Path
 import pandas as pd
 
-
-# ---------- small helpers ----------
-def run(cmd: list[str], allow_fail: bool = False) -> int:
+def run(cmd: list[str]) -> None:
     print(">>", " ".join(cmd))
     rc = subprocess.call(cmd)
-    if rc != 0 and not allow_fail:
+    if rc != 0:
         raise SystemExit(rc)
-    return rc
 
-def exists_nonempty(p: str | Path) -> bool:
+def exists_nonempty(p) -> bool:
     p = Path(p)
     return p.exists() and p.is_file() and p.stat().st_size > 0
 
 def latest_csv(folder: Path, stem_contains: str) -> Path | None:
-    if not folder.exists():
-        return None
-    cands = sorted(
-        [p for p in folder.glob("*.csv") if stem_contains in p.name],
-        key=lambda q: q.stat().st_mtime,
-        reverse=True,
-    )
-    return cands[0] if cands else None
+    if not folder.exists(): return None
+    c = sorted([p for p in folder.glob("*.csv") if stem_contains in p.name],
+               key=lambda q: q.stat().st_mtime, reverse=True)
+    return c[0] if c else None
 
 def safe_left_join(left: pd.DataFrame, right: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
-    if left is None or left.empty:
-        return right.copy()
-    if right is None or right.empty:
-        return left.copy()
+    if left is None or left.empty:  return right.copy()
+    if right is None or right.empty: return left.copy()
     k = [c for c in keys if c in left.columns and c in right.columns]
-    if not k:
-        return left
-    return left.merge(right, on=k, how="left")
+    return left if not k else left.merge(right, on=k, how="left")
 
-
-# ---------- composition ----------
 def compose_team_form(out_root: Path, season: int) -> None:
-    """Team-level EPA splits + PROE + defensive box rates (season-averaged)."""
-    out_root.mkdir(parents=True, exist_ok=True)
     team_stats_dir = out_root / "team_stats"
-    proe_dir      = out_root / "proe"
-    box_dir       = out_root / "box_counts"
+    proe_dir       = out_root / "proe"
+    box_dir        = out_root / "box_counts"
 
-    # start with regular-season team stats if present
     tf = pd.DataFrame()
     reg = latest_csv(team_stats_dir, f"team_stats_reg_{season}")
     if reg and exists_nonempty(reg):
         t = pd.read_csv(reg)
         keep = [c for c in t.columns if c in (
-            "team","season","passing_epa","rushing_epa",
-            "def_pass_epa","def_rush_epa","epa_per_play",
-            "def_epa_per_play","sack_rate"
+            "team","season","passing_epa","rushing_epa","def_pass_epa",
+            "def_rush_epa","epa_per_play","def_epa_per_play","sack_rate"
         )]
-        if keep:
-            tf = t[keep].copy()
+        if keep: tf = t[keep].copy()
 
-    # add PROE (season)
     proe = latest_csv(proe_dir, f"team_proe_season_{season}")
     if proe and exists_nonempty(proe):
         p = pd.read_csv(proe).rename(columns={"posteam":"team"})
         tf = safe_left_join(tf, p[["season","team","season_proe"]], ["season","team"])
 
-    # add defensive box rate season averages
     dbox = latest_csv(box_dir, f"defense_box_rates_week_{season}")
     if dbox and exists_nonempty(dbox):
         d = pd.read_csv(dbox)
@@ -84,41 +63,26 @@ def compose_team_form(out_root: Path, season: int) -> None:
         })
         tf = safe_left_join(tf, g, ["season","team"])
 
-    # rename toward your schema
-    ren = {
+    tf = tf.rename(columns={
         "passing_epa":"off_pass_epa",
         "rushing_epa":"off_rush_epa",
         "epa_per_play":"off_epa_play",
         "def_epa_per_play":"def_epa_play",
         "season_proe":"proe",
         "sack_rate":"def_sack_rate",
-    }
-    tf = tf.rename(columns=ren)
-
+    })
     out = out_root / "metrics" / "team_form.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     tf.to_csv(out, index=False)
     print(f"[compose] wrote {out} ({len(tf)} rows)")
 
-
 def compose_player_form(out_root: Path, season: int) -> None:
-    """
-    Player-level usage + roles + RB metrics.
-    Produces your expected columns exactly (filled with 0.0/'' if a source is missing):
-      team, player, position, target_share, rush_share, rz_tgt_share, rz_carry_share,
-      yprr_proxy, ypc, ypt, qb_ypa
-    """
-    out_root.mkdir(parents=True, exist_ok=True)
     pstats_dir = out_root / "player_stats"
     roles_dir  = out_root / "roles"
     rbm_dir    = out_root / "rb_metrics"
 
-    EXPECT = [
-        "team","player","position",
-        "target_share","rush_share",
-        "rz_tgt_share","rz_carry_share",
-        "yprr_proxy","ypc","ypt","qb_ypa"
-    ]
+    EXPECT = ["team","player","position","target_share","rush_share",
+              "rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]
 
     base = pd.DataFrame(columns=[
         "season","week","team","player_display_name","position",
@@ -128,10 +92,9 @@ def compose_player_form(out_root: Path, season: int) -> None:
     pw = latest_csv(pstats_dir, f"player_stats_week_{season}")
     if pw and exists_nonempty(pw):
         dfp = pd.read_csv(pw)
-        keep = [c for c in base.columns if c in dfp.columns]
-        base = dfp[keep].copy()
+        have = [c for c in base.columns if c in dfp.columns]
+        base = dfp[have].copy()
 
-    # shares
     if not base.empty and {"targets","team"}.issubset(base.columns):
         team_tot = base.groupby(["season","week","team"], as_index=False)["targets"].sum()\
                        .rename(columns={"targets":"team_targets"})
@@ -140,39 +103,24 @@ def compose_player_form(out_root: Path, season: int) -> None:
     else:
         base["target_share"] = 0.0
 
-    # simple aDOT proxy if air_yards present
-    if "air_yards" in base.columns and "targets" in base.columns:
-        base["aDOT"] = base.apply(lambda r: (r["air_yards"]/r["targets"]) if r.get("targets",0)>0 else 0.0, axis=1)
-    else:
-        base["aDOT"] = 0.0
-
-    # roles
     roles_csv = latest_csv(roles_dir, f"roles_weekly_{season}")
     if roles_csv and exists_nonempty(roles_csv):
         rr = pd.read_csv(roles_csv).rename(columns={"role_label":"role"})
-        base = base.merge(
-            rr[["season","week","team","player_display_name","role"]],
-            on=["season","week","team","player_display_name"],
-            how="left"
-        )
+        base = base.merge(rr[["season","week","team","player_display_name","role"]],
+                          on=["season","week","team","player_display_name"], how="left")
 
-    # RB metrics
     rbw = latest_csv(rbm_dir, f"rb_metrics_week_{season}")
     if rbw and exists_nonempty(rbw):
         r = pd.read_csv(rbw).rename(columns={
             "posteam":"team",
-            "rusher_player_name":"player_display_name"
+            "rusher_player_name":"player_display_name",
+            "yards_per_carry":"ypc"
         })
-        base = base.merge(
-            r[["season","week","team","player_display_name","yards_per_carry"]],
-            on=["season","week","team","player_display_name"],
-            how="left"
-        )
-        base = base.rename(columns={"yards_per_carry":"ypc"})
+        base = base.merge(r[["season","week","team","player_display_name","ypc"]],
+                          on=["season","week","team","player_display_name"], how="left")
     else:
         base["ypc"] = 0.0
 
-    # final projection columns (zeros if you don't compute them elsewhere)
     base = base.rename(columns={"player_display_name":"player"})
     out_df = pd.DataFrame()
     out_df["team"]           = base.get("team", "")
@@ -187,82 +135,64 @@ def compose_player_form(out_root: Path, season: int) -> None:
     out_df["ypt"]            = 0.0
     out_df["qb_ypa"]         = 0.0
 
-    # ensure exact order
-    out_df = out_df[EXPECT]
+    out_df = out_df[EXPECT].fillna(0.0)
     out = out_root / "metrics" / "player_form.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(out, index=False)
     print(f"[compose] wrote {out} ({len(out_df)} rows)")
 
-
-# ---------- optional (paid) sources — safe stubs that won’t crash ----------
-def fetch_msf(season: int) -> None:
-    key = os.getenv("MSF_KEY")
-    pw  = os.getenv("MSF_PASSWORD")
-    if not (key and pw):
+def fetch_msf(_season: int) -> None:
+    if not (os.getenv("MSF_KEY") and os.getenv("MSF_PASSWORD")):
         print("[msf] secrets not set; skipping")
         return
-    # TODO: add your MSF pulls here (this is a safe placeholder to avoid failing CI)
-    print("[msf] creds found; add your MSF endpoints here when ready.")
+    print("[msf] creds detected — add MSF endpoints here when ready.")
 
-def fetch_gsis(season: int) -> None:
-    u = os.getenv("NFLGSIS_USERNAME")
-    p = os.getenv("NFLGSIS_PASSWORD")
-    if not (u and p):
+def fetch_gsis(_season: int) -> None:
+    if not (os.getenv("NFLGSIS_USERNAME") and os.getenv("NFLGSIS_PASSWORD")):
         print("[gsis] secrets not set; skipping")
         return
-    # TODO: add your GSIS client here (partner access only)
-    print("[gsis] creds found; add GSIS client calls here if you have partner endpoints.")
+    print("[gsis] creds detected — add GSIS client calls here if you have partner endpoints.")
 
-def fetch_odds(season: int) -> None:
-    k = os.getenv("THE_ODDS_API_KEY")
-    if not k:
+def fetch_odds(_season: int) -> None:
+    if not os.getenv("THE_ODDS_API_KEY"):
         print("[odds] THE_ODDS_API_KEY not set; skipping")
         return
-    # TODO: add odds pulls if you want them staged in outputs/
-    print("[odds] key found; add Odds API calls here if needed.")
+    print("[odds] key detected — add Odds API pulls here if you want them staged.")
 
-
-# ---------- main ----------
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", type=int, default=2025)
-    ap.add_argument("--skip-pbp", action="store_true")
     ap.add_argument("--out", default="outputs")
+    ap.add_argument("--skip-pbp", action="store_true")
     args = ap.parse_args()
 
     repo = Path(__file__).resolve().parent
     out_root = repo / args.out
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # 1) free data fetcher (nflverse + addons)
     fetcher = repo / "nflverse_csv_fetcher" / "make_all.py"
     if fetcher.exists():
         cmd = [sys.executable, str(fetcher), "--season", str(args.season)]
-        if args.skip_pbp:
-            cmd.append("--skip-pbp")
+        if args.skip_pbp: cmd.append("--skip-pbp")
         run(cmd)
     else:
         print("::warning ::nflverse_csv_fetcher/make_all.py missing — skipping free fetch.")
 
-    # 2) optional paid feeds (no-ops if secrets are absent)
     fetch_msf(args.season)
     fetch_gsis(args.season)
     fetch_odds(args.season)
 
-    # 3) compose model-ready CSVs
     compose_team_form(out_root, args.season)
     compose_player_form(out_root, args.season)
 
-    # 4) sanity check
     must = [out_root / "metrics" / "team_form.csv", out_root / "metrics" / "player_form.csv"]
     for m in must:
         if not exists_nonempty(m):
             print(f"::error ::missing or empty {m}")
             return 1
+
     print("✅ make_all completed.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
