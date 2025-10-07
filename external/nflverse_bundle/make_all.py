@@ -235,6 +235,9 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
     """
     if not _ok(pbp):
         return pd.DataFrame(), pd.DataFrame()
+    # --- guard: drop duplicate-named columns (e.g., duplicated 'game_id') ---
+    if pbp.columns.duplicated().any():
+        pbp = pbp.loc[:, ~pbp.columns.duplicated()].copy()
 
     # Column normalization (nflfastR style preferred)
     posteam = _pick(["posteam","offense_team"], pbp) or "posteam"
@@ -296,7 +299,8 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         # approximate seconds per play using negative diffs of game_seconds_remaining
         # order plays per game/possession chronology
         order_cols = [c for c in ["game_id","old_game_id","drive","play_id","index"] if c in p.columns]
-        if not order_cols: order_cols = [p.index.name] if p.index.name else [p.index]
+        order_cols = list(dict.fromkeys(order_cols))  # ensure unique labels
+        if order_cols:
         p = p.sort_values(order_cols)
         p["sec"] = _safe_num(p[sec_rem])
         p["delta"] = -p.groupby([posteam])[ "sec" ].diff().fillna(np.nan)
@@ -367,24 +371,42 @@ def derive_team_from_pbp(pbp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
         proe_season = grp.groupby("team", as_index=False)["proe"].mean()
         env = env.merge(proe_season, on="team", how="left")
 
-    # --- Red-zone trip rate (first entries per game) ---
-    yline_use = yline
-    env["rz_rate"] = 0.0
-    if yline_use:
-        df = pbp.loc[pbp[posteam].notna() & pbp[yline_use].notna(), [game_id, posteam, yline_use]].copy()
-        df = df.rename(columns={posteam:"team"})
-        order_cols = [c for c in ["game_id","old_game_id","drive","play_id","index"] if c in pbp.columns]
-        if order_cols:
-            df = pbp.loc[df.index, [game_id, posteam, yline_use] + order_cols].copy().rename(columns={posteam:"team"})
-            df = df.sort_values(order_cols)
-        df["is_rz"] = _safe_num(df[yline_use]) <= 20
-        df["prev_is_rz"] = df.groupby([game_id, "team"])["is_rz"].shift(1).fillna(False)
-        df["rz_entry"] = df["is_rz"] & (~df["prev_is_rz"])
-        trips = df.groupby([game_id, "team"], as_index=False)["rz_entry"].sum().rename(columns={"rz_entry":"rz_trips"})
-        games = df.groupby(["team", game_id], as_index=False).size().groupby("team", as_index=False).size().rename(columns={"size":"games"})
-        rz = trips.groupby("team", as_index=False)["rz_trips"].mean().rename(columns={"rz_trips":"rz_trips_per_game"})
-        env = env.merge(rz, on="team", how="left")
-        env["rz_rate"] = env["rz_trips_per_game"].fillna(0.0)
+# --- Red-zone trip rate (first entries per game) ---
+# define entry when yardline_100 <= 20 and previous play for same team+game was >20 or different game/team
+yline_use = yline
+env["rz_rate"] = 0.0
+if yline_use:
+    # start with the minimal columns we need
+    df = pbp.loc[
+        pbp[posteam].notna() & pbp[yline_use].notna(),
+        [game_id, posteam, yline_use]
+    ].copy().rename(columns={posteam: "team"})
+
+    # ensure a stable chronological order if these columns exist
+    order_cols = [c for c in ["game_id", "old_game_id", "drive", "play_id", "index"] if c in pbp.columns]
+    order_cols = list(dict.fromkeys(order_cols))  # de-dup to avoid "label is not unique"
+    if order_cols:
+        # re-pull with the ordering columns then sort
+        df = pbp.loc[df.index, [game_id, posteam, yline_use] + order_cols].copy().rename(columns={posteam: "team"})
+        df = df.sort_values(order_cols)
+
+    # mark red-zone on each play
+    df["is_rz"] = _safe_num(df[yline_use]) <= 20
+    # first entry within each game/team is when previous is_rz is False
+    df["prev_is_rz"] = df.groupby([game_id, "team"])["is_rz"].shift(1).fillna(False)
+    df["rz_entry"] = df["is_rz"] & (~df["prev_is_rz"])
+
+    # trips per game, then average across games
+    trips = (df.groupby([game_id, "team"], as_index=False)["rz_entry"]
+               .sum()
+               .rename(columns={"rz_entry": "rz_trips"}))
+    rz = (trips.groupby("team", as_index=False)["rz_trips"]
+              .mean()
+              .rename(columns={"rz_trips": "rz_trips_per_game"}))
+
+    env = env.merge(rz, on="team", how="left")
+    env["rz_rate"] = env["rz_trips_per_game"].fillna(0.0)
+
 
     # --- plays_est from pace ---
     env["plays_est"] = (3600.0 / env["sec_per_play_neutral"].replace(0, np.nan)).fillna(0.0) if "sec_per_play_neutral" in env.columns else 0.0
