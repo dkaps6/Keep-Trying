@@ -12,6 +12,11 @@ import argparse, os, sys, subprocess
 from pathlib import Path
 import pandas as pd
 
+# ensure script runs no matter where it's called from
+ROOT = Path(__file__).resolve().parent
+os.chdir(ROOT)
+sys.path.insert(0, str(ROOT))
+
 def run(cmd: list[str]) -> None:
     print(">>", " ".join(cmd))
     rc = subprocess.call(cmd)
