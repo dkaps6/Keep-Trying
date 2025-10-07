@@ -4,7 +4,7 @@ scipy==1.11.4
 nfl-data-py>=0.3.1
 python-dateutil==2.9.0.post0
 beautifulsoup4
-lxml
+lxml>=5.2.0
 selenium
 nflfastpy
 numpy==1.26.4
