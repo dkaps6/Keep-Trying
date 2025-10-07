@@ -32,22 +32,21 @@ def _to_pandas(obj):
         pass
     return obj
 
-
 def _safe_read_csv(path: Path, **kw) -> pd.DataFrame:
     if path.exists():
         try:
             return pd.read_csv(path, **kw)
+        except pd.errors.EmptyDataError:
+            warnings.warn(f"{path} is empty. Returning empty DataFrame.")
         except Exception:
             warnings.warn(f"Failed reading {path}, returning empty.")
     return pd.DataFrame()
-
 
 def _ensure_cols(df: pd.DataFrame, cols: List[str], fill=0.0) -> pd.DataFrame:
     for c in cols:
         if c not in df.columns:
             df[c] = fill
     return df
-
 
 # -----------------------------
 # nflverse loaders (optional)
@@ -73,7 +72,6 @@ def _load_pbp_year(year: int) -> pd.DataFrame:
             warnings.warn(f"nfl_data_py.import_pbp_data({year}) failed: {type(e).__name__}: {e}")
     return pd.DataFrame()
 
-
 def _load_weekly_year(year: int) -> pd.DataFrame:
     """Weekly player stats – used as extra context if needed."""
     if HAS_NFLREADPY:
@@ -92,7 +90,6 @@ def _load_weekly_year(year: int) -> pd.DataFrame:
             warnings.warn(f"nfl_data_py.import_weekly_data({year}) failed: {type(e).__name__}: {e}")
     return pd.DataFrame()
 
-
 # -----------------------------
 # Team form build
 # -----------------------------
@@ -100,7 +97,6 @@ BUNDLE_TEAM_FORM = Path("outputs/metrics/team_form.csv")
 PFR_ADVANCED = Path("outputs/metrics/pfr_advanced_team.csv")      # optional
 NGS_WEEKLY   = Path("outputs/metrics/ngs_weekly_team.csv")        # optional
 BOX_COUNTS   = Path("outputs/metrics/box_counts_team.csv")        # optional
-
 
 def _maybe_bundle_team() -> pd.DataFrame:
     """Prefer team_form from bundle if present."""
@@ -118,7 +114,6 @@ def _maybe_bundle_team() -> pd.DataFrame:
         df = df.rename(columns={"posteam":"team"})
     df["team"] = df["team"].astype(str).str.upper()
     return df
-
 
 def _augment_with_optionals(team: pd.DataFrame) -> pd.DataFrame:
     """Optionally merge PFR advanced, NGS weekly, and aggregated box counts."""
@@ -151,7 +146,6 @@ def _augment_with_optionals(team: pd.DataFrame) -> pd.DataFrame:
         if pd.api.types.is_numeric_dtype(out[c]):
             out[c] = out[c].fillna(0.0)
     return out
-
 
 def compute_team_form_from_pbp(seasons: List[int]) -> pd.DataFrame:
     """Minimal team-level aggregates from PBP if bundle not present."""
@@ -197,7 +191,6 @@ def compute_team_form_from_pbp(seasons: List[int]) -> pd.DataFrame:
     out["team"] = out["team"].astype(str).str.upper()
     return out
 
-
 def build_team_form(season: int, history: str) -> pd.DataFrame:
     """
     Prefer: outputs/metrics/team_form.csv (bundle)
@@ -226,7 +219,6 @@ def build_team_form(season: int, history: str) -> pd.DataFrame:
     ], fill=0.0)
     return df
 
-
 # -----------------------------
 # CLI
 # -----------------------------
@@ -241,7 +233,6 @@ def main():
     df = build_team_form(args.season, args.history)
     df.to_csv(args.write, index=False)
     print(f"[fetch_nfl_data] ✅ wrote {len(df)} rows → {args.write}")
-
 
 if __name__ == "__main__":
     main()
