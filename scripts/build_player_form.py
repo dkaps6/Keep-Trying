@@ -1,10 +1,29 @@
 # scripts/build_player_form.py
 from __future__ import annotations
-import argparse, warnings, time
+import argparse, warnings, time, sys, os
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 import pandas as pd
 import requests
+
+# --- ensure pandas helper (handles Polars results from some libs) ---
+try:
+    import polars as _pl  # optional
+except Exception:
+    _pl = None
+
+def _to_pd(df):
+    if df is None:
+        return pd.DataFrame()
+    if _pl is not None and isinstance(df, _pl.DataFrame):
+        return df.to_pandas()
+    if hasattr(df, "to_pandas"):
+        try:
+            return df.to_pandas()
+        except Exception:
+            pass
+    return df
+# --- end helper ---
 
 # Primaries
 try:
@@ -23,7 +42,6 @@ from .sources.apisports import season_team_player_tables as apisports_tables
 from .sources.mysportsfeeds import season_team_player_tables as msf_tables
 
 # --- NFLGSIS import shim (works in GitHub Actions and local) ---
-import sys, os
 from pathlib import Path as _PathShim
 _REPO_ROOT = _PathShim(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
@@ -144,6 +162,7 @@ def _load_pbp(season: int) -> pd.DataFrame:
         try:
             print(f"[build_player_form] USING PBP (nflreadpy) {season}")
             df = nrp.load_pbp(seasons=[season])
+            df = _to_pd(df)
             if "season" not in df.columns: df["season"] = season
             return df
         except Exception as e:
@@ -151,7 +170,8 @@ def _load_pbp(season: int) -> pd.DataFrame:
     if HAS_NFL_DATA_PY:
         try:
             print(f"[build_player_form] FALLBACK PBP (nfl_data_py) {season}")
-            return nfl.import_pbp_data([season])
+            df = nfl.import_pbp_data([season])
+            return _to_pd(df)
         except Exception as e:
             warnings.warn(f"nfl_data_py.import_pbp_data failed: {type(e).__name__}: {e}")
     return pd.DataFrame()
@@ -160,20 +180,22 @@ def _load_weekly(season: int) -> pd.DataFrame:
     if HAS_NFLREADPY:
         try:
             print(f"[build_player_form] USING WEEKLY (nflreadpy) {season}")
-            return nrp.load_player_stats(seasons=[season])
+            df = nrp.load_player_stats(seasons=[season])
+            return _to_pd(df)
         except Exception as e:
             warnings.warn(f"nflreadpy.load_player_stats failed: {type(e).__name__}: {e}")
     if HAS_NFL_DATA_PY:
         try:
             print(f"[build_player_form] FALLBACK WEEKLY (nfl_data_py) {season}")
-            return nfl.import_weekly_data([season])
+            df = nfl.import_weekly_data([season])
+            return _to_pd(df)
         except Exception as e:
             warnings.warn(f"nfl_data_py.import_weekly_data failed: {type(e).__name__}: {e}")
     return pd.DataFrame()
 
 # ---------- transforms ----------
 def _from_pbp(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
-    cur = pbp.copy()
+    cur = _to_pd(pbp).copy()
     if "season" in cur.columns:
         cur = cur[cur["season"] == season].copy()
     if cur.empty:
@@ -227,6 +249,7 @@ def _from_pbp(pbp: pd.DataFrame, season: int) -> pd.DataFrame:
     return out.sort_values(["team","player"]).reset_index(drop=True)
 
 def _from_weekly(wk: pd.DataFrame) -> pd.DataFrame:
+    wk = _to_pd(wk)
     if wk is None or wk.empty:
         return pd.DataFrame()
     # normalize
@@ -314,19 +337,17 @@ def build_player_form(season: int, history: str) -> pd.DataFrame:
             if games:
                 game_ids = [g["id"] for g in games][:30]
                 _, p = gsis_team_player_tables(s, game_ids, limit=30)
-                # Map to weekly-like schema if needed
-                if "player_name" not in p.columns and "player" in p.columns:
-                    p = p.rename(columns={"player": "player_name"})
-                if "recent_team" not in p.columns and "team" in p.columns:
-                    p = p.rename(columns={"team": "recent_team"})
-                # Use the weekly aggregator shape
-                p = p.rename(columns={
-                    "player_name": "player",
-                    "recent_team": "team"
-                })
-                pf = _from_weekly(p) if "_from_weekly" in globals() else p
-                if pf is not None and not pf.empty:
-                    return pf
+                if not isinstance(p, pd.DataFrame):
+                    p = _to_pd(p)
+                if not p.empty:
+                    # Minimal schema align (player, team, attempts/carries/targets/yards if present)
+                    if "player_name" in p.columns and "player" not in p.columns:
+                        p = p.rename(columns={"player_name": "player"})
+                    if "recent_team" in p.columns and "team" not in p.columns:
+                        p = p.rename(columns={"recent_team": "team"})
+                    pf = _from_weekly(p)
+                    if pf is not None and not pf.empty:
+                        return pf
     except Exception as e:
         warnings.warn(f"NFLGSIS player fallback failed: {type(e).__name__}: {e}")
 
@@ -344,6 +365,10 @@ def main():
     df = build_player_form(args.season, args.history)
     df.to_csv(args.write, index=False)
     print(f"[build_player_form] ✅ wrote {len(df)} rows → {args.write}")
+
+if __name__ == "__main__":
+    main()
+
 
 if __name__ == "__main__":
     main()
