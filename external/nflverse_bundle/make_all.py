@@ -519,36 +519,30 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
       yprr_proxy, ypc, ypt, qb_ypa
     """
     if not _ok(pbp):
-        raise DataQualityError("[derive_player_from_pbp] PBP table is empty — cannot compute player shares")
+        raise RuntimeError("[derive_player_from_pbp] PBP table is empty — cannot compute player shares")
 
     posteam = _pick(["posteam","offense_team"], pbp) or "posteam"
 
-    # Names (nflfastR cols)
+    # Names (nflfastR-ish)
     rec_name  = _pick(["receiver_player_name","receiver","receiver_name"], pbp)
     rush_name = _pick(["rusher_player_name","rusher","rusher_name"], pbp)
     pass_name = _pick(["passer_player_name","passer","passer_name","qb_player_name"], pbp)
-
+    yline     = _pick(["yardline_100","yardline"], pbp)
     yards_gained = _pick(["yards_gained","yards"], pbp)
-    yac         = _pick(["yards_after_catch","yac"], pbp)
-    yline       = _pick(["yardline_100","yardline"], pbp)
+    yac          = _pick(["yards_after_catch","yac"], pbp)
 
-    # Hard requirements for the stats you asked to model
+    # Hard requirements for the stats we’re producing
     missing_bits = []
-    if not rec_name:
-        missing_bits.append("receiver name column (receiver_player_name/receiver/receiver_name)")
-    if not rush_name:
-        missing_bits.append("rusher name column (rusher_player_name/rusher/rusher_name)")
-    if not yline:
-        missing_bits.append("yardline_100/yardline (needed for red-zone shares)")
-
+    if not rec_name:  missing_bits.append("receiver name (receiver_player_name/receiver/receiver_name)")
+    if not rush_name: missing_bits.append("rusher name (rusher_player_name/rusher/rusher_name)")
+    if not yline:     missing_bits.append("yardline_100/yardline (needed for red-zone shares)")
     if missing_bits:
-        # You prefer not to proceed with missing inputs → fail fast
-        raise DataQualityError("[derive_player_from_pbp] Missing required PBP columns: " + ", ".join(missing_bits))
+        raise RuntimeError("[derive_player_from_pbp] Missing required PBP columns: " + ", ".join(missing_bits))
 
     pass_flag = _bool_col(pbp, ["pass","is_pass","qb_dropback"])
     rush_flag = _bool_col(pbp, ["rush","is_rush"]) & ~pass_flag
 
-    # ---------- per-player counting tables ----------
+    # ---------- counting tables ----------
     targ_df = (
         pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name]]
            .assign(tgt=1)
@@ -563,7 +557,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
            .rename(columns={posteam:"team", rush_name:"player"})
     )
 
-    # red-zone events
     rz_mask = _safe_num(pbp[yline]) <= 20
 
     rz_tgt_df = (
@@ -580,14 +573,14 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
            .rename(columns={posteam:"team", rush_name:"player"})
     )
 
-    # Enforce presence of feeders (your preference is to fail clearly)
+    # If any feeders are empty, stop (your preference is strict, not silent zeros)
     feeder_issues = []
     if not _ok(targ_df):   feeder_issues.append("no receiver targets found")
     if not _ok(rush_df):   feeder_issues.append("no rusher attempts found")
     if not _ok(rz_tgt_df): feeder_issues.append("no receiver red-zone targets found")
     if not _ok(rz_car_df): feeder_issues.append("no rusher red-zone carries found")
     if feeder_issues:
-        raise DataQualityError("[derive_player_from_pbp] Missing feeder data: " + "; ".join(feeder_issues))
+        raise RuntimeError("[derive_player_from_pbp] Missing feeder data: " + "; ".join(feeder_issues))
 
     # ---------- efficiency tables ----------
     rec_yds_df = pd.DataFrame()
@@ -618,14 +611,15 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
         if _ok(base):
             pf = pf.merge(base, on=["team","player"], how="outer") if _ok(pf) else base.copy()
     if not _ok(pf):
-        raise DataQualityError("[derive_player_from_pbp] No player rows produced after merges")
+        raise RuntimeError("[derive_player_from_pbp] No player rows produced after merges")
 
-    # ensure numeric base cols ALWAYS exist before shares
+    # make sure numeric feeders exist
     for c in ["tgt","rush","rz_tgt","rz_car","rec_yards","yac_sum","rush_yards"]:
-        if c not in pf.columns: pf[c] = 0.0
+        if c not in pf.columns:
+            pf[c] = 0.0
         pf[c] = _safe_num(pf[c]).fillna(0.0)
 
-    # team totals and ensure *_team cols exist
+    # team totals
     team_tgts   = targ_df.groupby("team", as_index=False)["tgt"].sum()
     team_rush   = rush_df.groupby("team", as_index=False)["rush"].sum()
     team_rz_tgt = rz_tgt_df.groupby("team", as_index=False)["rz_tgt"].sum()
@@ -636,24 +630,23 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     pf = pf.merge(team_rz_tgt, on="team", how="left")
     pf = pf.merge(team_rz_car, on="team", how="left", suffixes=("","_team"))
 
-    # normalize *_team names if suffixes collide
+    # normalize *_team names if merge created _y columns
     rename_map = {"tgt_y":"tgt_team","rush_y":"rush_team","rz_tgt_y":"rz_tgt_team","rz_car_y":"rz_car_team"}
     pf = pf.rename(columns={k:v for k,v in rename_map.items() if k in pf.columns})
 
-    # assert totals exist & are non-zero somewhere
-    required_totals = ["tgt_team","rush_team","rz_tgt_team","rz_car_team"]
-    missing_totals = [c for c in required_totals if c not in pf.columns]
-    if missing_totals:
-        raise DataQualityError("[derive_player_from_pbp] Missing team total columns: " + ", ".join(missing_totals))
-    for c in required_totals:
-        pf[c] = _safe_num(pf[c]).fillna(0.0)
-    if all((pf["rz_tgt_team"] == 0)):  # the one you’re tripping over
-        raise DataQualityError("[derive_player_from_pbp] rz_tgt_team is zero for all teams — red-zone targets missing in PBP")
+    # —— STRICT validation *before* computing shares (this is where your KeyError came from)
+    missing_cols = [c for c in ["rz_tgt","rz_tgt_team"] if c not in pf.columns]
+    if missing_cols:
+        raise RuntimeError("[derive_player_from_pbp] Expected columns missing after merges: "
+                           + ", ".join(missing_cols)
+                           + " — check receiver names and yardline columns in the 2025 PBP.")
+    # also ensure there is at least some signal (otherwise shares will be NA/inf)
+    if (pf["rz_tgt"].sum() == 0) or (pf["rz_tgt_team"].sum() == 0):
+        raise RuntimeError("[derive_player_from_pbp] Red-zone target counts are zero for all rows/teams — "
+                           "source PBP lacks receiver RZ targets for 2025. Cannot produce rz_tgt_share.")
 
     # ---------- shares ----------
-    def sdiv(num, den):
-        return num / den.replace(0, np.nan)
-
+    def sdiv(num, den): return num / den.replace(0, np.nan)
     pf["target_share"]   = sdiv(pf["tgt"],    pf["tgt_team"])
     pf["rush_share"]     = sdiv(pf["rush"],   pf["rush_team"])
     pf["rz_tgt_share"]   = sdiv(pf["rz_tgt"], pf["rz_tgt_team"])
@@ -664,7 +657,7 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     pf["ypc"]        = pf["rush_yards"] / pf["rush"].replace(0, np.nan)
     pf["yprr_proxy"] = pf["ypt"]
 
-    # QB YPA (by passer)
+    # QB YPA
     qb = pd.DataFrame(columns=["player","team","qb_ypa"])
     if pass_name and yards_gained:
         pa = (pbp.loc[pass_flag & pbp[pass_name].notna() & pbp[posteam].notna(), [posteam, pass_name]]
@@ -680,7 +673,7 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
 
     pf = pf.merge(qb, on=["team","player"], how="left")
 
-    # final output schema
+    # final schema
     pf2 = pf[["player","team"]].copy()
     pf2["position"] = ""
     for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]:
