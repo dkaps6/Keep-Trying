@@ -427,7 +427,6 @@ if yline_use:
         "proe": env["proe"].fillna(0.0),
         "rz_rate": env["rz_rate"].fillna(0.0),
     })
-
     return out, proe_week
 
 def derive_player_from_pbp(pbp: pd.DataFrame) -> pd.DataFrame:
