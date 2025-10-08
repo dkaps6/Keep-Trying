@@ -79,16 +79,20 @@ jobs:
           set -e
           echo "Repo root: $(pwd)"
           ls -la
-
+          
+          - name: Fetch free data + compose (nflverse + addons)
+            run: |
+                set -euo pipefail
+                
           if [ -f make_all.py ]; then
             echo "Found: ./make_all.py"
-            python make_all.py --season "${{ github.event.inputs.season }}"
+            python make_all.py --season "${{ github.event.inputs.season }}" --strict 0
           elif [ -f nflverse_csv_fetcher/make_all.py ]; then
             echo "Found: nflverse_csv_fetcher/make_all.py"
-            python nflverse_csv_fetcher/make_all.py --season "${{ github.event.inputs.season }}"
+            python nflverse_csv_fetcher/make_all.py --season "${{ github.event.inputs.season }}" --strict 0
           elif [ -f external/nflverse_bundle/make_all.py ]; then
             echo "Found: external/nflverse_bundle/make_all.py"
-            python external/nflverse_bundle/make_all.py --season "${{ github.event.inputs.season }}"
+            python external/nflverse_bundle/make_all.py --season "${{ github.event.inputs.season }}" --strict 0
           else
             echo "::error ::make_all.py not found in ./, nflverse_csv_fetcher/, or external/nflverse_bundle/"
             exit 1
