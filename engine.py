@@ -8,7 +8,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
+from pathlib import Path
 
+# local data folder
+REPO = Path(__file__).resolve().parent
+DATA = REPO / "data"
+
+def _read_soft(p: Path) -> pd.DataFrame:
+    """Gracefully read a CSV file or return an empty DataFrame."""
+    try:
+        if p.exists() and p.stat().st_size > 0:
+            return pd.read_csv(p)
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 # -----------------------------
 # Logging
@@ -220,6 +233,8 @@ def run_pipeline(
     events: Optional[str] = None,
     write_dir: str = "outputs",
     basename: Optional[str] = None,
+    odds_game_df: Optional[pd.DataFrame] = None,   
+    odds_props_df: Optional[pd.DataFrame] = None,
 ) -> int:
     """
     Orchestrates the end-to-end pricing run.
@@ -236,6 +251,13 @@ def run_pipeline(
         _log(f"fetching props… date={date} season={season}")
         _log(f"markets={','.join(markets_list) if markets_list else 'default'} order={order} books={books}")
         _log(f"selection={_none_if_blank(selection)} window={window} hours={eff_hours} cap={cap}")
+        # Odds consensus fallbacks (safe hybrid)
+        if odds_game_df is None:
+            odds_game_df = _read_soft(DATA / "odds_game_consensus.csv")
+        if odds_props_df is None:
+            odds_props_df = _read_soft(DATA / "odds_props_consensus.csv")
+
+        _log(f"odds_game rows={len(odds_game_df)}; odds_props rows={len(odds_props_df)}")
 
         # Resolve modules
         fetch_fn = _import_odds_fetcher()
