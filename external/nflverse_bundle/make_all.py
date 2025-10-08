@@ -898,62 +898,34 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
             "yprr_proxy","ypc","ypt","qb_ypa"
         ])
 
-    # feeders present (create & clean if missing)
-    for c in ["tgt","rush","rz_tgt","rz_car","rec_yards","yac_sum","rush_yards"]:
-        if c not in pf.columns: pf[c] = 0.0
-        pf[c] = _safe_num(pf[c]).fillna(0.0)
+# (everything above remains as-is)
+pf["position"] = pf["position"].fillna("")
+for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]:
+    if c not in pf.columns: pf[c] = 0.0
+    pf[c] = pf[c].fillna(0.0)
 
-        # ---------- team totals (safe even if the source tables are empty) ----------
-    def _safe_group_sum(df_in: pd.DataFrame, col: str) -> pd.DataFrame:
-        if not _ok(df_in) or col not in df_in.columns:
-            return pd.DataFrame({"team": [], col: []})
-        return df_in.groupby("team", as_index=False)[col].sum()
+# 👇 DELETE this old line:
+# return pf2
 
-    team_tgts   = _safe_group_sum(targ_df,   "tgt")
-    team_rush   = _safe_group_sum(rush_df,   "rush")
-    team_rz_tgt = _safe_group_sum(rz_tgt_df, "rz_tgt")
-    team_rz_car = _safe_group_sum(rz_car_df, "rz_car")
+# 👇 PASTE this new final block instead:
+# ---------- final schema (always defined) ----------
+cols_out = [
+    "target_share","rush_share","rz_tgt_share","rz_carry_share",
+    "yprr_proxy","ypc","ypt","qb_ypa"
+]
 
-    pf = pf.merge(team_tgts,   on="team", how="left", suffixes=("", "_team"))
-    pf = pf.merge(team_rush,   on="team", how="left", suffixes=("", "_team"))
-    pf = pf.merge(team_rz_tgt, on="team", how="left")
-    pf = pf.merge(team_rz_car, on="team", how="left", suffixes=("", "_team"))
+pf_out = pf[["player","team"]].copy()
+pf_out["position"] = ""
 
-    # If merges produced “_x/_y” columns, normalize them to *_team
-    ren = {}
-    if "tgt_y" in pf.columns:    ren["tgt_y"]    = "tgt_team"
-    if "rush_y" in pf.columns:   ren["rush_y"]   = "rush_team"
-    if "rz_tgt_y" in pf.columns: ren["rz_tgt_y"] = "rz_tgt_team"
-    if "rz_car_y" in pf.columns: ren["rz_car_y"] = "rz_car_team"
-    pf = pf.rename(columns=ren)
+for c in cols_out:
+    series = pf[c] if c in pf.columns else pd.Series(np.nan, index=pf.index)
+    pf_out[c] = _safe_num(series).astype(float)
 
-    # ---------- guarantee all numeric feeders exist (zeros if missing) ----------
-    need_num = [
-        "tgt","rush","rz_tgt","rz_car",
-        "rec_yards","yac_sum","rush_yards",
-        "tgt_team","rush_team","rz_tgt_team","rz_car_team",
-    ]
-    for c in need_num:
-        if c not in pf.columns:
-            pf[c] = 0.0
-        else:
-            pf[c] = _safe_num(pf[c]).fillna(0.0)
+if not strict:
+    for c in cols_out:
+        pf_out[c] = pf_out[c].fillna(0.0)
 
-    # ---------- shares (no KeyErrors) ----------
-    def sdiv(num: pd.Series, den: pd.Series) -> pd.Series:
-        return num / den.replace(0, np.nan)
-
-    pf["target_share"]   = sdiv(pf["tgt"],    pf["tgt_team"])
-    pf["rush_share"]     = sdiv(pf["rush"],   pf["rush_team"])
-    pf["rz_tgt_share"]   = sdiv(pf["rz_tgt"], pf["rz_tgt_team"])
-    pf["rz_carry_share"] = sdiv(pf["rz_car"], pf["rz_car_team"])
-
-    # In non-strict runs, fill NaNs from missing feeders with zeros so we don’t crash downstream
-    if not strict:
-        for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share"]:
-            pf[c] = pf[c].fillna(0.0)
-
-    return pf2
+return pf_out
 
 # ============================
 # ===== COMPOSERS ============
