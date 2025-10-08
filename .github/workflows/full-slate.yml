@@ -32,6 +32,8 @@ jobs:
             python external/nflverse_bundle/fetch_all.py --season 2025 || true
           fi
 
+      # --- earlier steps (fetchers, addons, etc) ---
+
       - name: Compose metrics
         env:
           # strict=0 so we don't hard-fail on sparse inputs
@@ -41,33 +43,33 @@ jobs:
             python external/nflverse_bundle/make_all.py --season 2025 || true
           fi
 
-      # 👇 NEW: ensure placeholder CSVs exist *before* validation
+      # 🆕 NEW SECTION STARTS HERE -----------------------------
       - name: Bootstrap placeholder CSVs
         run: python scripts/bootstrap_datapack_placeholders.py
 
-      # 👇 NEW: quick sanity check so you can see headers & sizes in logs
       - name: Sanity check placeholders
         run: |
           python - <<'PY'
           from pathlib import Path
           import pandas as pd
           files = [
-            "data/weather.csv","data/roles.csv","data/injuries.csv",
-            "data/coverage.csv","data/cb_assignments.csv",
-            "outputs/game_lines.csv","outputs/props_raw.csv",
+              "data/weather.csv","data/roles.csv","data/injuries.csv",
+              "data/coverage.csv","data/cb_assignments.csv",
+              "outputs/game_lines.csv","outputs/props_raw.csv",
           ]
           for f in files:
               p = Path(f)
-              print(f"→ {f}: exists={p.exists()} size={(p.stat().st_size if p.exists() else 0)}")
+              print(f"> {f}: exists={p.exists()} size={(p.stat().st_size if p.exists() else 0)}")
               if p.exists() and p.stat().st_size>0:
                   try:
                       print("   columns:", pd.read_csv(p, nrows=1).columns.tolist())
                   except Exception as e:
-                      print("   ⚠️ read error:", e)
+                      print("⚠️  read error:", e)
           PY
           ls -la data || true
-          ls -la outputs || true
+          l s -la outputs || true
+      # 🆕 NEW SECTION ENDS HERE -------------------------------
 
-      # ✅ Now validation will have readable files with correct headers
+      # Now validation will have readable files with correct headers
       - name: Validate data pack outputs
         run: python scripts/validate_inputs.py
