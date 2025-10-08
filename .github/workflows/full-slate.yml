@@ -23,9 +23,14 @@ on:
         required: false
         default: ""
       odds_markets:
-        description: "Markets to include (comma-separated). e.g. spreads,totals,ml,player_points,player_receptions"
+        description: "Markets to include (comma-separated). Leave BLANK to fetch ALL markets (game lines + ALL player props incl. anytime TD)."
         required: false
         default: "spreads,totals,ml"
+      all_markets:
+        description: "Fetch ALL markets (overrides 'markets')"
+        type: boolean
+        required: false
+        default: true
       odds_books:
         description: "Bookmakers to include (comma-separated keys)"
         required: false
@@ -68,7 +73,7 @@ jobs:
       ODDS_PROPS_ONLY:  ${{ github.event.inputs.odds_props_only }}
       ODDS_SIDES_ONLY:  ${{ github.event.inputs.odds_sides_only }}
       ODDS_CAP:         ${{ github.event.inputs.odds_cap }}
-      
+      ODDS_ALL_MARKETS: ${{ github.event.inputs.all_markets }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
