@@ -903,67 +903,55 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
         if c not in pf.columns: pf[c] = 0.0
         pf[c] = _safe_num(pf[c]).fillna(0.0)
 
-    # team totals (safe even if the base is empty)
-    def safe_group(df, col):
-        return (df.groupby("team", as_index=False)[col].sum()) if _ok(df) else pd.DataFrame({"team":[] , col:[]})
+        # ---------- team totals (safe even if the source tables are empty) ----------
+    def _safe_group_sum(df_in: pd.DataFrame, col: str) -> pd.DataFrame:
+        if not _ok(df_in) or col not in df_in.columns:
+            return pd.DataFrame({"team": [], col: []})
+        return df_in.groupby("team", as_index=False)[col].sum()
 
-    team_tgts   = safe_group(targ_df,   "tgt")
-    team_rush   = safe_group(rush_df,   "rush")
-    team_rz_tgt = safe_group(rz_tgt_df, "rz_tgt")
-    team_rz_car = safe_group(rz_car_df, "rz_car")
+    team_tgts   = _safe_group_sum(targ_df,   "tgt")
+    team_rush   = _safe_group_sum(rush_df,   "rush")
+    team_rz_tgt = _safe_group_sum(rz_tgt_df, "rz_tgt")
+    team_rz_car = _safe_group_sum(rz_car_df, "rz_car")
 
-    pf = pf.merge(team_tgts,   on="team", how="left", suffixes=("","_team"))
-    pf = pf.merge(team_rush,   on="team", how="left", suffixes=("","_team"))
+    pf = pf.merge(team_tgts,   on="team", how="left", suffixes=("", "_team"))
+    pf = pf.merge(team_rush,   on="team", how="left", suffixes=("", "_team"))
     pf = pf.merge(team_rz_tgt, on="team", how="left")
-    pf = pf.merge(team_rz_car, on="team", how="left", suffixes=("","_team"))
+    pf = pf.merge(team_rz_car, on="team", how="left", suffixes=("", "_team"))
 
-    # normalize *_team names if merge created _y columns
-    rename_map = {"tgt_y":"tgt_team","rush_y":"rush_team","rz_tgt_y":"rz_tgt_team","rz_car_y":"rz_car_team"}
-    pf = pf.rename(columns={k:v for k,v in rename_map.items() if k in pf.columns})
+    # If merges produced “_x/_y” columns, normalize them to *_team
+    ren = {}
+    if "tgt_y" in pf.columns:    ren["tgt_y"]    = "tgt_team"
+    if "rush_y" in pf.columns:   ren["rush_y"]   = "rush_team"
+    if "rz_tgt_y" in pf.columns: ren["rz_tgt_y"] = "rz_tgt_team"
+    if "rz_car_y" in pf.columns: ren["rz_car_y"] = "rz_car_team"
+    pf = pf.rename(columns=ren)
 
-    for c in ["tgt_team","rush_team","rz_tgt_team","rz_car_team"]:
-        if c not in pf.columns: pf[c] = 0.0
-        pf[c] = _safe_num(pf[c]).fillna(0.0)
+    # ---------- guarantee all numeric feeders exist (zeros if missing) ----------
+    need_num = [
+        "tgt","rush","rz_tgt","rz_car",
+        "rec_yards","yac_sum","rush_yards",
+        "tgt_team","rush_team","rz_tgt_team","rz_car_team",
+    ]
+    for c in need_num:
+        if c not in pf.columns:
+            pf[c] = 0.0
+        else:
+            pf[c] = _safe_num(pf[c]).fillna(0.0)
 
-    # ---------- shares ----------
-    def sdiv(num, den): return num / den.replace(0, np.nan)
+    # ---------- shares (no KeyErrors) ----------
+    def sdiv(num: pd.Series, den: pd.Series) -> pd.Series:
+        return num / den.replace(0, np.nan)
+
     pf["target_share"]   = sdiv(pf["tgt"],    pf["tgt_team"])
     pf["rush_share"]     = sdiv(pf["rush"],   pf["rush_team"])
     pf["rz_tgt_share"]   = sdiv(pf["rz_tgt"], pf["rz_tgt_team"])
     pf["rz_carry_share"] = sdiv(pf["rz_car"], pf["rz_car_team"])
 
+    # In non-strict runs, fill NaNs from missing feeders with zeros so we don’t crash downstream
     if not strict:
         for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share"]:
             pf[c] = pf[c].fillna(0.0)
-
-    # ---------- efficiency proxies ----------
-    pf["ypt"]        = pf["rec_yards"] / pf["tgt"].replace(0, np.nan)
-    pf["ypc"]        = pf["rush_yards"] / pf["rush"].replace(0, np.nan)
-    pf["yprr_proxy"] = pf["ypt"]
-
-    # QB YPA (best-effort)
-    qb = pd.DataFrame(columns=["player","team","qb_ypa"])
-    if pass_name and yards_gained:
-        pa = (pbp.loc[pass_flag & pbp[pass_name].notna() & pbp[posteam].notna(), [posteam, pass_name]]
-                .assign(att=1)
-                .groupby([posteam, pass_name], as_index=False)["att"].sum()
-                .rename(columns={posteam:"team", pass_name:"player"}))
-        py = (pbp.loc[pass_flag & pbp[pass_name].notna() & pbp[posteam].notna(), [posteam, pass_name, yards_gained]]
-                .groupby([posteam, pass_name], as_index=False)[yards_gained].sum()
-                .rename(columns={posteam:"team", pass_name:"player", yards_gained:"pass_yards"}))
-        qb = pa.merge(py, on=["team","player"], how="left")
-        qb["qb_ypa"] = qb["pass_yards"] / qb["att"].replace(0, np.nan)
-        qb = qb[["team","player","qb_ypa"]]
-
-    pf = pf.merge(qb, on=["team","player"], how="left")
-
-    # final schema
-    pf2 = pf[["player","team"]].copy()
-    pf2["position"] = ""
-    for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]:
-        pf2[c] = _safe_num(pf.get(c, np.nan)).astype(float)
-        if not strict:
-            pf2[c] = pf2[c].fillna(0.0)
 
     return pf2
 
