@@ -133,6 +133,7 @@ jobs:
           runp external/nflverse_bundle/addons/derive_roles.py
           runp external/nflverse_bundle/addons/derive_rb_metrics.py
           runp external/nflverse_bundle/addons/fetch_injuries_espn.py
+          runp external/nflverse_bundle/addons/fetch_odds.py
 
       # -----------------------------
       # COMPOSE (call whichever make_all exists)
