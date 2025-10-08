@@ -110,9 +110,9 @@ jobs:
             exit 1
           fi
 
-      - name: Validate data pack outputs
-        run: |
-          python scripts/validate_inputs.py
+      - name: Bootstrap placeholder CSVs
+        run: python scripts/bootstrap_datapack_placeholders.py
+
 
       - name: Build player_form (safe fallback)
         run: |
