@@ -882,9 +882,9 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     if rush_name and yards_gained:
         rush_yds_df = (
             pbp.loc[rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name, yards_gained]]
-               .groupby([posteam, rush_name], as_index=False)[yards_gained].sum()
-               .rename(columns={posteam:"team", rush_name:"player", yards_gained:"rush_yards"})  # <- fixed: posteam
-        )
+                .groupby([posteam, rush_name], as_index=False)[yards_gained].sum()
+                .rename(columns={posteam: "team", rush_name: "player", yards_gained: "rush_yards"})
+    )
 
     # ---------- merge per-player ----------
     pf = pd.DataFrame(columns=["player","team"])
