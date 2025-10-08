@@ -152,7 +152,7 @@ jobs:
           STRICT_FLAG=""
           if [ -n "${STRICT}" ]; then STRICT_FLAG="--strict ${STRICT}"; fi
 
-    python external/nflverse_bundle/make_all.py --season "${SEASON}" ${STRICT_FLAG}
+          python external/nflverse_bundle/make_all.py --season "${SEASON}" ${STRICT_FLAG}
 
 
           if [ -f external/nflverse_bundle/make_all.py ]; then
