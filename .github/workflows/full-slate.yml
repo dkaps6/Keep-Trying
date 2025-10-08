@@ -1,131 +1,177 @@
-name: Full Slate
+name: Full slate (fetch + compose + validate)
 
 on:
   workflow_dispatch:
+    inputs:
+      season:
+        description: NFL season
+        required: false
+        default: "2025"
   push:
     branches: [ main ]
+    paths:
+      - "**/*.py"
+      - ".github/workflows/**"
+  schedule:
+    - cron: "0 13 * * 4"   # Thu 13:00 UTC (edit/remove if you like)
+
+concurrency:
+  group: full-slate-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # default to 2025; allow override from workflow_dispatch input
+      SEASON: ${{ github.event.inputs.season || '2025' }}
+      STRICT: "0"            # non-strict (don’t die on sparse vendor data)
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # provider secrets (only used if present)
+      MSF_API_KEY: ${{ secrets.MSF_API_KEY }}
+      APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
+      GSIS_USERNAME: ${{ secrets.GSIS_USERNAME }}
+      GSIS_PASSWORD: ${{ secrets.GSIS_PASSWORD }}
+      ESPN_S2: ${{ secrets.ESPN_S2 }}
+      SWID: ${{ secrets.SWID }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+
     steps:
-      - name: Check out repo
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: |
-          python -m pip install -U pip
-          pip install -r requirements.txt || true
-
-    # ---------- FETCH RAW FEEDS ----------
-      - name: Fetch raw data (multi-provider fallbacks)
-        env:
-        MSF_API_KEY: ${{ secrets.MSF_API_KEY }}
-        APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
-        GSIS_USERNAME: ${{ secrets.GSIS_USERNAME }}
-        GSIS_PASSWORD: ${{ secrets.GSIS_PASSWORD }}
-        ESPN_S2: ${{ secrets.ESPN_S2 }}
-        SWID: ${{ secrets.SWID }}
+      - name: Install Python deps
+        shell: bash
         run: |
           set -e
-          echo "[fetch_all] season=2025"
-          if [ -f external/nflverse_bundle/fetch_all.py ]; then
-          python external/nflverse_bundle/fetch_all.py --season 2025
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
           else
-          echo "WARN: fetch_all.py not found; skipping."
+            # minimal stack if no requirements.txt
+            pip install pandas numpy pyarrow requests lxml
           fi
 
-    # ---------- COMPOSE METRICS ----------
-      - name: Compose metrics (make_all) with strict=0
-        env:
-        STRICT: "0"
-        MSF_API_KEY: ${{ secrets.MSF_API_KEY }}
-        APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
-        GSIS_USERNAME: ${{ secrets.GSIS_USERNAME }}
-        GSIS_PASSWORD: ${{ secrets.GSIS_PASSWORD }}
-        ESPN_S2: ${{ secrets.ESPN_S2 }}
-        SWID: ${{ secrets.SWID }}
+      # ---------- FETCH RAW FEEDS (multi-provider where available) ----------
+      - name: Fetch raw data (multi-provider fallbacks)
+        shell: bash
+        run: |
+          set -e
+          echo "[fetch_all] season=${SEASON}"
+          if [ -f external/nflverse_bundle/fetch_all.py ]; then
+            python external/nflverse_bundle/fetch_all.py --season "${SEASON}"
+          else
+            echo "::warning::external/nflverse_bundle/fetch_all.py not found; skipping raw fetch step."
+          fi
+
+      # Optional: run addons if they exist in your repo
+      - name: Run addons (if present)
+        shell: bash
+        run: |
+          set -e
+          runp () { [ -f "$1" ] && python "$1" --season "${SEASON}" || echo "skip $1"; }
+          runp external/nflverse_bundle/addons/derive_proe.py
+          runp external/nflverse_bundle/addons/aggregate_box_counts.py
+          runp external/nflverse_bundle/addons/derive_roles.py
+          runp external/nflverse_bundle/addons/derive_rb_metrics.py
+          runp external/nflverse_bundle/addons/fetch_injuries_espn.py
+
+      # ---------- COMPOSE METRICS ----------
+      - name: Compose metrics (make_all) STRICT=${{ env.STRICT }}
+        shell: bash
         run: |
           set -e
           if [ -f external/nflverse_bundle/make_all.py ]; then
-          python external/nflverse_bundle/make_all.py --season 2025
+            python external/nflverse_bundle/make_all.py --season "${SEASON}"
           else
-          echo "ERROR: make_all.py not found"; exit 1
+            echo "::error::external/nflverse_bundle/make_all.py not found"
+            exit 1
           fi
 
-    # ---------- BUILD GAME LINES / PROPS (if you have scripts for these) ----------
+      # ---------- OPTIONAL BUILDERS (only run if file exists) ----------
       - name: Build game_lines (if script exists)
+        shell: bash
         run: |
           set -e
           if [ -f scripts/build_game_lines.py ]; then
-          python scripts/build_game_lines.py --season 2025
+            python scripts/build_game_lines.py --season "${SEASON}"
           else
-          echo "INFO: scripts/build_game_lines.py not present; skipping."
+            echo "INFO: scripts/build_game_lines.py not present; skipping."
           fi
 
       - name: Build props_raw (if script exists)
-        env:
-        ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        shell: bash
         run: |
           set -e
           if [ -f scripts/build_props_raw.py ]; then
-          python scripts/build_props_raw.py --season 2025
+            python scripts/build_props_raw.py --season "${SEASON}"
           else
-          echo "INFO: scripts/build_props_raw.py not present; skipping."
+            echo "INFO: scripts/build_props_raw.py not present; skipping."
           fi
 
-    # ---------- QUICK SANITY/LOGS ----------
+      # ---------- SANITY LOGS (print heads & sizes so you can see what exists) ----------
       - name: Sanity check key outputs
+        shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           import pandas as pd
 
           paths = [
-          "outputs/metrics/team_form.csv",
-          "outputs/metrics/player_form.csv",
-          "data/weather.csv",
-          "data/roles.csv",
-          "data/injuries.csv",
-          "data/coverage.csv",
-          "data/cb_assignments.csv",
-          "outputs/game_lines.csv",
-          "outputs/props_raw.csv",
+            "outputs/metrics/team_form.csv",
+            "outputs/metrics/player_form.csv",
+            "data/weather.csv",
+            "data/roles.csv",
+            "data/injuries.csv",
+            "data/coverage.csv",
+            "data/cb_assignments.csv",
+            "outputs/game_lines.csv",
+            "outputs/props_raw.csv",
           ]
 
-        for p in paths:
-            pp = Path(p)
-            print(f"\n=== {p} ===")
-            if not pp.exists():
-                print("MISSING")
-                continue
-            sz = pp.stat().st_size
-            print("size:", sz)
-            try:
-                df = pd.read_csv(pp)
-                print("rows:", len(df), "cols:", list(df.columns)[:12])
-                print(df.head(3).to_string(index=False))
-            except Exception as e:
-                print("read error:", e)
-        PY
+          for p in paths:
+              pp = Path(p)
+              print(f"\n=== {p} ===")
+              if not pp.exists():
+                  print("MISSING")
+                  continue
+              sz = pp.stat().st_size
+              print("size:", sz)
+              try:
+                  df = pd.read_csv(pp)
+                  print("rows:", len(df), "cols:", list(df.columns)[:12])
+                  print(df.head(3).to_string(index=False))
+              except Exception as e:
+                  print("read error:", e)
+          PY
 
-    # ---------- VALIDATE ----------
-    - name: Validate data pack outputs
-      run: python scripts/validate_inputs.py
+      # ---------- VALIDATE ----------
+      - name: Validate data pack outputs
+        shell: bash
+        run: |
+          set -e
+          if [ -f scripts/validate_inputs.py ]; then
+            python scripts/validate_inputs.py
+          else
+            echo "::warning::scripts/validate_inputs.py not found; skipping validation."
+          fi
 
-    # ---------- ARTIFACTS FOR DEBUG ----------
-    - name: Upload artifacts (data & outputs)
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: datapack-${{ github.run_id }}
-        path: |
-          data/**
-          outputs/**
-          external/nflverse_bundle/outputs/**
-        if-no-files-found: warn
+      # ---------- ARTIFACTS ----------
+      - name: Upload artifacts (data & outputs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datapack-${{ github.run_id }}-season-${{ env.SEASON }}
+          path: |
+            data/**
+            outputs/**
+            external/nflverse_bundle/outputs/**
+          if-no-files-found: warn
