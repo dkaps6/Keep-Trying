@@ -7,8 +7,6 @@ API_KEY = os.getenv("THE_ODDS_API_KEY")
 BASE = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl"
 assert API_KEY, "Missing THE_ODDS_API_KEY (GitHub secret)."
 
-DATE = os.getenv("ODDS_DATE", "")
-BOOKS = os.getenv("ODDS_BOOKMAKERS", "draftkings,fanDuel,betmgm,caesars")
 MARKETS = (os.getenv("ODDS_MARKETS", "") or "").strip()
 ALL = os.getenv("ODDS_ALL_MARKETS", "false").lower() == "true"
 PROPS_ONLY = os.getenv("ODDS_PROPS_ONLY", "false").lower() == "true"
