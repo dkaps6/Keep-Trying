@@ -58,7 +58,17 @@ jobs:
       NFLGSIS_USERNAME: ${{ secrets.NFLGSIS_USERNAME }}
       NFLGSIS_PASSWORD: ${{ secrets.NFLGSIS_PASSWORD }}
       THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
-
+  
+      # 🎯 Odds Filtering Inputs (optional)
+      ODDS_DATE:        ${{ github.event.inputs.odds_date }}
+      ODDS_FROM:        ${{ github.event.inputs.odds_from }}
+      ODDS_TO:          ${{ github.event.inputs.odds_to }}
+      ODDS_MARKETS:     ${{ github.event.inputs.odds_markets }}
+      ODDS_BOOKS:       ${{ github.event.inputs.odds_books }}
+      ODDS_PROPS_ONLY:  ${{ github.event.inputs.odds_props_only }}
+      ODDS_SIDES_ONLY:  ${{ github.event.inputs.odds_sides_only }}
+      ODDS_CAP:         ${{ github.event.inputs.odds_cap }}
+      
     steps:
       - name: Checkout
         uses: actions/checkout@v4
