@@ -898,34 +898,24 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
             "yprr_proxy","ypc","ypt","qb_ypa"
         ])
 
-# (everything above remains as-is)
-pf["position"] = pf["position"].fillna("")
-for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]:
-    if c not in pf.columns: pf[c] = 0.0
-    pf[c] = pf[c].fillna(0.0)
+    # ---------- final schema (always defined) ----------
+    cols_out = [
+        "target_share","rush_share","rz_tgt_share","rz_carry_share",
+        "yprr_proxy","ypc","ypt","qb_ypa"
+    ]
 
-# 👇 DELETE this old line:
-# return pf2
+    pf_out = pf[["player","team"]].copy()
+    pf_out["position"] = ""
 
-# 👇 PASTE this new final block instead:
-# ---------- final schema (always defined) ----------
-cols_out = [
-    "target_share","rush_share","rz_tgt_share","rz_carry_share",
-    "yprr_proxy","ypc","ypt","qb_ypa"
-]
-
-pf_out = pf[["player","team"]].copy()
-pf_out["position"] = ""
-
-for c in cols_out:
-    series = pf[c] if c in pf.columns else pd.Series(np.nan, index=pf.index)
-    pf_out[c] = _safe_num(series).astype(float)
-
-if not strict:
     for c in cols_out:
-        pf_out[c] = pf_out[c].fillna(0.0)
+        series = pf[c] if c in pf.columns else pd.Series(np.nan, index=pf.index)
+        pf_out[c] = _safe_num(series).astype(float)
 
-return pf_out
+    if not strict:
+        for c in cols_out:
+            pf_out[c] = pf_out[c].fillna(0.0)
+
+    return pf_out
 
 # ============================
 # ===== COMPOSERS ============
