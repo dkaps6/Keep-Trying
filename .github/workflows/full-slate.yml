@@ -80,19 +80,31 @@ jobs:
           echo "Repo root: $(pwd)"
           ls -la
           
-          - name: Fetch free data + compose (nflverse + addons)
-            run: |
-                set -euo pipefail
-                
+      - name: Fetch free data + compose (nflverse + addons)
+        shell: bash
+        env:
+          # If you already defined this input in workflow_dispatch, this will pass it in.
+          # If it's unset, we'll default to 0 in the script below.
+          STRICT: ${{ github.event.inputs.strict }}
+        run: |
+          set -e
+
+          # Default STRICT to 0 if not provided
+          if [ -z "${STRICT:-}" ]; then STRICT=0; fi
+          echo "Fetcher strict mode: $STRICT"
+
           if [ -f make_all.py ]; then
             echo "Found: ./make_all.py"
-            python make_all.py --season "${{ github.event.inputs.season }}" --strict 0
+            python make_all.py --season "${{ github.event.inputs.season }}" --strict "$STRICT"
+
           elif [ -f nflverse_csv_fetcher/make_all.py ]; then
             echo "Found: nflverse_csv_fetcher/make_all.py"
-            python nflverse_csv_fetcher/make_all.py --season "${{ github.event.inputs.season }}" --strict 0
+            python nflverse_csv_fetcher/make_all.py --season "${{ github.event.inputs.season }}" --strict "$STRICT"
+
           elif [ -f external/nflverse_bundle/make_all.py ]; then
             echo "Found: external/nflverse_bundle/make_all.py"
-            python external/nflverse_bundle/make_all.py --season "${{ github.event.inputs.season }}" --strict 0
+            python external/nflverse_bundle/make_all.py --season "${{ github.event.inputs.season }}" --strict "$STRICT"
+
           else
             echo "::error ::make_all.py not found in ./, nflverse_csv_fetcher/, or external/nflverse_bundle/"
             exit 1
