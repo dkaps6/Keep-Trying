@@ -3,11 +3,16 @@ name: Run pipeline
 on:
   workflow_dispatch:
     inputs:
-      # already there
       season:
         description: "Season tag (e.g., 2025)"
         required: true
         default: "2025"
+
+      # Strict mode input (NEW)
+      strict:
+        description: "Strict mode (0 = tolerant, 1 = strict)"
+        required: false
+        default: "0"
 
       # Odds controls (NEW)
       odds_date:
@@ -142,23 +147,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "[make_all] seasons=[${SEASON}] strict=${STRICT}"
+          SEASON="${{ github.event.inputs.season }}"
+          STRICT="${{ github.event.inputs.strict }}"
+          STRICT_FLAG=""
+          if [ -n "${STRICT}" ]; then STRICT_FLAG="--strict ${STRICT}"; fi
 
-          if [ -f make_all.py ]; then
-            echo "Found: ./make_all.py"
-            python make_all.py --season "${SEASON}" --strict "${STRICT}"
+    python external/nflverse_bundle/make_all.py --season "${SEASON}" ${STRICT_FLAG}
 
-          elif [ -f nflverse_csv_fetcher/make_all.py ]; then
-            echo "Found: nflverse_csv_fetcher/make_all.py"
-            python nflverse_csv_fetcher/make_all.py --season "${SEASON}" --strict "${STRICT}"
 
-          elif [ -f external/nflverse_bundle/make_all.py ]; then
+          if [ -f external/nflverse_bundle/make_all.py ]; then
             echo "Found: external/nflverse_bundle/make_all.py"
             python external/nflverse_bundle/make_all.py --season "${SEASON}" --strict "${STRICT}"
-
           else
-            echo "::error ::make_all.py not found in ./, nflverse_csv_fetcher/, OR external/nflverse_bundle/"
-            exit 1
+            echo "::error ::make_all.py not found"; exit 1
           fi
 
       # -----------------------------
