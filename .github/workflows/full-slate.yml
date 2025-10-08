@@ -173,6 +173,17 @@ jobs:
             echo "::warning::No validator found at scripts/validate_inputs.py; skipping validation."
           fi
 
+      - name: Run predictive model (if script exists)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f run_model.py ]; then
+            echo "Found run_model.py — executing..."
+            python run_model.py --season "${SEASON}" --strict "${STRICT}"
+          else
+            echo "::warning::run_model.py not found — skipping model execution."
+          fi
+
       # -----------------------------
       # ZIP OUTPUTS (artifact)
       # -----------------------------
