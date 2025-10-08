@@ -98,6 +98,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # NEW: pass odds consensus tables into the engine (optional if your engine accepts them)
     odds_game = _read_soft(DATA / "odds_game_consensus.csv")
     odds_props = _read_soft(DATA / "odds_props_consensus.csv")
+
+    print(f"[model] odds_game rows={len(odds_game)}; odds_props rows={len(odds_props)}")
+
     kwargs["odds_game_df"]  = odds_game
     kwargs["odds_props_df"] = odds_props
     
