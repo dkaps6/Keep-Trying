@@ -19,57 +19,113 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install -U pip
           pip install -r requirements.txt || true
-          # Minimal runtime deps if requirements is light:
-          pip install pandas numpy requests pyarrow || true
 
-      # (Optional) fetchers / compose before validation
-      # Keep if you already have these; otherwise remove
-      - name: Fetch free data
-        run: |
-          if [ -f external/nflverse_bundle/fetch_all.py ]; then
-            python external/nflverse_bundle/fetch_all.py --season 2025 || true
-          fi
-
-      # --- earlier steps (fetchers, addons, etc) ---
-
-      - name: Compose metrics
+    # ---------- FETCH RAW FEEDS ----------
+      - name: Fetch raw data (multi-provider fallbacks)
         env:
-          # strict=0 so we don't hard-fail on sparse inputs
-          STRICT: "0"
+        MSF_API_KEY: ${{ secrets.MSF_API_KEY }}
+        APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
+        GSIS_USERNAME: ${{ secrets.GSIS_USERNAME }}
+        GSIS_PASSWORD: ${{ secrets.GSIS_PASSWORD }}
+        ESPN_S2: ${{ secrets.ESPN_S2 }}
+        SWID: ${{ secrets.SWID }}
         run: |
-          if [ -f external/nflverse_bundle/make_all.py ]; then
-            python external/nflverse_bundle/make_all.py --season 2025 || true
+          set -e
+          echo "[fetch_all] season=2025"
+          if [ -f external/nflverse_bundle/fetch_all.py ]; then
+          python external/nflverse_bundle/fetch_all.py --season 2025
+          else
+          echo "WARN: fetch_all.py not found; skipping."
           fi
 
-      # 🆕 NEW SECTION STARTS HERE -----------------------------
-      - name: Bootstrap placeholder CSVs
-        run: python scripts/bootstrap_datapack_placeholders.py
+    # ---------- COMPOSE METRICS ----------
+      - name: Compose metrics (make_all) with strict=0
+        env:
+        STRICT: "0"
+        MSF_API_KEY: ${{ secrets.MSF_API_KEY }}
+        APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
+        GSIS_USERNAME: ${{ secrets.GSIS_USERNAME }}
+        GSIS_PASSWORD: ${{ secrets.GSIS_PASSWORD }}
+        ESPN_S2: ${{ secrets.ESPN_S2 }}
+        SWID: ${{ secrets.SWID }}
+        run: |
+          set -e
+          if [ -f external/nflverse_bundle/make_all.py ]; then
+          python external/nflverse_bundle/make_all.py --season 2025
+          else
+          echo "ERROR: make_all.py not found"; exit 1
+          fi
 
-      - name: Sanity check placeholders
+    # ---------- BUILD GAME LINES / PROPS (if you have scripts for these) ----------
+      - name: Build game_lines (if script exists)
+        run: |
+          set -e
+          if [ -f scripts/build_game_lines.py ]; then
+          python scripts/build_game_lines.py --season 2025
+          else
+          echo "INFO: scripts/build_game_lines.py not present; skipping."
+          fi
+
+      - name: Build props_raw (if script exists)
+        env:
+        ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          set -e
+          if [ -f scripts/build_props_raw.py ]; then
+          python scripts/build_props_raw.py --season 2025
+          else
+          echo "INFO: scripts/build_props_raw.py not present; skipping."
+          fi
+
+    # ---------- QUICK SANITY/LOGS ----------
+      - name: Sanity check key outputs
         run: |
           python - <<'PY'
           from pathlib import Path
           import pandas as pd
-          files = [
-              "data/weather.csv","data/roles.csv","data/injuries.csv",
-              "data/coverage.csv","data/cb_assignments.csv",
-              "outputs/game_lines.csv","outputs/props_raw.csv",
-          ]
-          for f in files:
-              p = Path(f)
-              print(f"> {f}: exists={p.exists()} size={(p.stat().st_size if p.exists() else 0)}")
-              if p.exists() and p.stat().st_size>0:
-                  try:
-                      print("   columns:", pd.read_csv(p, nrows=1).columns.tolist())
-                  except Exception as e:
-                      print("⚠️  read error:", e)
-          PY
-          ls -la data || true
-          l s -la outputs || true
-      # 🆕 NEW SECTION ENDS HERE -------------------------------
 
-      # Now validation will have readable files with correct headers
-      - name: Validate data pack outputs
-        run: python scripts/validate_inputs.py
+          paths = [
+          "outputs/metrics/team_form.csv",
+          "outputs/metrics/player_form.csv",
+          "data/weather.csv",
+          "data/roles.csv",
+          "data/injuries.csv",
+          "data/coverage.csv",
+          "data/cb_assignments.csv",
+          "outputs/game_lines.csv",
+          "outputs/props_raw.csv",
+          ]
+
+        for p in paths:
+            pp = Path(p)
+            print(f"\n=== {p} ===")
+            if not pp.exists():
+                print("MISSING")
+                continue
+            sz = pp.stat().st_size
+            print("size:", sz)
+            try:
+                df = pd.read_csv(pp)
+                print("rows:", len(df), "cols:", list(df.columns)[:12])
+                print(df.head(3).to_string(index=False))
+            except Exception as e:
+                print("read error:", e)
+        PY
+
+    # ---------- VALIDATE ----------
+    - name: Validate data pack outputs
+      run: python scripts/validate_inputs.py
+
+    # ---------- ARTIFACTS FOR DEBUG ----------
+    - name: Upload artifacts (data & outputs)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: datapack-${{ github.run_id }}
+        path: |
+          data/**
+          outputs/**
+          external/nflverse_bundle/outputs/**
+        if-no-files-found: warn
