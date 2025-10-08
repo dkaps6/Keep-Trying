@@ -8,47 +8,37 @@ on:
         required: true
         default: "2025"
 
-      # Strict mode input (NEW)
       strict:
         description: "Strict mode (0 = tolerant, 1 = strict)"
         required: false
         default: "0"
 
-      # Odds controls (NEW)
       odds_date:
         description: "Only fetch lines for this calendar day (YYYY-MM-DD, optional)"
         required: false
         default: ""
-      odds_from:
-        description: "Commence time >= (ISO-8601, optional)"
+
+      # If you prefer a time window, comment out odds_date above and use these two instead:
+      # odds_from:
+      #   description: "Commence time >= (ISO-8601, optional)"
+      #   required: false
+      #   default: ""
+      # odds_to:
+      #   description: "Commence time < (ISO-8601, optional)"
+      #   required: false
+      #   default: ""
+
+      markets:
+        description: "Comma-separated markets. Leave blank for ALL (spreads,totals,ml,player props, TDs)"
         required: false
         default: ""
-      odds_to:
-        description: "Commence time < (ISO-8601, optional)"
-        required: false
-        default: ""
-      odds_markets:
-        description: "Markets to include (comma-separated). Leave BLANK to fetch ALL markets (game lines + ALL player props incl. anytime TD)."
-        required: false
-        default: "spreads,totals,ml"
-      all_markets:
-        description: "Fetch ALL markets (overrides 'markets')"
-        type: boolean
-        required: false
-        default: true
-      odds_books:
-        description: "Bookmakers to include (comma-separated keys)"
+
+      bookmakers:
+        description: "Bookmakers (comma-separated keys)"
         required: false
         default: "draftkings,fanduel,betmgm,caesars"
-      odds_props_only:
-        description: "Only fetch props (true/false)"
-        required: false
-        default: "false"
-      odds_sides_only:
-        description: "Only fetch sides/totals/ml (true/false)"
-        required: false
-        default: "false"
-      odds_cap:
+
+      cap:
         description: "Hard cap on number of events to fetch (0 = no cap)"
         required: false
         default: "0"
