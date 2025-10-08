@@ -7,11 +7,21 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import pandas as pd
+from pathlib import Path
 
+REPO = Path(__file__).resolve().parent
+DATA = REPO / "data"
 
+def _read_soft(p: Path) -> pd.DataFrame:
+    try:
+        if p.exists() and p.stat().st_size > 0:
+            return pd.read_csv(p)
+    except Exception:
+        pass
+    return pd.DataFrame()
 def _log(msg: str) -> None:
     print(f"[run_model] {msg}", flush=True)
-
 
 def _to_list(s: Optional[str]) -> Optional[List[str]]:
     """
