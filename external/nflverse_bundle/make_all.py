@@ -950,11 +950,15 @@ def compose_team_form(season: int, cache: Dict[str, pd.DataFrame], strict: bool,
             "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
             "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
             "plays_est","proe","rz_rate"]
+
     for c in cols:
         if c not in tf_der.columns:
             tf_der[c] = 0.0 if c != "team" else ""
 
-    return tf_der[cols], proe_week
+    # ✅ add season column the validator wants
+    tf_der["season"] = int(season)
+
+    return tf_der[cols + ["season"]], proe_week
 
 def compose_player_form(season: int, cache: Dict[str, pd.DataFrame], strict: bool, issues: List[str]) -> pd.DataFrame:
     pbp = _get_or_resolve("pbp", season, cache)
