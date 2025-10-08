@@ -795,7 +795,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
 
     if not _ok(pbp):
         warn_or_raise("[derive_player_from_pbp] PBP is empty — cannot compute player shares")
-        # return an empty-schema frame so downstream never explodes
         return pd.DataFrame(columns=[
             "player","team","position","target_share","rush_share","rz_tgt_share","rz_carry_share",
             "yprr_proxy","ypc","ypt","qb_ypa"
@@ -803,7 +802,7 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
 
     posteam = _pick(["posteam","offense_team"], pbp) or "posteam"
 
-    # Try generous aliases
+    # Generous aliases
     rec_name  = _pick([
         "receiver_player_name","receiver","receiver_name",
         "target_player_name","targeted_receiver","target_name"
@@ -824,7 +823,7 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     pass_flag = _bool_col(pbp, ["pass","is_pass","qb_dropback"])
     rush_flag = _bool_col(pbp, ["rush","is_rush"]) & ~pass_flag
 
-    # ---------- counting tables (best-effort; may be empty) ----------
+    # ---------- counting tables ----------
     targ_df = (pd.DataFrame() if not rec_name else
         pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name]]
            .assign(tgt=1)
@@ -855,7 +854,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
            .rename(columns={posteam:"team", rush_name:"player"})
     )
 
-    # In strict mode, feeders must exist
     if strict:
         feeder_issues = []
         if not _ok(targ_df):   feeder_issues.append("no receiver targets found")
@@ -885,32 +883,28 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
         rush_yds_df = (
             pbp.loc[rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name, yards_gained]]
                .groupby([posteam, rush_name], as_index=False)[yards_gained].sum()
-               .rename(columns={postem:"team", rush_name:"player", yards_gained:"rush_yards"})
+               .rename(columns={posteam:"team", rush_name:"player", yards_gained:"rush_yards"})  # <- fixed: posteam
         )
-    # fix typo if any
-    if "postem" in locals(): del postem  # defensive; ignore if not defined
 
     # ---------- merge per-player ----------
     pf = pd.DataFrame(columns=["player","team"])
     for base in [targ_df, rush_df, rz_tgt_df, rz_car_df, rec_yds_df, yac_df, rush_yds_df]:
         if _ok(base):
             pf = pf.merge(base, on=["team","player"], how="outer") if _ok(pf) else base.copy()
-
     if not _ok(pf):
-        # Non-strict: return empty schema; Strict: already raised above.
         warn_or_raise("[derive_player_from_pbp] No player rows produced after merges; filling empty schema")
         return pd.DataFrame(columns=[
             "player","team","position","target_share","rush_share","rz_tgt_share","rz_carry_share",
             "yprr_proxy","ypc","ypt","qb_ypa"
         ])
 
-    # make sure numeric feeders exist
+    # feeders present (create & clean if missing)
     for c in ["tgt","rush","rz_tgt","rz_car","rec_yards","yac_sum","rush_yards"]:
         if c not in pf.columns: pf[c] = 0.0
         pf[c] = _safe_num(pf[c]).fillna(0.0)
 
     # team totals (safe even if the base is empty)
-    def safe_group(df, col): 
+    def safe_group(df, col):
         return (df.groupby("team", as_index=False)[col].sum()) if _ok(df) else pd.DataFrame({"team":[] , col:[]})
 
     team_tgts   = safe_group(targ_df,   "tgt")
@@ -927,7 +921,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     rename_map = {"tgt_y":"tgt_team","rush_y":"rush_team","rz_tgt_y":"rz_tgt_team","rz_car_y":"rz_car_team"}
     pf = pf.rename(columns={k:v for k,v in rename_map.items() if k in pf.columns})
 
-    # guarantee *_team cols exist
     for c in ["tgt_team","rush_team","rz_tgt_team","rz_car_team"]:
         if c not in pf.columns: pf[c] = 0.0
         pf[c] = _safe_num(pf[c]).fillna(0.0)
@@ -939,12 +932,8 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     pf["rz_tgt_share"]   = sdiv(pf["rz_tgt"], pf["rz_tgt_team"])
     pf["rz_carry_share"] = sdiv(pf["rz_car"], pf["rz_car_team"])
 
-    # If the inputs weren’t present, these will be NaN; fill with 0 in non-strict.
-    for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share"]:
-        if strict:
-            # keep NaN so strict runs surface data issues loudly
-            pass
-        else:
+    if not strict:
+        for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share"]:
             pf[c] = pf[c].fillna(0.0)
 
     # ---------- efficiency proxies ----------
