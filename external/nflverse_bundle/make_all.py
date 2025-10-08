@@ -7,6 +7,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
+import math
 
 # ----------------------------
 # Paths
@@ -320,6 +321,28 @@ def _normalize_pbp_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # --- helpers ---
+def _read_csv_soft(path: Path) -> pd.DataFrame:
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return pd.read_csv(path)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def _decimal_to_impl(p):
+    # Odds API decimals: implied prob = 1 / price
+    try:
+        p = float(p)
+        return 1.0 / p if p and p > 1e-9 else None
+    except Exception:
+        return None
+
+def _de_vig(impl_series: pd.Series) -> pd.Series:
+    # normalize so each event/market’s outcomes sum to 1.0
+    s = impl_series.astype(float)
+    tot = s.groupby(level=0).transform("sum")  # assumes MultiIndex with grouping key at level 0
+    return s / tot
+
 def _alias(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> pd.DataFrame:
     if not _ok(df): return df
     ren = {}
@@ -933,6 +956,14 @@ def compose_team_form(season: int, cache: Dict[str, pd.DataFrame], strict: bool,
     box   = _get_or_resolve("box_week", season, cache)
     proe  = _get_or_resolve("proe_week", season, cache)
 
+    # --- Odds: compose consensus tables ---
+    game_odds, props_odds = compose_odds(s)
+    # also mirror to data/ for model convenience
+    if _ok(game_odds):
+        _write_csv(game_odds, DATA_MIRROR / "odds_game_consensus.csv")
+    if _ok(props_odds):
+        _write_csv(props_odds, DATA_MIRROR / "odds_props_consensus.csv")
+
     # integrate box rates if present
     if _ok(box) and {"team","def_light_box_rate","def_heavy_box_rate"} <= set(box.columns):
         b = box.groupby("team", as_index=False)[["def_light_box_rate","def_heavy_box_rate"]].mean()
@@ -1012,6 +1043,82 @@ def compose_player_form(season: int, cache: Dict[str, pd.DataFrame], strict: boo
         "target_share","rush_share","rz_tgt_share","rz_carry_share",
         "yprr_proxy","ypc","ypt","qb_ypa"
     ]]
+def compose_odds(season: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Ingests outputs from fetch_odds.py and computes bookmaker-consensus
+    game-line and props tables. Returns (game_consensus, props_consensus).
+    """
+    out_dir = ROOT / "outputs"
+    gl_path = out_dir / "game_lines.csv"
+    pr_path = out_dir / "props_raw.csv"
+
+    game = _read_csv_soft(gl_path)
+    props = _read_csv_soft(pr_path)
+
+    # ---------- GAME LINES ----------
+    game_cons = pd.DataFrame()
+    if _ok(game):
+        # ensure typed
+        for c in ["price", "point"]:
+            if c in game.columns:
+                game[c] = pd.to_numeric(game[c], errors="coerce")
+
+        # implied probs by event+market+outcome+book
+        if {"event_id","market","outcome","bookmaker","price"}.issubset(game.columns):
+            key_cols = ["event_id","market","outcome","bookmaker"]
+            game["impl"] = game["price"].map(_decimal_to_impl)
+            # remove rows with no probability
+            game = game.dropna(subset=["impl"])
+
+            # build a pivot to de-vig within each (event_id, market, bookmaker)
+            grp = game.groupby(["event_id","market","bookmaker"])
+            # normalize outcomes per (event, market, book)
+            game["impl_vigfree"] = grp["impl"].transform(lambda s: s / s.sum())
+
+            # consensus per (event, market, outcome): average across books
+            cons = (game.groupby(["event_id","market","outcome"], as_index=False)
+                        .agg(cons_prob=("impl_vigfree","mean"),
+                             avg_price=("price","mean"),
+                             avg_point=("point","mean")))
+
+            # also keep teams/time for joins
+            meta = (game.groupby("event_id", as_index=False)
+                        .agg(commence_time=("commence_time","first"),
+                             home_team=("home_team","first"),
+                             away_team=("away_team","first")))
+            game_cons = cons.merge(meta, on="event_id", how="left")
+
+    # ---------- PROPS ----------
+    props_cons = pd.DataFrame()
+    if _ok(props):
+        for c in ["price","point"]:
+            if c in props.columns:
+                props[c] = pd.to_numeric(props[c], errors="coerce")
+
+        if {"event_id","market","outcome","bookmaker","price"}.issubset(props.columns):
+            props["impl"] = props["price"].map(_decimal_to_impl)
+            props = props.dropna(subset=["impl"])
+
+            grp = props.groupby(["event_id","market","label","player","bookmaker"])
+            props["impl_vigfree"] = grp["impl"].transform(lambda s: s / s.sum())
+
+            cons = (props.groupby(["event_id","market","label","player","outcome"], as_index=False)
+                         .agg(cons_prob=("impl_vigfree","mean"),
+                              avg_price=("price","mean"),
+                              avg_point=("point","mean")))
+
+            meta = (props.groupby("event_id", as_index=False)
+                        .agg(commence_time=("commence_time","first")))
+            props_cons = cons.merge(meta, on="event_id", how="left")
+
+    # write outputs (for debugging/consumption)
+    (ROOT / "outputs").mkdir(parents=True, exist_ok=True)
+    if _ok(game_cons):
+        game_cons.to_csv(ROOT / "outputs" / "odds_game_consensus.csv", index=False)
+    if _ok(props_cons):
+        props_cons.to_csv(ROOT / "outputs" / "odds_props_consensus.csv", index=False)
+
+    return game_cons, props_cons
 
 # ============================
 # ===== BUNDLE DRIVER ========
