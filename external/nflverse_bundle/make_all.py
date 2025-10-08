@@ -1171,24 +1171,34 @@ def main() -> int:
     fetch_bundle(seasons)
 
     try:
-        for s in seasons:
-            print(f"[compose] season {s}")
-            cache: Dict[str, pd.DataFrame] = {}
-            cache["pbp"] = _get_or_resolve("pbp", s, cache)  # early for proxies
+    for s in seasons:
+        print(f"[compose] season {s}")
+        cache: Dict[str, pd.DataFrame] = {}
+        cache["pbp"] = _get_or_resolve("pbp", s, cache)  # early for proxies
 
-            team_form, proe_week = compose_team_form(s, cache, strict, data_issues)
-            player_form = compose_player_form(s, cache, strict, data_issues)
+        # 🆕 Fetch and compose odds consensus FIRST (before team/player forms)
+        game_odds, props_odds = compose_odds(s)
 
-            # write outputs
-            _write_csv(team_form, OUT_METRICS / "team_form.csv")
-            _write_csv(player_form, OUT_METRICS / "player_form.csv")
-            _write_csv(team_form, DATA_MIRROR / "team_form.csv")
-            _write_csv(player_form, DATA_MIRROR / "player_form.csv")
+        # 🆕 Write odds results so downstream steps can read them
+        if _ok(game_odds):
+            _write_csv(game_odds, DATA_MIRROR / "odds_game_consensus.csv")
+        if _ok(props_odds):
+            _write_csv(props_odds, DATA_MIRROR / "odds_props_consensus.csv")
 
-            # optional export of weekly proe (debug/inspection)
-            if _ok(proe_week):
-                out_proe = ROOT / "outputs" / "proe" / f"proe_week_{s}.csv"
-                _write_csv(proe_week, out_proe)
+        # Existing form builders
+        team_form, proe_week = compose_team_form(s, cache, strict, data_issues)
+        player_form = compose_player_form(s, cache, strict, data_issues)
+
+        # Write outputs
+        _write_csv(team_form, OUT_METRICS / "team_form.csv")
+        _write_csv(player_form, OUT_METRICS / "player_form.csv")
+        _write_csv(team_form, DATA_MIRROR / "team_form.csv")
+        _write_csv(player_form, DATA_MIRROR / "player_form.csv")
+
+        # Optional export of weekly proe (debug/inspection)
+        if _ok(proe_week):
+            out_proe = ROOT / "outputs" / "proe" / f"proe_week_{s}.csv"
+            _write_csv(proe_week, out_proe)
 
         # write data quality issues when non-strict
         if data_issues and not strict:
