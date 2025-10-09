@@ -28,7 +28,7 @@ def main():
     seasons = [int(s) for s in args.season]
     ensure_dir(args.out)
 
-    part = nfl.load_participation(seasons=seasons, file_type="csv")
+    part = nfl.load_participation(seasons=seasons)
     # Keep run/pass plays only
     part = part.filter(pl.col("play_type").is_in(["run","pass"]))
     # Tag box
