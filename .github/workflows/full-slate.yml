@@ -3,78 +3,60 @@ name: Full Slate (orchestrated via run_model)
 on:
   workflow_dispatch:
     inputs:
-      date:
-        description: "Props date (YYYY-MM-DD). Blank = upcoming"
-        required: false
-        default: ""
       season:
         description: "Season (e.g., 2025)"
         required: true
         default: "2025"
-      books:
-        description: "Comma-separated bookmakers"
-        required: false
-        default: "draftkings,fanduel,betmgm,caesars"
-      markets:
-        description: "Override markets (comma-separated)"
+      date:
+        description: "ISO date (YYYY-MM-DD) optional"
         required: false
         default: ""
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
       NFLGSIS_USERNAME: ${{ secrets.NFLGSIS_USERNAME }}
       NFLGSIS_PASSWORD: ${{ secrets.NFLGSIS_PASSWORD }}
-      MYSPORTSFEEDS_API_KEY: ${{ secrets.MYSPORTSFEEDS_API_KEY }}
       APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
+      MSF_KEY: ${{ secrets.MSF_KEY }}
+      MSF_PASSWORD: ${{ secrets.MSF_PASSWORD }}
       ESPN_COOKIE: ${{ secrets.ESPN_COOKIE }}
+      RUN_TS: ${{ github.run_id }}
+      RUN_ID: ${{ github.run_id }}
+      LOG_DIR: logs/daily_runs
+      MC_TRIALS: "25000"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip wheel
+          python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-          pip install pandas numpy scipy requests polars nfl_data_py pyarrow fastparquet
 
-      - name: Ensure folders
+      - name: Prepare working dirs
         run: |
-          mkdir -p data outputs outputs/metrics external/nflverse_bundle/outputs
+          mkdir -p data outputs logs
 
-      - name: Secrets smoke test
+      - name: Run pipeline
         run: |
-          python - << 'PY'
-          import os, sys
-          need = ["ODDS_API_KEY"]
-          miss = [k for k in need if not os.getenv(k)]
-          if miss:
-              print("Missing secrets:", ", ".join(miss)); sys.exit(1)
-          print("Secrets OK (values masked).")
-          PY
-
-      - name: Run model
-        run: |
-          python run_model.py \
-            --date "${{ inputs.date }}" \
-            --season "${{ inputs.season }}" \
-            --books "${{ inputs.books }}" \
-            --markets "${{ inputs.markets }}"
+          python run_model.py --season "${{ github.event.inputs.season }}" --date "${{ github.event.inputs.date }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: slate-${{ github.run_id }}
+          name: model_outputs
           path: |
-            outputs/**
-            data/**
-            external/nflverse_bundle/outputs/**
+            data/*.csv
+            data/*.parquet
+            outputs/**/*.csv
+            outputs/**/*.parquet
+            logs/**/*.*
           if-no-files-found: warn
