@@ -1,8 +1,10 @@
-# engine.py (updated to include provider fallback)
+
 from __future__ import annotations
-import subprocess, shlex
+import os, subprocess, shlex
 from pathlib import Path
-from engine_adapters.providers import run_espn, run_nflgsis, run_msf, run_apisports
+from engine_adapters.providers import (
+    run_nflverse, run_espn, run_nflgsis, run_apisports, run_msf
+)
 
 REPO = Path(__file__).resolve().parent
 
@@ -13,43 +15,17 @@ def _run(cmd: str) -> None:
         raise SystemExit(proc.returncode)
 
 def _provider_chain(season: int, date: str|None):
-    print("[engine] Provider fallback: ESPN -> NFLGSIS -> MSF -> API-Sports")
-    for runner in (run_espn, run_nflgsis, run_msf, run_apisports):
+    print("[engine] Provider order: nflverse -> ESPN -> NFLGSIS -> API-Sports -> MSF")
+    for runner in (run_nflverse, run_espn, run_nflgsis, run_apisports, run_msf):
         res = runner(season, date)
         print(f"[engine] {res['source']} wrote={res.get('wrote',{})} rows={res.get('rows',{})} notes={'; '.join(res.get('notes', []))}")
         if res.get("ok"):
             print(f"[engine] ✅ using {res['source']} outputs")
+            os.environ["PROVIDER_USED"] = res["source"]
             return
     print("[engine] ⚠️ No provider produced usable data — metrics may be empty")
 
-def run_pipeline(
-    date: str = "",
-    season: str = "",
-    hours: int = 0,
-    cap: int = 0,
-    books=None,
-    markets=None,
-    order=None,
-    teams=None,
-    selection=None,
-    write_dir: str = "outputs",
-    basename: str | None = None,
-    odds_game_df=None,
-    odds_props_df=None,
-):
-    # Optional: persist consensus odds snapshots if given
-    try:
-        import pandas as pd
-        if getattr(odds_game_df, "empty", True) is False:
-            p = REPO / "data" / "odds_game_consensus.csv"; p.parent.mkdir(parents=True, exist_ok=True)
-            odds_game_df.to_csv(p, index=False); print(f"[engine] wrote {p} ({len(odds_game_df)})")
-        if getattr(odds_props_df, "empty", True) is False:
-            p = REPO / "data" / "odds_props_consensus.csv"; p.parent.mkdir(parents=True, exist_ok=True)
-            odds_props_df.to_csv(p, index=False); print(f"[engine] wrote {p} ({len(odds_props_df)})")
-    except Exception as e:
-        print(f"[engine] consensus write skipped: {e}")
-
-    # 0) Provider fallback chain first (to populate data/ files)
+def run_pipeline(date: str = "", season: str = "", **kwargs):
     if season:
         try:
             _provider_chain(int(season), date or None)
@@ -58,23 +34,23 @@ def run_pipeline(
     else:
         print("[engine] WARN: season missing; skipping provider chain")
 
-    # 1) Metrics
-    if season:
-        _run(f"python scripts/make_metrics.py --season {shlex.quote(str(season))}")
-    else:
-        print("[engine] WARN: season not provided; metrics step skipped")
+    for p in ("data", "outputs", "logs"):
+        Path(p).mkdir(parents=True, exist_ok=True)
 
-    # 2) Props
-    books_arg = ",".join(books) if books else "draftkings,fanduel,betmgm,caesars"
-    mk_arg = ",".join(markets) if markets else ""
-    date_arg = str(date) if date else ""
-    _run(f"python scripts/fetch_props_oddsapi.py --books {shlex.quote(books_arg)} --markets {shlex.quote(mk_arg)} --date {shlex.quote(date_arg)} --out outputs/props_raw.csv")
-
-    # 3) Pricing
     if season:
-        _run(f"python scripts/pricing.py --season {shlex.quote(str(season))}")
+        _run(f"python scripts/make_team_form.py --season {season}")
+        _run(f"python scripts/make_player_form.py --season {season}")
+        _run(f"python scripts/make_metrics.py --season {season}")
     else:
-        _run("python scripts/pricing.py")
+        print("[engine] WARN: season not provided; metrics skipped")
+
+    books = kwargs.get("books") or ["draftkings","fanduel","betmgm","caesars"]
+    markets = kwargs.get("markets") or []
+    mk = ",".join(markets)
+    bk = ",".join(books)
+    _run(f"python scripts/fetch_props_oddsapi.py --books {bk} --markets {mk} --date {date} --out outputs/props_raw.csv")
+
+    _run(f"python -m scripts.models.run_predictors --season {season}")
 
     print("[engine] pipeline complete.")
     return 0
