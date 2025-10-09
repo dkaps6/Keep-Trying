@@ -22,7 +22,7 @@ def main():
     seasons = [int(s) for s in args.season]
     ensure_dir(args.out)
 
-    dc = nfl.load_depth_charts(seasons=seasons, file_type="csv")
+    dc = nfl.load_depth_charts(seasons=seasons)
     ps = nfl.load_player_stats(seasons=seasons, summary_level="week", file_type="csv")
 
     # Keep relevant fields
