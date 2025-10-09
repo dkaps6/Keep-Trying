@@ -1,3 +1,28 @@
+
+# Sharp Edge: Prop Intelligence System v3.0
+
+Generated: 2025-10-09T19:28:16.314277Z
+
+## What this is
+A plug-and-play pipeline that:
+1) Fetches NFL data with failovers (nflverse → ESPN → NFLGSIS → API-Sports → MSF)
+2) Builds team & player feature tables
+3) Fetches sportsbook props
+4) Runs predictive models (MC/Bayes/Markov/ML with ABM adjustments)
+5) Outputs edges + fair odds
+
+## Entry points
+- `run_model.py` — run everything end-to-end (local or CI)
+- `fetch_all.py` — compatibility wrapper that only runs the provider chain
+- `make_all.py` — compatibility wrapper that runs metrics + props + predictors
+
+## Working dirs
+- `data/`    — ingested + engineered tables
+- `outputs/` — props + predictions
+- `logs/`    — per-run audit trail
+
+[README.md](https://github.com/user-attachments/files/22803928/README.md)
+
 # NFL Props Model — Turn‑Key (Odds API + Free Features)
 
 This repo is a **turn‑key pipeline** to pull NFL game lines & player props (including alternates) from **The Odds API**, build **external features** from free sources (nfl_data_py), price markets with your **ELITE model spec** (μ/σ + post‑mortem rules), and export tidy CSVs. It runs **locally** or on **GitHub Actions**.
@@ -18,6 +43,7 @@ python run_model.py --date today --season 2025 --write outputs
 Artifacts:
 - `outputs/game_lines.csv` — H2H / spreads / totals (normalized)
 - `outputs/props_priced.csv` — Player props (with alternates), model μ/σ, blended probabilities, fair odds, **edge%**, **kelly** and **tier**.
+[Uploading README.md…]()
 
 ---
 
