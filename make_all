@@ -1,0 +1,10 @@
+from __future__ import annotations
+import argparse
+from engine import run_pipeline
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--season", required=True)
+    ap.add_argument("--date", default="")
+    args = ap.parse_args()
+    run_pipeline(season=args.season, date=args.date)
