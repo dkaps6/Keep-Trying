@@ -20,7 +20,7 @@ def main():
     seasons = [int(s) for s in args.season]
     ensure_dir(args.out)
 
-    pbp = nfl.load_pbp(seasons=seasons, file_type="csv")
+    pbp = nfl.load_pbp(seasons=seasons)
 
     # Keep designed runs only
     runs = pbp.filter((pl.col("play_type")=="run") & (pl.col("rusher_player_name").is_not_null()))
