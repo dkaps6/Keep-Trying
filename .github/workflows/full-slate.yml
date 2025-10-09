@@ -108,6 +108,36 @@ jobs:
             fi
           done
 
+# ------------------------------
+# PROPS INGEST (must run before metrics/model)
+# ------------------------------
+      - name: Fetch props (Odds API)
+        shell: bash
+        working-directory: scripts/providers
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}   # keep your existing secret name
+          SPORT: "americanfootball_nfl"
+          SEASON: "2025"
+        run: |
+          set -euo pipefail
+          echo "::group::Fetch props from Odds API"
+          python fetch_props_odds_api.py \
+            --sport "$SPORT" \
+            --season "$SEASON" \
+            --out ../../outputs/props_raw.csv || true
+          echo "::endgroup::"
+
+# If the above failed to create a usable file, drop a header-only placeholder
+      - name: Ensure props_raw.csv exists (header placeholder if needed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p outputs
+          if [ ! -s outputs/props_raw.csv ]; then
+            echo "book,market,player,team,prop,price,side,ou,open_time,update_time" > outputs/props_raw.csv
+            echo "WARN: outputs/props_raw.csv was missing; wrote header-only placeholder."
+          fi
+
       # ==========================
       # METRICS COMPOSITION
       # ==========================
