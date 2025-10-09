@@ -1,185 +1,204 @@
-name: Run pipeline
+name: Full Slate (NFL 2025 • production)
 
 on:
   workflow_dispatch:
     inputs:
       season:
-        description: "Season tag (e.g., 2025)"
+        description: "Season (e.g., 2025)"
         required: true
         default: "2025"
-
       strict:
-        description: "Strict mode (0 = tolerant, 1 = strict)"
+        description: "Strict mode (0 tolerant, 1 strict)"
         required: false
         default: "0"
-
-      odds_date:
-        description: "Only fetch lines for this calendar day (YYYY-MM-DD, optional)"
+      run_addons:
+        description: "Run addon derivations (PROE, box counts, roles, RB metrics, ESPN injuries)"
         required: false
-        default: ""
+        default: "true"
 
-      # If you prefer a time window, comment out odds_date above and use these two instead:
-      # odds_from:
-      #   description: "Commence time >= (ISO-8601, optional)"
-      #   required: false
-      #   default: ""
-      # odds_to:
-      #   description: "Commence time < (ISO-8601, optional)"
-      #   required: false
-      #   default: ""
+concurrency:
+  group: full-slate-${{ github.ref_name }}
+  cancel-in-progress: false
 
-      markets:
-        description: "Comma-separated markets. Leave blank for ALL (spreads,totals,ml,player props, TDs)"
-        required: false
-        default: ""
+permissions:
+  contents: read
 
-      bookmakers:
-        description: "Bookmakers (comma-separated keys)"
-        required: false
-        default: "draftkings,fanduel,betmgm,caesars"
+env:
+  SEASON: ${{ github.event.inputs.season }}
+  STRICT: ${{ github.event.inputs.strict }}
+  RUN_ADDONS: ${{ github.event.inputs.run_addons }}
 
-      cap:
-        description: "Hard cap on number of events to fetch (0 = no cap)"
-        required: false
-        default: "0"
+  # Provider secrets (filled from GitHub Secrets if present)
+  MSF_API_KEY: ${{ secrets.MSF_API_KEY }}
+  MSF_API_USERNAME: ${{ secrets.MSF_API_USERNAME }}
+  MSF_API_PASSWORD: ${{ secrets.MSF_API_PASSWORD }}
+  APISPORTS_API_KEY: ${{ secrets.APISPORTS_API_KEY }}
+  NFL_GSIS_USERNAME: ${{ secrets.NFL_GSIS_USERNAME }}
+  NFL_GSIS_PASSWORD: ${{ secrets.NFL_GSIS_PASSWORD }}
+  ESPN_COOKIE: ${{ secrets.ESPN_COOKIE }}
+  ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      # Plumb season/strict across steps
-      SEASON: ${{ github.event.inputs.season }}
-      STRICT: ${{ github.event.inputs.strict }}
-
-      # Make secrets visible to Python fetchers (fallback providers)
-      MSF_KEY:        ${{ secrets.MSF_KEY }}
-      MSF_PASSWORD:   ${{ secrets.MSF_PASSWORD }}
-      APISPORTS_KEY:  ${{ secrets.APISPORTS_KEY }}
-      NFLGSIS_USERNAME: ${{ secrets.NFLGSIS_USERNAME }}
-      NFLGSIS_PASSWORD: ${{ secrets.NFLGSIS_PASSWORD }}
-      THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
-  
-      # 🎯 Odds Filtering Inputs (optional)
-      ODDS_DATE:        ${{ github.event.inputs.odds_date }}
-      ODDS_FROM:        ${{ github.event.inputs.odds_from }}
-      ODDS_TO:          ${{ github.event.inputs.odds_to }}
-      ODDS_MARKETS:     ${{ github.event.inputs.odds_markets }}
-      ODDS_BOOKS:       ${{ github.event.inputs.odds_books }}
-      ODDS_PROPS_ONLY:  ${{ github.event.inputs.odds_props_only }}
-      ODDS_SIDES_ONLY:  ${{ github.event.inputs.odds_sides_only }}
-      ODDS_CAP:         ${{ github.event.inputs.odds_cap }}
-      ODDS_ALL_MARKETS: ${{ github.event.inputs.all_markets }}
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
-          echo "Repo root: $PWD"
-          ls -la
-          if [ -f requirements-extended.txt ]; then
-            pip install -r requirements-extended.txt
-          elif [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            echo "::warning::No requirements*.txt found; proceeding with installed environment."
-          fi
-          python -V
-          pip -V
+          python -m pip install --upgrade pip wheel
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Soft deps for our fallbacks
+          pip install pandas numpy requests pyarrow
+          # Try nflverse client libs; fall back if one missing
+          pip install "nflreadpy>=0.3" || true
+          pip install "nfl_data_py>=0.3.1" || true
 
-      - name: Show layout (debug)
+      - name: Echo configured season/strict
+        run: |
+          echo "Season=${SEASON}"
+          echo "Strict=${STRICT}"
+          echo "Addons=${RUN_ADDONS}"
+
+      # ==========================
+      # FETCH LAYER (with fallbacks)
+      # ==========================
+      - name: Fetch data (nflverse + provider fallbacks)
         shell: bash
         run: |
           set -euo pipefail
-          echo "== tree -L 3 =="
-          (command -v tree >/dev/null 2>&1 && tree -L 3 || ls -R | sed -n '1,300p') || true
-
-      # -----------------------------
-      # FETCH RAW (multi-source)
-      # -----------------------------
-      - name: Fetch free data (nflverse + fallbacks)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "[fetch_all] season=${SEASON}"
           if [ -f external/nflverse_bundle/fetch_all.py ]; then
             python external/nflverse_bundle/fetch_all.py --season "${SEASON}"
           else
-            echo "::warning::external/nflverse_bundle/fetch_all.py not found; skipping raw fetch step."
+            echo "::warning::external/nflverse_bundle/fetch_all.py missing. Skipping fetch."
           fi
 
-      # -----------------------------
-      # RUN ADDONS (optional)
-      # -----------------------------
-      - name: Run addons (if present)
+      # ==========================
+      # OPTIONAL ADDONS
+      # ==========================
+      - name: Run addons (PROE, box counts, roles, RB metrics, ESPN injuries)
+        if: env.RUN_ADDONS == 'true'
         shell: bash
+        working-directory: external/nflverse_bundle
         run: |
           set -euo pipefail
-          runp() { [ -f "$1" ] && echo ">> $1" && python "$1" --season "${SEASON}" || echo "skip $1"; }
-          runp external/nflverse_bundle/addons/derive_proe.py
-          runp external/nflverse_bundle/addons/aggregate_box_counts.py
-          runp external/nflverse_bundle/addons/derive_roles.py
-          runp external/nflverse_bundle/addons/derive_rb_metrics.py
-          runp external/nflverse_bundle/addons/fetch_injuries_espn.py
-          runp external/nflverse_bundle/addons/fetch_odds.py
+          for add in             addons/derive_proe.py             addons/aggregate_box_counts.py             addons/derive_roles.py             addons/derive_rb_metrics.py             addons/fetch_injuries_espn.py           ; do
+            if [ -f "${add}" ]; then
+              echo "[addon] ${add} --season ${SEASON}"
+              python "${add}" --season "${SEASON}" || echo "::warning::addon ${add} failed"
+            else
+              echo "::notice::${add} not present; skipping"
+            fi
+          done
 
-      # -----------------------------
-      # COMPOSE (call whichever make_all exists)
-      # -----------------------------
-      - name: Compose bundle (team_form / player_form)
+      # ==========================
+      # METRICS COMPOSITION
+      # ==========================
+      - name: Compose metrics (team_form / player_form)
         shell: bash
+        working-directory: external/nflverse_bundle
+        env:
+          STRICT: ${{ env.STRICT }}
         run: |
           set -euo pipefail
-          SEASON="${{ github.event.inputs.season }}"
-          STRICT="${{ github.event.inputs.strict }}"
-          STRICT_FLAG=""
-          if [ -n "${STRICT}" ]; then STRICT_FLAG="--strict ${STRICT}"; fi
-
-          python external/nflverse_bundle/make_all.py --season "${SEASON}" ${STRICT_FLAG}
-
-
-          if [ -f external/nflverse_bundle/make_all.py ]; then
-            echo "Found: external/nflverse_bundle/make_all.py"
-            python external/nflverse_bundle/make_all.py --season "${SEASON}" --strict "${STRICT}"
+          if [ -f make_all.py ]; then
+            python make_all.py --season "${SEASON}" --strict "${STRICT}"
           else
-            echo "::error ::make_all.py not found"; exit 1
+            echo "::error::make_all.py not found."
+            exit 2
           fi
 
-      # -----------------------------
-      # VALIDATE OUTPUTS (optional)
-      # -----------------------------
-      - name: Validate data pack outputs
+      # ==========================
+      # MIRROR & SANITY
+      # ==========================
+      - name: Mirror files to canonical locations
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p data outputs outputs/metrics
+          # mirror core bundle outputs
+          cp -f external/nflverse_bundle/outputs/pbp/pbp_${SEASON}_${SEASON}.csv data/pbp.csv || true
+          cp -f external/nflverse_bundle/outputs/injuries/injuries_${SEASON}.csv data/injuries.csv || true
+          cp -f external/nflverse_bundle/outputs/schedules/schedules_${SEASON}.csv data/schedules.csv || true
+          cp -f external/nflverse_bundle/outputs/rosters/rosters_${SEASON}.csv data/rosters.csv || true
+          cp -f external/nflverse_bundle/outputs/depth_charts/depth_charts_${SEASON}.csv data/depth_charts.csv || true
+          cp -f external/nflverse_bundle/outputs/snap_counts/snap_counts_${SEASON}.csv data/snap_counts.csv || true
+          cp -f external/nflverse_bundle/outputs/team_stats/team_stats_week_${SEASON}.csv data/team_stats_week.csv || true
+          cp -f external/nflverse_bundle/outputs/player_stats/player_stats_week_${SEASON}.csv data/player_stats_week.csv || true
+          # metrics
+          cp -f outputs/metrics/team_form.csv data/team_form.csv || true
+          cp -f outputs/metrics/player_form.csv data/player_form.csv || true
+          # placeholders expected downstream
+          [ -f data/roles.csv ] || echo "" > data/roles.csv
+          [ -f data/coverage.csv ] || echo "" > data/coverage.csv
+          [ -f data/cb_assignments.csv ] || echo "" > data/cb_assignments.csv
+          [ -f data/weather.csv ] || echo "" > data/weather.csv
+          [ -f outputs/game_lines.csv ] || echo "" > outputs/game_lines.csv
+          [ -f outputs/props_raw.csv ] || echo "" > outputs/props_raw.csv
+
+      - name: Sanity check (quick headers)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pandas as pd
+          targets = [
+              "data/pbp.csv","data/injuries.csv","data/schedules.csv",
+              "outputs/metrics/team_form.csv","outputs/metrics/player_form.csv",
+              "outputs/game_lines.csv","outputs/props_raw.csv",
+          ]
+          for t in targets:
+              if not os.path.exists(t) or os.stat(t).st_size == 0:
+                  print(f"[WARN] {t} missing/empty")
+              else:
+                  try:
+                      df = pd.read_csv(t, nrows=3)
+                      print(f"[OK] {t} cols={list(df.columns)}")
+                  except Exception as e:
+                      print(f"[READ ERR] {t}: {e}")
+          PY
+
+      # ==========================
+      # VALIDATION / MODEL (hooks)
+      # ==========================
+      - name: Validate inputs (if present)
+        shell: bash
+        run: |
           if [ -f scripts/validate_inputs.py ]; then
             python scripts/validate_inputs.py
           else
-            echo "::warning::No validator found at scripts/validate_inputs.py; skipping validation."
+            echo "::notice::scripts/validate_inputs.py not present; skipping"
           fi
 
-      - name: Run predictive model (if script exists)
+      - name: Price props & run model (if your script exists)
         shell: bash
         run: |
-          set -euo pipefail
-          if [ -f run_model.py ]; then
-            echo "Found run_model.py — executing..."
-            python run_model.py --season "${SEASON}" --strict "${STRICT}"
+          if [ -f pricing/pricing.py ]; then
+            python pricing/pricing.py --season "${SEASON}" --strict "${STRICT}" || echo "::warning::pricing failed"
           else
-            echo "::warning::run_model.py not found — skipping model execution."
+            echo "::notice::pricing/pricing.py not present; skipping"
           fi
 
-      # -----------------------------
-      # ZIP OUTPUTS (artifact)
-      # -----------------------------
-      - name: Pack outputs artifact
+      # ==========================
+      # ARTIFACTS
+      # ==========================
+      - name: Bundle artifacts
         if: always()
         shell: bash
         run: |
