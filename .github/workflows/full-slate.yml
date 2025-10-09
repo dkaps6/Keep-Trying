@@ -233,6 +233,9 @@ jobs:
           else
             echo "::notice::scripts/validate_inputs.py not present; skipping"
           fi
+          
+      - name: Build metrics (team_form, player_form)
+        run: python scripts/make_metrics.py --season "${{ inputs.season }}"
 
       - name: Price props & run model (if your script exists)
         shell: bash
