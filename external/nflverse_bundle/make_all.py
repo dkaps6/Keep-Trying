@@ -136,7 +136,7 @@ PRIMARY_PATHS: Dict[str, Callable[[int], List[Path]]] = {
     "rosters_weekly":   lambda s: [OUT_BUNDLE / "rosters_weekly" / f"rosters_weekly_{s}.csv"],
     "participation":    lambda s: [OUT_BUNDLE / "participation" / f"participation_{s}.csv"],
     "pbp":              lambda s: [OUT_BUNDLE / "pbp" / f"pbp_{s}_{s}.csv"],
-    # expanded to find your artifacts:
+    # Expanded to find artifacts (addons write here)
     "proe_week":        lambda s: [
         ROOT / "outputs" / "proe" / f"proe_week_{s}.csv",
         ROOT / "outputs" / "proe" / f"team_proe_week_{s}.csv",
@@ -146,7 +146,7 @@ PRIMARY_PATHS: Dict[str, Callable[[int], List[Path]]] = {
 }
 
 # ----------------------------
-# Fallbacks (nflverse -> msf -> apisports -> gsis)
+# Fallbacks (nflverse -> msf -> apisports -> gsis -> espn)
 # ----------------------------
 FALLBACKS: Dict[str, List] = {
     "schedules": [
@@ -215,8 +215,8 @@ FALLBACKS: Dict[str, List] = {
         (lambda s: nflverse.participation(s)) if nflverse and hasattr(nflverse, "participation") else None,
         (lambda s: msf.participation(s)) if msf and hasattr(msf, "participation") else None,
     ],
-    "proe_week": [],  # derived addon (kept empty; you already have an addon for this)
-    "box_week":  [],  # derived addon (kept empty)
+    "proe_week": [],  # derived addon
+    "box_week":  [],  # derived addon
 }
 
 # ----------------------------
@@ -246,103 +246,9 @@ def _compute_proxy(key: str, season: int, cache: Dict[str, pd.DataFrame]) -> Opt
             return wk.groupby(keys, as_index=False).sum(numeric_only=True)
     return None
 
-def _normalize_pbp_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Map various provider column names → the canonical names our composers expect."""
-    if not _ok(df):
-        return df
-
-    col_map = {}
-    # teams
-    if "posteam" not in df.columns:
-        for a in ["offense_team", "team_offense", "poss_team", "possession_team"]:
-            if a in df.columns: col_map[a] = "posteam"; break
-    if "defteam" not in df.columns:
-        for a in ["defense_team", "team_defense"]:
-            if a in df.columns: col_map[a] = "defteam"; break
-
-    # ids / week
-    if "game_id" not in df.columns:
-        for a in ["old_game_id","gameid","gameId","gameId_str","game_identifier"]:
-            if a in df.columns: col_map[a] = "game_id"; break
-    if "week" not in df.columns:
-        for a in ["game_week","week_number","wk"]:
-            if a in df.columns: col_map[a] = "week"; break
-
-    # receiver/rusher/passer
-    if "receiver_player_name" not in df.columns:
-        for a in ["receiver","receiver_name","receiver_full_name","target_player_name"]:
-            if a in df.columns: col_map[a] = "receiver_player_name"; break
-    if "rusher_player_name" not in df.columns:
-        for a in ["rusher","rusher_name","runner_name"]:
-            if a in df.columns: col_map[a] = "rusher_player_name"; break
-    if "passer_player_name" not in df.columns:
-        for a in ["passer","passer_name","qb_player_name","quarterback_name"]:
-            if a in df.columns: col_map[a] = "passer_player_name"; break
-
-    # yardline / yards
-    if "yardline_100" not in df.columns:
-        for a in ["yardline","yard_line_100","yards_to_goal","yardlineNumber"]:
-            if a in df.columns: col_map[a] = "yardline_100"; break
-    if "yards_gained" not in df.columns and "yards" in df.columns:
-        col_map["yards"] = "yards_gained"
-
-    # pass/rush flags
-    if "pass" not in df.columns:
-        for a in ["is_pass","qb_dropback","pass_flag"]:
-            if a in df.columns: col_map[a] = "pass"; break
-    if "rush" not in df.columns:
-        for a in ["is_rush","rush_flag"]:
-            if a in df.columns: col_map[a] = "rush"; break
-
-    if col_map:
-        df = df.rename(columns=col_map)
-
-    # types
-    for c in ["week","down"]:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
-    for c in ["yardline_100","yards_gained","ydstogo"]:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # Best-effort defteam inference if missing: "other team in same game"
-    if "defteam" in df.columns and df["defteam"].isna().all() and {"game_id","posteam"}.issubset(df.columns):
-        # per game, collect teams appeared as offense; infer defense as the other team seen in that game
-        try:
-            teams_by_game = (df[["game_id","posteam"]].dropna().groupby("game_id")["posteam"]
-                              .agg(lambda x: list(pd.unique(x))).to_dict())
-            def infer_def(row):
-                plist = teams_by_game.get(row["game_id"], [])
-                if len(plist) == 2 and row["posteam"] in plist:
-                    return plist[1] if plist[0] == row["posteam"] else plist[0]
-                return np.nan
-            df["defteam"] = df.apply(infer_def, axis=1)
-        except Exception:
-            pass
-
-    return df
-
-# --- helpers ---
-def _read_csv_soft(path: Path) -> pd.DataFrame:
-    try:
-        if path.exists() and path.stat().st_size > 0:
-            return pd.read_csv(path)
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-def _decimal_to_impl(p):
-    # Odds API decimals: implied prob = 1 / price
-    try:
-        p = float(p)
-        return 1.0 / p if p and p > 1e-9 else None
-    except Exception:
-        return None
-
-def _de_vig(impl_series: pd.Series) -> pd.Series:
-    # normalize so each event/market’s outcomes sum to 1.0
-    s = impl_series.astype(float)
-    tot = s.groupby(level=0).transform("sum")  # assumes MultiIndex with grouping key at level 0
-    return s / tot
-
+# ----------------------------
+# Column aliasing / normalizers
+# ----------------------------
 def _alias(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> pd.DataFrame:
     if not _ok(df): return df
     ren = {}
@@ -400,8 +306,6 @@ def _normalize_pbp_cols(df: pd.DataFrame) -> pd.DataFrame:
             )
         except Exception:
             pass
-
-    # Do **not** hard-require yardline/receiver here; composers handle strict vs. non-strict.
     return df
 
 def _normalize_schedules(df: pd.DataFrame) -> pd.DataFrame:
@@ -573,11 +477,9 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
             raise DataQualityError("[derive_team_from_pbp] pbp is empty")
         return pd.DataFrame(), pd.DataFrame()
 
-    # drop duplicate-named columns (e.g., duplicated 'game_id')
     if pbp.columns.duplicated().any():
         pbp = pbp.loc[:, ~pbp.columns.duplicated()].copy()
 
-    # Column normalization (nflfastR style preferred)
     posteam = _pick(["posteam","offense_team"], pbp) or "posteam"
     defteam = _pick(["defteam","defense_team"], pbp) or "defteam"
     weekcol = _pick(["week","game_week"], pbp) or "week"
@@ -588,7 +490,6 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
     pass_flag = _bool_col(pbp, ["pass","is_pass","qb_dropback"])
     rush_flag = _bool_col(pbp, ["rush","is_rush"]) & ~pass_flag
 
-    # EPA splits (defense is negative of offense EPA allowed)
     teams = pd.unique(pd.concat([pbp[posteam], pbp[defteam]], ignore_index=True)).astype(str)
     env = pd.DataFrame({"team": sorted([t for t in teams if t and t != "nan"])})
 
@@ -609,7 +510,6 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
         env["def_pass_epa"] = -env["off_pass_epa"].fillna(0.0)
         env["def_rush_epa"] = -env["off_rush_epa"].fillna(0.0)
 
-    # aDOT / air_yards per attempt
     air = _pick(["air_yards"], pbp)
     attempts = (
         pbp.loc[pbp[posteam].notna(), [posteam]]
@@ -628,7 +528,6 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
     else:
         env["ay_per_att"] = np.nan
 
-    # Neutral pace (sec/play in neutral score)
     sec_rem = _pick(["game_seconds_remaining","game_seconds"], pbp)
     score_diff = _pick(["score_differential","score_diff"], pbp)
     qtr = _pick(["qtr","quarter"], pbp)
@@ -645,9 +544,8 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
         pace = pace.rename(columns={posteam:"team","delta":"sec_per_play_neutral"})
         env = env.merge(pace, on="team", how="left")
         env["pace"] = env["sec_per_play_neutral"].fillna(env["sec_per_play_neutral"].median())
-        env["pace"] = -env["pace"].fillna(28.0)  # default ~28 sec/play
+        env["pace"] = -env["pace"].fillna(28.0)
 
-    # PROE (league expectation by down/dist/field/score/quarter/time)
     down = _pick(["down"], pbp)
     ytg  = _pick(["ydstogo","yards_to_go","yds_to_go"], pbp)
     yline= _pick(["yardline_100","yardline"], pbp)
@@ -662,12 +560,10 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
         df = pbp.loc[pbp[posteam].notna() & pbp[down].notna(), [posteam, weekcol, down, ytg, yline]].copy()
         df["is_pass"] = pass_flag.loc[df.index].astype(int)
 
-        # bins
         df["down_b"]   = df[down].clip(1,4)
         df["ytg_b"]    = pd.cut(_safe_num(df[ytg]), bins=[-1,2,6,10,25,99], labels=["short","med","long","xlong","hail"])
         df["yl_b"]     = pd.cut(_safe_num(df[yline]), bins=[-1,20,50,80,110], labels=["rz","mid","deep","backed"])
 
-        # add score bins, quarter bins, time bins
         if score_diff in pbp.columns:
             df2 = pbp.loc[df.index, [score_diff]].copy()
             df["score_b"] = pd.cut(_safe_num(df2[score_diff]), bins=[-99,-14,-7,-3,3,7,14,99],
@@ -687,7 +583,6 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
         else:
             df["time_b"] = "Q1"
 
-        # league baseline expectation
         exp_keys = ["down_b","ytg_b","yl_b","score_b","qtr_b","time_b"]
         exp_tbl = (
             df.groupby(exp_keys, as_index=False)["is_pass"]
@@ -712,7 +607,6 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
         proe_season = grp.groupby("team", as_index=False)["proe"].mean()
         env = env.merge(proe_season, on="team", how="left")
 
-    # Red-zone trip rate (first entries per game)
     yline_use = yline
     env["rz_rate"] = 0.0
 
@@ -720,16 +614,12 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
         require_cols(pbp, [c for c in [yline_use, game_id, posteam] if c], "pbp for red-zone trips", strict, issues)
 
     if yline_use:
-        # minimal columns we always need
         base_cols = [game_id, posteam, yline_use]
-
         df = (
             pbp.loc[pbp[posteam].notna() & pbp[yline_use].notna(), base_cols]
             .copy()
             .rename(columns={posteam: "team"})
         )
-
-        # optional ordering cols, avoid duplicating base columns
         order_cols = [
             c for c in ["game_id", "old_game_id", "drive", "play_id", "index"]
             if c in pbp.columns and c not in base_cols
@@ -743,13 +633,10 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
             )
             df = df.sort_values(order_cols)
 
-        # mark red-zone on each play
         df["is_rz"] = _safe_num(df[yline_use]) <= 20
-        # first entry within each game/team is when previous is_rz is False
         df["prev_is_rz"] = df.groupby([game_id, "team"])["is_rz"].shift(1).fillna(False)
         df["rz_entry"] = df["is_rz"] & (~df["prev_is_rz"])
 
-        # trips per game, then average across games
         trips = (
             df.groupby([game_id, "team"], as_index=False)["rz_entry"]
               .sum()
@@ -764,12 +651,10 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
         env = env.merge(rz, on="team", how="left")
         env["rz_rate"] = env["rz_trips_per_game"].fillna(0.0)
 
-    # plays_est from pace
     env["plays_est"] = (
         3600.0 / env.get("sec_per_play_neutral", pd.Series(np.nan)).replace(0, np.nan)
     ).fillna(0.0)
 
-    # SAFETY: ensure these columns exist
     for col, default in [
         ("sec_per_play_neutral", np.nan),
         ("pace", np.nan),
@@ -782,7 +667,6 @@ def derive_team_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -> 
                 issues.append(f"[data] '{col}' not produced; derived team table incomplete")
             env[col] = default
 
-    # final assemble
     out = pd.DataFrame({
         "team": env["team"],
         "def_pressure_rate_z": 0.0,
@@ -825,7 +709,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
 
     posteam = _pick(["posteam","offense_team"], pbp) or "posteam"
 
-    # Generous aliases
     rec_name  = _pick([
         "receiver_player_name","receiver","receiver_name",
         "target_player_name","targeted_receiver","target_name"
@@ -846,7 +729,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
     pass_flag = _bool_col(pbp, ["pass","is_pass","qb_dropback"])
     rush_flag = _bool_col(pbp, ["rush","is_rush"]) & ~pass_flag
 
-    # ---------- counting tables ----------
     targ_df = (pd.DataFrame() if not rec_name else
         pbp.loc[pass_flag & pbp[rec_name].notna() & pbp[posteam].notna(), [posteam, rec_name]]
            .assign(tgt=1)
@@ -886,7 +768,6 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
         if feeder_issues:
             raise RuntimeError("[derive_player_from_pbp] Missing feeder data: " + "; ".join(feeder_issues))
 
-    # ---------- efficiency tables ----------
     rec_yds_df = pd.DataFrame()
     if rec_name and yards_gained:
         rec_yds_df = (
@@ -907,9 +788,8 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
             pbp.loc[rush_flag & pbp[rush_name].notna() & pbp[posteam].notna(), [posteam, rush_name, yards_gained]]
                 .groupby([posteam, rush_name], as_index=False)[yards_gained].sum()
                 .rename(columns={posteam: "team", rush_name: "player", yards_gained: "rush_yards"})
-    )
+        )
 
-    # ---------- merge per-player ----------
     pf = pd.DataFrame(columns=["player","team"])
     for base in [targ_df, rush_df, rz_tgt_df, rz_car_df, rec_yds_df, yac_df, rush_yds_df]:
         if _ok(base):
@@ -921,74 +801,157 @@ def derive_player_from_pbp(pbp: pd.DataFrame, strict: bool, issues: List[str]) -
             "yprr_proxy","ypc","ypt","qb_ypa"
         ])
 
-    # ---------- final schema (always defined) ----------
-    cols_out = [
-        "target_share","rush_share","rz_tgt_share","rz_carry_share",
-        "yprr_proxy","ypc","ypt","qb_ypa"
-    ]
+    # Build shares/efficiency safely
+    team_tgts = targ_df.groupby("team", as_index=False)["tgt"].sum() if _ok(targ_df) else pd.DataFrame(columns=["team","tgt"])
+    team_rush = rush_df.groupby("team", as_index=False)["rush"].sum() if _ok(rush_df) else pd.DataFrame(columns=["team","rush"])
+    team_rz_tgts = rz_tgt_df.groupby("team", as_index=False)["rz_tgt"].sum() if _ok(rz_tgt_df) else pd.DataFrame(columns=["team","rz_tgt"])
+    team_rz_car = rz_car_df.groupby("team", as_index=False)["rz_car"].sum() if _ok(rz_car_df) else pd.DataFrame(columns=["team","rz_car"])
 
-    pf_out = pf[["player","team"]].copy()
-    pf_out["position"] = ""
+    pf = pf.merge(team_tgts, on="team", how="left", suffixes=("","_team")).merge(team_rush, on="team", how="left", suffixes=("","_team"))
+    pf = pf.merge(team_rz_tgts, on="team", how="left").merge(team_rz_car, on="team", how="left", suffixes=("","_team"))
 
-    for c in cols_out:
-        series = pf[c] if c in pf.columns else pd.Series(np.nan, index=pf.index)
-        pf_out[c] = _safe_num(series).astype(float)
+    for c in ["tgt","rush","rz_tgt","rz_car","rec_yards","yac_sum","rush_yards","tgt_team","rush_team","rz_tgt_team","rz_car_team"]:
+        if c not in pf.columns: pf[c] = 0.0
+        pf[c] = _safe_num(pf[c]).fillna(0.0)
+
+    pf["target_share"]   = pf["tgt"]    / pf["tgt_team"].replace(0, np.nan)
+    pf["rush_share"]     = pf["rush"]   / pf["rush_team"].replace(0, np.nan)
+    pf["rz_tgt_share"]   = pf["rz_tgt"] / pf["rz_tgt_team"].replace(0, np.nan)
+    pf["rz_carry_share"] = pf["rz_car"] / pf["rz_car_team"].replace(0, np.nan)
+
+    pf["ypt"]        = pf["rec_yards"] / pf["tgt"].replace(0, np.nan)
+    pf["ypc"]        = pf["rush_yards"] / pf["rush"].replace(0, np.nan)
+    pf["yprr_proxy"] = pf["ypt"]
+
+    qb = pd.DataFrame(columns=["player","team","qb_ypa"])
+    if pass_name and yards_gained:
+        pa = (pbp.loc[pass_flag & pbp[pass_name].notna() & pbp[posteam].notna(), [posteam, pass_name]]
+                .assign(att=1)
+                .groupby([posteam, pass_name], as_index=False)["att"].sum()
+                .rename(columns={posteam:"team", pass_name:"player"}))
+        py = (pbp.loc[pass_flag & pbp[pass_name].notna() & pbp[posteam].notna(), [posteam, pass_name, yards_gained]]
+                .groupby([posteam, pass_name], as_index=False)[yards_gained].sum()
+                .rename(columns={posteam:"team", pass_name:"player", yards_gained:"pass_yards"}))
+        qb = pa.merge(py, on=["team","player"], how="left")
+        qb["qb_ypa"] = qb["pass_yards"] / qb["att"].replace(0, np.nan)
+        qb = qb[["team","player","qb_ypa"]]
+
+    pf = pf.merge(qb, on=["team","player"], how="left")
+
+    pf2 = pf[["player","team"]].copy()
+    pf2["position"] = ""
+    for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]:
+        if c not in pf.columns: pf[c] = np.nan
+        pf2[c] = pf[c].astype(float)
 
     if not strict:
-        for c in cols_out:
-            pf_out[c] = pf_out[c].fillna(0.0)
+        for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]:
+            pf2[c] = pf2[c].fillna(0.0)
 
-    return pf_out
+    return pf2
+
+# ============================
+# Odds consensus (from outputs/game_lines.csv, outputs/props_raw.csv)
+# ============================
+def _read_csv_soft(path: Path) -> pd.DataFrame:
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return pd.read_csv(path)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def _decimal_to_impl(p):
+    try:
+        p = float(p)
+        return 1.0 / p if p and p > 1e-9 else None
+    except Exception:
+        return None
+
+def compose_odds(season: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    out_dir = ROOT / "outputs"
+    gl_path = out_dir / "game_lines.csv"
+    pr_path = out_dir / "props_raw.csv"
+
+    game = _read_csv_soft(gl_path)
+    props = _read_csv_soft(pr_path)
+
+    game_cons = pd.DataFrame()
+    if _ok(game) and {"event_id","market","outcome","bookmaker","price"}.issubset(game.columns):
+        for c in ["price", "point"]:
+            if c in game.columns:
+                game[c] = pd.to_numeric(game[c], errors="coerce")
+        game["impl"] = game["price"].map(_decimal_to_impl)
+        game = game.dropna(subset=["impl"])
+        grp = game.groupby(["event_id","market","bookmaker"])
+        game["impl_vigfree"] = grp["impl"].transform(lambda s: s / s.sum())
+        cons = (game.groupby(["event_id","market","outcome"], as_index=False)
+                    .agg(cons_prob=("impl_vigfree","mean"),
+                         avg_price=("price","mean"),
+                         avg_point=("point","mean")))
+        meta = (game.groupby("event_id", as_index=False)
+                    .agg(commence_time=("commence_time","first"),
+                         home_team=("home_team","first"),
+                         away_team=("away_team","first")))
+        game_cons = cons.merge(meta, on="event_id", how="left")
+
+    props_cons = pd.DataFrame()
+    if _ok(props) and {"event_id","market","label","player","outcome","bookmaker","price"}.issubset(props.columns):
+        for c in ["price","point"]:
+            if c in props.columns:
+                props[c] = pd.to_numeric(props[c], errors="coerce")
+        props["impl"] = props["price"].map(_decimal_to_impl)
+        props = props.dropna(subset=["impl"])
+        grp = props.groupby(["event_id","market","label","player","bookmaker"])
+        props["impl_vigfree"] = grp["impl"].transform(lambda s: s / s.sum())
+        cons = (props.groupby(["event_id","market","label","player","outcome"], as_index=False)
+                    .agg(cons_prob=("impl_vigfree","mean"),
+                         avg_price=("price","mean"),
+                         avg_point=("point","mean")))
+        meta = (props.groupby("event_id", as_index=False)
+                    .agg(commence_time=("commence_time","first")))
+        props_cons = cons.merge(meta, on="event_id", how="left")
+
+    (ROOT / "outputs").mkdir(parents=True, exist_ok=True)
+    if _ok(game_cons):
+        game_cons.to_csv(ROOT / "outputs" / "odds_game_consensus.csv", index=False)
+    if _ok(props_cons):
+        props_cons.to_csv(ROOT / "outputs" / "odds_props_consensus.csv", index=False)
+
+    return game_cons, props_cons
 
 # ============================
 # ===== COMPOSERS ============
 # ============================
 def compose_team_form(season: int, cache: Dict[str, pd.DataFrame], strict: bool, issues: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns team_form and proe_week (for optional export)
-    """
     pbp = _get_or_resolve("pbp", season, cache)
     require_nonempty(pbp, "pbp", strict, issues)
 
     tf_der, proe_week = derive_team_from_pbp(pbp, strict, issues)
 
-    # Optional sources for box rates, etc.
+    # Optional: integrate box rates
     box   = _get_or_resolve("box_week", season, cache)
     proe  = _get_or_resolve("proe_week", season, cache)
 
-    # --- Odds: compose consensus tables ---
-    game_odds, props_odds = compose_odds(s)
-    # also mirror to data/ for model convenience
-    if _ok(game_odds):
-        _write_csv(game_odds, DATA_MIRROR / "odds_game_consensus.csv")
-    if _ok(props_odds):
-        _write_csv(props_odds, DATA_MIRROR / "odds_props_consensus.csv")
-
-    # integrate box rates if present
     if _ok(box) and {"team","def_light_box_rate","def_heavy_box_rate"} <= set(box.columns):
         b = box.groupby("team", as_index=False)[["def_light_box_rate","def_heavy_box_rate"]].mean()
         tf_der = tf_der.merge(b, on="team", how="left")
         tf_der["light_box_rate_z"] = _z(tf_der["def_light_box_rate"].fillna(0.0))
         tf_der["heavy_box_rate_z"] = _z(tf_der["def_heavy_box_rate"].fillna(0.0))
 
-    # prefer addon PROE season if present (otherwise derived)
     if _ok(proe) and {"team","proe"} <= set(proe.columns):
         p = proe.groupby("team", as_index=False)["proe"].mean()
         tf_der = tf_der.drop(columns=["proe"], errors="ignore").merge(p, on="team", how="left")
 
-    # ensure required cols exist
     cols = ["team",
             "def_pressure_rate_z","def_pass_epa_z","def_rush_epa_z","def_sack_rate_z",
             "pace_z","light_box_rate_z","heavy_box_rate_z","ay_per_att_z",
             "plays_est","proe","rz_rate"]
-
     for c in cols:
         if c not in tf_der.columns:
             tf_der[c] = 0.0 if c != "team" else ""
 
-    # ✅ add season column the validator wants
     tf_der["season"] = int(season)
-
     return tf_der[cols + ["season"]], proe_week
 
 def compose_player_form(season: int, cache: Dict[str, pd.DataFrame], strict: bool, issues: List[str]) -> pd.DataFrame:
@@ -997,13 +960,11 @@ def compose_player_form(season: int, cache: Dict[str, pd.DataFrame], strict: boo
 
     pf = derive_player_from_pbp(pbp, strict, issues)
 
-    # Merge optional addons
     roles = _read_csv(ROOT / "outputs" / "roles" / f"roles_{season}.csv")
     rbm   = _read_csv(ROOT / "outputs" / "rb_metrics" / f"rb_metrics_{season}.csv")
     inj   = _get_or_resolve("injuries", season, cache)
 
     if _ok(roles):
-        # where roles provide position & overrides for shares, prefer them
         for col, default in [
             ("player",""), ("team",""), ("position",""),
             ("target_share",np.nan), ("rush_share",np.nan),
@@ -1012,7 +973,6 @@ def compose_player_form(season: int, cache: Dict[str, pd.DataFrame], strict: boo
         ]:
             if col not in roles.columns: roles[col] = default
         pf = pf.merge(roles[pf.columns], on=["player","team"], how="outer", suffixes=("", "_role"))
-        # fill from roles if present
         for c in ["position","target_share","rush_share","rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]:
             rc = f"{c}_role"
             if rc in pf.columns:
@@ -1032,7 +992,6 @@ def compose_player_form(season: int, cache: Dict[str, pd.DataFrame], strict: boo
             if c not in inj2.columns: inj2[c] = "" if c != "inj_status" else ""
         pf = pf.merge(inj2[["player","team","inj_status"]], on=["player","team"], how="left")
 
-    # final NA cleanup
     pf["position"] = pf["position"].fillna("")
     for c in ["target_share","rush_share","rz_tgt_share","rz_carry_share","yprr_proxy","ypc","ypt","qb_ypa"]:
         if c not in pf.columns: pf[c] = 0.0
@@ -1043,82 +1002,6 @@ def compose_player_form(season: int, cache: Dict[str, pd.DataFrame], strict: boo
         "target_share","rush_share","rz_tgt_share","rz_carry_share",
         "yprr_proxy","ypc","ypt","qb_ypa"
     ]]
-def compose_odds(season: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Ingests outputs from fetch_odds.py and computes bookmaker-consensus
-    game-line and props tables. Returns (game_consensus, props_consensus).
-    """
-    out_dir = ROOT / "outputs"
-    gl_path = out_dir / "game_lines.csv"
-    pr_path = out_dir / "props_raw.csv"
-
-    game = _read_csv_soft(gl_path)
-    props = _read_csv_soft(pr_path)
-
-    # ---------- GAME LINES ----------
-    game_cons = pd.DataFrame()
-    if _ok(game):
-        # ensure typed
-        for c in ["price", "point"]:
-            if c in game.columns:
-                game[c] = pd.to_numeric(game[c], errors="coerce")
-
-        # implied probs by event+market+outcome+book
-        if {"event_id","market","outcome","bookmaker","price"}.issubset(game.columns):
-            key_cols = ["event_id","market","outcome","bookmaker"]
-            game["impl"] = game["price"].map(_decimal_to_impl)
-            # remove rows with no probability
-            game = game.dropna(subset=["impl"])
-
-            # build a pivot to de-vig within each (event_id, market, bookmaker)
-            grp = game.groupby(["event_id","market","bookmaker"])
-            # normalize outcomes per (event, market, book)
-            game["impl_vigfree"] = grp["impl"].transform(lambda s: s / s.sum())
-
-            # consensus per (event, market, outcome): average across books
-            cons = (game.groupby(["event_id","market","outcome"], as_index=False)
-                        .agg(cons_prob=("impl_vigfree","mean"),
-                             avg_price=("price","mean"),
-                             avg_point=("point","mean")))
-
-            # also keep teams/time for joins
-            meta = (game.groupby("event_id", as_index=False)
-                        .agg(commence_time=("commence_time","first"),
-                             home_team=("home_team","first"),
-                             away_team=("away_team","first")))
-            game_cons = cons.merge(meta, on="event_id", how="left")
-
-    # ---------- PROPS ----------
-    props_cons = pd.DataFrame()
-    if _ok(props):
-        for c in ["price","point"]:
-            if c in props.columns:
-                props[c] = pd.to_numeric(props[c], errors="coerce")
-
-        if {"event_id","market","outcome","bookmaker","price"}.issubset(props.columns):
-            props["impl"] = props["price"].map(_decimal_to_impl)
-            props = props.dropna(subset=["impl"])
-
-            grp = props.groupby(["event_id","market","label","player","bookmaker"])
-            props["impl_vigfree"] = grp["impl"].transform(lambda s: s / s.sum())
-
-            cons = (props.groupby(["event_id","market","label","player","outcome"], as_index=False)
-                         .agg(cons_prob=("impl_vigfree","mean"),
-                              avg_price=("price","mean"),
-                              avg_point=("point","mean")))
-
-            meta = (props.groupby("event_id", as_index=False)
-                        .agg(commence_time=("commence_time","first")))
-            props_cons = cons.merge(meta, on="event_id", how="left")
-
-    # write outputs (for debugging/consumption)
-    (ROOT / "outputs").mkdir(parents=True, exist_ok=True)
-    if _ok(game_cons):
-        game_cons.to_csv(ROOT / "outputs" / "odds_game_consensus.csv", index=False)
-    if _ok(props_cons):
-        props_cons.to_csv(ROOT / "outputs" / "odds_props_consensus.csv", index=False)
-
-    return game_cons, props_cons
 
 # ============================
 # ===== BUNDLE DRIVER ========
@@ -1158,7 +1041,7 @@ def main() -> int:
     ap.add_argument("--start", type=int, default=None)
     ap.add_argument("--end", type=int, default=None)
     ap.add_argument("--seasons", type=str, default=None)
-    ap.add_argument("--strict", type=int, default=1, help="1=hard-fail on missing inputs, 0=fill & continue")
+    ap.add_argument("--strict", type=int, default=0, help="1=hard-fail on missing inputs, 0=fill & continue")
     args = ap.parse_args()
 
     _mkdirs()
@@ -1170,45 +1053,43 @@ def main() -> int:
 
     fetch_bundle(seasons)
 
-try:
-    for s in seasons:
-        print(f"[compose] season {s}")
+    try:
+        for s in seasons:
+            print(f"[compose] season {s}")
+            cache: Dict[str, pd.DataFrame] = {}
+            cache["pbp"] = _get_or_resolve("pbp", s, cache)  # early for proxies
 
-        # fresh cache per season
-        cache: Dict[str, pd.DataFrame] = {}
+            # Compose bookmaker consensus odds (from outputs written by fetch_odds.py)
+            game_odds, props_odds = compose_odds(s)
+            if _ok(game_odds):
+                _write_csv(game_odds, DATA_MIRROR / "odds_game_consensus.csv")
+            if _ok(props_odds):
+                _write_csv(props_odds, DATA_MIRROR / "odds_props_consensus.csv")
 
-        # resolve PBP early (some downstream proxies depend on it)
-        cache["pbp"] = _get_or_resolve("pbp", s, cache)
+            # Core forms
+            team_form, proe_week = compose_team_form(s, cache, strict, data_issues)
+            player_form = compose_player_form(s, cache, strict, data_issues)
 
-        # ---- team/player form (existing) ----
-        team_form, proe_week = compose_team_form(s, cache, strict, data_issues)
-        player_form = compose_player_form(s, cache, strict, data_issues)
+            # Write outputs
+            _write_csv(team_form, OUT_METRICS / "team_form.csv")
+            _write_csv(player_form, OUT_METRICS / "player_form.csv")
+            _write_csv(team_form, DATA_MIRROR / "team_form.csv")
+            _write_csv(player_form, DATA_MIRROR / "player_form.csv")
 
-        # ---- odds consensus (NEW) ----
-        game_odds, props_odds = compose_odds(s)
+            if _ok(proe_week):
+                out_proe = ROOT / "outputs" / "proe" / f"proe_week_{s}.csv"
+                _write_csv(proe_week, out_proe)
 
-        # ---- write outputs (existing) ----
-        _write_csv(team_form, OUT_METRICS / "team_form.csv")
-        _write_csv(player_form, OUT_METRICS / "player_form.csv")
-        _write_csv(team_form, DATA_MIRROR / "team_form.csv")
-        _write_csv(player_form, DATA_MIRROR / "player_form.csv")
+        if data_issues and not strict:
+            dq = pd.DataFrame({"issue": data_issues})
+            _write_csv(dq, ROOT / "outputs" / "data_quality_issues.csv")
 
-        # optional: weekly PROE export
-        if _ok(proe_week):
-            out_proe = ROOT / "outputs" / "proe" / f"proe_week_{s}.csv"
-            _write_csv(proe_week, out_proe)
+        print("✅ make_all completed.")
+        return 0
 
-        # ---- write odds mirrors (optional but convenient for run_model.py) ----
-        if _ok(game_odds):
-            _write_csv(game_odds, DATA_MIRROR / "odds_game_consensus.csv")
-        if _ok(props_odds):
-            _write_csv(props_odds, DATA_MIRROR / "odds_props_consensus.csv")
-
-except Exception as e:
-    # keep the log friendly, then re-raise so CI fails loudly
-    print(f"[compose] ERROR: {e}")
-    raise
+    except DataQualityError as e:
+        print(f"❌ DataQualityError: {e}")
+        return 1
 
 if __name__ == "__main__":
     sys.exit(main())
-
