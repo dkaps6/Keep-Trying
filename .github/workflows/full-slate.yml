@@ -1,268 +1,80 @@
-name: Full Slate (NFL 2025 • production)
+name: Full Slate (orchestrated via run_model)
 
 on:
   workflow_dispatch:
     inputs:
+      date:
+        description: "Props date (YYYY-MM-DD). Blank = upcoming"
+        required: false
+        default: ""
       season:
         description: "Season (e.g., 2025)"
         required: true
         default: "2025"
-
-      strict:
-        description: "Strict mode (0 tolerant, 1 strict)"
+      books:
+        description: "Comma-separated bookmakers"
         required: false
-        default: "0"
-
-      run_addons:
-        description: "Run addon derivations (PROE, box counts, roles, RB metrics, ESPN injuries)"
-        required: false
-        default: "true"
-
-      props_date:
-        description: "Specific date to pull props for (YYYY-MM-DD). Leave blank for latest."
+        default: "draftkings,fanduel,betmgm,caesars"
+      markets:
+        description: "Override markets (comma-separated)"
         required: false
         default: ""
 
-concurrency:
-  group: full-slate-${{ github.ref_name }}
-  cancel-in-progress: false
-
-permissions:
-  contents: read
-
-env:
-  SEASON: ${{ github.event.inputs.season }}
-  STRICT: ${{ github.event.inputs.strict }}
-  RUN_ADDONS: ${{ github.event.inputs.run_addons }}
-
-  # Provider secrets (filled from GitHub Secrets if present)
-  MSF_API_KEY: ${{ secrets.MSF_API_KEY }}
-  MSF_API_USERNAME: ${{ secrets.MSF_API_USERNAME }}
-  MSF_API_PASSWORD: ${{ secrets.MSF_API_PASSWORD }}
-  APISPORTS_API_KEY: ${{ secrets.APISPORTS_API_KEY }}
-  NFL_GSIS_USERNAME: ${{ secrets.NFL_GSIS_USERNAME }}
-  NFL_GSIS_PASSWORD: ${{ secrets.NFL_GSIS_PASSWORD }}
-  ESPN_COOKIE: ${{ secrets.ESPN_COOKIE }}
-  ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
 jobs:
-  build:
+  run:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    timeout-minutes: 75
+    env:
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      NFLGSIS_USERNAME: ${{ secrets.NFLGSIS_USERNAME }}
+      NFLGSIS_PASSWORD: ${{ secrets.NFLGSIS_PASSWORD }}
+      MYSPORTSFEEDS_API_KEY: ${{ secrets.MYSPORTSFEEDS_API_KEY }}
+      APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
+      ESPN_COOKIE: ${{ secrets.ESPN_COOKIE }}
 
-      - name: Set up Python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
-        shell: bash
+      - name: Install deps
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip wheel
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Soft deps for our fallbacks
-          pip install pandas numpy requests pyarrow
-          # Try nflverse client libs; fall back if one missing
-          pip install "nflreadpy>=0.3" || true
-          pip install "nfl_data_py>=0.3.1" || true
+          pip install -r requirements.txt || true
+          pip install pandas numpy scipy requests polars nfl_data_py pyarrow fastparquet
 
-      - name: Echo configured season/strict
+      - name: Ensure folders
         run: |
-          echo "Season=${SEASON}"
-          echo "Strict=${STRICT}"
-          echo "Addons=${RUN_ADDONS}"
+          mkdir -p data outputs outputs/metrics external/nflverse_bundle/outputs
 
-      # ==========================
-      # FETCH LAYER (with fallbacks)
-      # ==========================
-      - name: Fetch data (nflverse + provider fallbacks)
-        shell: bash
+      - name: Secrets smoke test
         run: |
-          set -euo pipefail
-          if [ -f external/nflverse_bundle/fetch_all.py ]; then
-            python external/nflverse_bundle/fetch_all.py --season "${SEASON}"
-          else
-            echo "::warning::external/nflverse_bundle/fetch_all.py missing. Skipping fetch."
-          fi
-
-      # ==========================
-      # OPTIONAL ADDONS
-      # ==========================
-      - name: Run addons (PROE, box counts, roles, RB metrics, ESPN injuries)
-        if: env.RUN_ADDONS == 'true'
-        shell: bash
-        working-directory: external/nflverse_bundle
-        run: |
-          set -euo pipefail
-          for add in             addons/derive_proe.py             addons/aggregate_box_counts.py             addons/derive_roles.py             addons/derive_rb_metrics.py             addons/fetch_injuries_espn.py           ; do
-            if [ -f "${add}" ]; then
-              echo "[addon] ${add} --season ${SEASON}"
-              python "${add}" --season "${SEASON}" || echo "::warning::addon ${add} failed"
-            else
-              echo "::notice::${add} not present; skipping"
-            fi
-          done
-
-# ------------------------------
-# PROPS INGEST (must run before metrics/model)
-# ------------------------------
-      - name: Fetch props (Odds API)
-        shell: bash
-        working-directory: scripts
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          SPORT: "americanfootball_nfl"
-          SEASON: ${{ github.event.inputs.season }}
-          PROPS_DATE: ${{ github.event.inputs.props_date }}
-        run: |
-          set -euo pipefail
-          echo "::group::Fetching player props from Odds API"
-          if [ -n "$PROPS_DATE" ]; then
-            echo "Pulling props for specific date: $PROPS_DATE"
-            python fetch_props_oddsapi.py \
-              --sport "$SPORT" \
-              --season "$SEASON" \
-              --date "$PROPS_DATE" \
-              --out ../outputs/props_raw.csv || true
-          else
-            echo "Pulling latest available props"
-            python fetch_props_oddsapi.py \
-              --sport "$SPORT" \
-              --season "$SEASON" \
-              --out ../outputs/props_raw.csv || true
-          fi
-          echo "::endgroup::"
-
-# If the above failed to create a usable file, drop a header-only placeholder
-      - name: Ensure props_raw.csv exists (header placeholder if needed)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p outputs
-          if [ ! -s outputs/props_raw.csv ]; then
-            echo "book,market,player,team,prop,price,side,ou,open_time,update_time" > outputs/props_raw.csv
-            echo "WARN: outputs/props_raw.csv was missing; wrote header-only placeholder."
-          fi
-
-      # ==========================
-      # METRICS COMPOSITION
-      # ==========================
-      - name: Compose metrics (team_form / player_form)
-        shell: bash
-        working-directory: external/nflverse_bundle
-        env:
-          STRICT: ${{ env.STRICT }}
-        run: |
-          set -euo pipefail
-          if [ -f make_all.py ]; then
-            python make_all.py --season "${SEASON}" --strict "${STRICT}"
-          else
-            echo "::error::make_all.py not found."
-            exit 2
-          fi
-
-      # ==========================
-      # MIRROR & SANITY
-      # ==========================
-      - name: Mirror files to canonical locations
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data outputs outputs/metrics
-          # mirror core bundle outputs
-          cp -f external/nflverse_bundle/outputs/pbp/pbp_${SEASON}_${SEASON}.csv data/pbp.csv || true
-          cp -f external/nflverse_bundle/outputs/injuries/injuries_${SEASON}.csv data/injuries.csv || true
-          cp -f external/nflverse_bundle/outputs/schedules/schedules_${SEASON}.csv data/schedules.csv || true
-          cp -f external/nflverse_bundle/outputs/rosters/rosters_${SEASON}.csv data/rosters.csv || true
-          cp -f external/nflverse_bundle/outputs/depth_charts/depth_charts_${SEASON}.csv data/depth_charts.csv || true
-          cp -f external/nflverse_bundle/outputs/snap_counts/snap_counts_${SEASON}.csv data/snap_counts.csv || true
-          cp -f external/nflverse_bundle/outputs/team_stats/team_stats_week_${SEASON}.csv data/team_stats_week.csv || true
-          cp -f external/nflverse_bundle/outputs/player_stats/player_stats_week_${SEASON}.csv data/player_stats_week.csv || true
-          # metrics
-          cp -f outputs/metrics/team_form.csv data/team_form.csv || true
-          cp -f outputs/metrics/player_form.csv data/player_form.csv || true
-          # placeholders expected downstream
-          [ -f data/roles.csv ] || echo "" > data/roles.csv
-          [ -f data/coverage.csv ] || echo "" > data/coverage.csv
-          [ -f data/cb_assignments.csv ] || echo "" > data/cb_assignments.csv
-          [ -f data/weather.csv ] || echo "" > data/weather.csv
-          [ -f outputs/game_lines.csv ] || echo "" > outputs/game_lines.csv
-          [ -f outputs/props_raw.csv ] || echo "" > outputs/props_raw.csv
-
-      - name: Sanity check (quick headers)
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, pandas as pd
-          targets = [
-              "data/pbp.csv","data/injuries.csv","data/schedules.csv",
-              "outputs/metrics/team_form.csv","outputs/metrics/player_form.csv",
-              "outputs/game_lines.csv","outputs/props_raw.csv",
-          ]
-          for t in targets:
-              if not os.path.exists(t) or os.stat(t).st_size == 0:
-                  print(f"[WARN] {t} missing/empty")
-              else:
-                  try:
-                      df = pd.read_csv(t, nrows=3)
-                      print(f"[OK] {t} cols={list(df.columns)}")
-                  except Exception as e:
-                      print(f"[READ ERR] {t}: {e}")
+          python - << 'PY'
+          import os, sys
+          need = ["ODDS_API_KEY"]
+          miss = [k for k in need if not os.getenv(k)]
+          if miss:
+              print("Missing secrets:", ", ".join(miss)); sys.exit(1)
+          print("Secrets OK (values masked).")
           PY
 
-      # ==========================
-      # VALIDATION / MODEL (hooks)
-      # ==========================
-      - name: Validate inputs (if present)
-        shell: bash
+      - name: Run model
         run: |
-          if [ -f scripts/validate_inputs.py ]; then
-            python scripts/validate_inputs.py
-          else
-            echo "::notice::scripts/validate_inputs.py not present; skipping"
-          fi
-          
-      - name: Build metrics (team_form, player_form)
-        run: python scripts/make_metrics.py --season "${{ inputs.season }}"
-
-      - name: Price props & run model (if your script exists)
-        shell: bash
-        run: |
-          if [ -f pricing/pricing.py ]; then
-            python pricing/pricing.py --season "${SEASON}" --strict "${STRICT}" || echo "::warning::pricing failed"
-          else
-            echo "::notice::pricing/pricing.py not present; skipping"
-          fi
-
-      # ==========================
-      # ARTIFACTS
-      # ==========================
-      - name: Bundle artifacts
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p _artifacts
-          (tar -czf _artifacts/outputs.tgz outputs || true)
-          (tar -czf _artifacts/data.tgz data || true)
-          (tar -czf _artifacts/external-outputs.tgz external/nflverse_bundle/outputs || true)
+          python run_model.py \
+            --date "${{ inputs.date }}" \
+            --season "${{ inputs.season }}" \
+            --books "${{ inputs.books }}" \
+            --markets "${{ inputs.markets }}"
 
       - name: Upload artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: data-pack-${{ github.run_id }}
-          path: _artifacts
+          name: slate-${{ github.run_id }}
+          path: |
+            outputs/**
+            data/**
+            external/nflverse_bundle/outputs/**
           if-no-files-found: warn
