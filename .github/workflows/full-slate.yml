@@ -7,14 +7,21 @@ on:
         description: "Season (e.g., 2025)"
         required: true
         default: "2025"
+
       strict:
         description: "Strict mode (0 tolerant, 1 strict)"
         required: false
         default: "0"
+
       run_addons:
         description: "Run addon derivations (PROE, box counts, roles, RB metrics, ESPN injuries)"
         required: false
         default: "true"
+
+      props_date:
+        description: "Specific date to pull props for (YYYY-MM-DD). Leave blank for latest."
+        required: false
+        default: ""
 
 concurrency:
   group: full-slate-${{ github.ref_name }}
