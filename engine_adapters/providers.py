@@ -1,4 +1,3 @@
-# engine_adapters/providers.py — nflverse-first + robust imports/collection
 from __future__ import annotations
 from typing import Dict, List, TypedDict, Optional
 from pathlib import Path
@@ -82,10 +81,8 @@ def _try_module(source: str, module_names: List[str], call_hints: List[str],
         except Exception as e:
             res["notes"].append(f"main failed: {e}")
 
-    # Collect usable outputs from either external bundle or data/
     wrote, rows = {}, {}
 
-    # PBP
     pbp_src = _first_exists(
         OUT_EXT / "pbp" / f"pbp_{season}.parquet",
         OUT_EXT / "pbp" / f"pbp_{season}.csv",
@@ -97,7 +94,6 @@ def _try_module(source: str, module_names: List[str], call_hints: List[str],
         r = _mirror(pbp_src, target)
         wrote["pbp"] = str(target); rows["pbp"] = r
 
-    # Weekly player stats
     wk_src = _first_exists(
         OUT_EXT / "player_stats" / f"player_stats_week_{season}.csv",
         DATA / "player_stats_week.csv",
@@ -106,7 +102,6 @@ def _try_module(source: str, module_names: List[str], call_hints: List[str],
         r = _mirror(wk_src, DATA / "player_stats_week.csv")
         wrote["player_stats_week"] = str(DATA / "player_stats_week.csv"); rows["player_stats_week"] = r
 
-    # Rosters
     rost_src = _first_exists(
         OUT_EXT / "rosters" / f"rosters_{season}.csv",
         DATA / "rosters.csv",
@@ -115,7 +110,6 @@ def _try_module(source: str, module_names: List[str], call_hints: List[str],
         r = _mirror(rost_src, DATA / "rosters.csv")
         wrote["rosters"] = str(DATA / "rosters.csv"); rows["rosters"] = r
 
-    # Injuries (optional)
     inj_src = _first_exists(DATA / "injuries.csv", OUT_EXT / "injuries.csv")
     if inj_src:
         r = _mirror(inj_src, DATA / "injuries.csv")
@@ -126,9 +120,7 @@ def _try_module(source: str, module_names: List[str], call_hints: List[str],
     res["ok"] = bool(rows.get("player_stats_week", 0) or rows.get("pbp", 0))
     return res
 
-# ---- provider runners ----
 def run_nflverse(season: int, date: Optional[str]) -> ProviderResult:
-    # Try your external bundle first, then a pure-python entry (below) if present
     return _try_module(
         "nflverse",
         ["external.nflverse_bundle.fetch_all", "scripts.providers.nflverse_entry"],
@@ -152,18 +144,18 @@ def run_nflgsis(season: int, date: Optional[str]) -> ProviderResult:
         season, date
     )
 
-def run_msf(season: int, date: Optional[str]) -> ProviderResult:
-    return _try_module(
-        "MySportsFeeds",
-        ["msf", "scripts.providers.msf"],
-        ["fetch", "run", "download", "build", "main"],
-        season, date
-    )
-
 def run_apisports(season: int, date: Optional[str]) -> ProviderResult:
     return _try_module(
         "API-Sports",
         ["apisports", "scripts.providers.apisports"],
+        ["fetch", "run", "download", "build", "main"],
+        season, date
+    )
+
+def run_msf(season: int, date: Optional[str]) -> ProviderResult:
+    return _try_module(
+        "MySportsFeeds",
+        ["msf", "scripts.providers.msf"],
         ["fetch", "run", "download", "build", "main"],
         season, date
     )
