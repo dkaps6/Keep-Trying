@@ -1,4 +1,3 @@
-# scripts/fetch_props_oddsapi.py — always writes, even without a key
 import os, sys, argparse, pathlib, pandas as pd, requests
 
 def main():
