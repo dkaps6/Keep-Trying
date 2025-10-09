@@ -1,15 +1,15 @@
-# engine_adapters/providers.py
+# --- TOP OF FILE: engine_adapters/providers.py ---
 from __future__ import annotations
 from typing import Dict, List, TypedDict, Optional
 from pathlib import Path
-import importlib, inspect
+import importlib, inspect, sys
 import pandas as pd
 
 REPO = Path(__file__).resolve().parents[1]
-DATA = REPO / "data"
-OUT_EXT = REPO / "external" / "nflverse_bundle" / "outputs"
-DATA.mkdir(parents=True, exist_ok=True)
-OUT_EXT.mkdir(parents=True, exist_ok=True)
+# Ensure we can import "scripts.*" modules
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+# --------------------------------------------------
 
 class ProviderResult(TypedDict, total=False):
     ok: bool
