@@ -1,7 +1,8 @@
-# engine.py
+# engine.py (updated to include provider fallback)
 from __future__ import annotations
 import subprocess, shlex
 from pathlib import Path
+from engine_adapters.providers import run_espn, run_nflgsis, run_msf, run_apisports
 
 REPO = Path(__file__).resolve().parent
 
@@ -10,6 +11,16 @@ def _run(cmd: str) -> None:
     proc = subprocess.run(shlex.split(cmd), cwd=str(REPO))
     if proc.returncode != 0:
         raise SystemExit(proc.returncode)
+
+def _provider_chain(season: int, date: str|None):
+    print("[engine] Provider fallback: ESPN -> NFLGSIS -> MSF -> API-Sports")
+    for runner in (run_espn, run_nflgsis, run_msf, run_apisports):
+        res = runner(season, date)
+        print(f"[engine] {res['source']} wrote={res.get('wrote',{})} rows={res.get('rows',{})} notes={'; '.join(res.get('notes', []))}")
+        if res.get("ok"):
+            print(f"[engine] ✅ using {res['source']} outputs")
+            return
+    print("[engine] ⚠️ No provider produced usable data — metrics may be empty")
 
 def run_pipeline(
     date: str = "",
@@ -37,6 +48,15 @@ def run_pipeline(
             odds_props_df.to_csv(p, index=False); print(f"[engine] wrote {p} ({len(odds_props_df)})")
     except Exception as e:
         print(f"[engine] consensus write skipped: {e}")
+
+    # 0) Provider fallback chain first (to populate data/ files)
+    if season:
+        try:
+            _provider_chain(int(season), date or None)
+        except Exception as e:
+            print(f"[engine] provider chain error: {e}")
+    else:
+        print("[engine] WARN: season missing; skipping provider chain")
 
     # 1) Metrics
     if season:
