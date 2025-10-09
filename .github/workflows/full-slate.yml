@@ -120,18 +120,29 @@ jobs:
 # ------------------------------
       - name: Fetch props (Odds API)
         shell: bash
-        working-directory: scripts/providers
+        working-directory: scripts
         env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}   # keep your existing secret name
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SPORT: "americanfootball_nfl"
-          SEASON: "2025"
+          SEASON: ${{ github.event.inputs.season }}
+          PROPS_DATE: ${{ github.event.inputs.props_date }}
         run: |
           set -euo pipefail
-          echo "::group::Fetch props from Odds API"
-          python fetch_props_odds_api.py \
-            --sport "$SPORT" \
-            --season "$SEASON" \
-            --out ../../outputs/props_raw.csv || true
+          echo "::group::Fetching player props from Odds API"
+          if [ -n "$PROPS_DATE" ]; then
+            echo "Pulling props for specific date: $PROPS_DATE"
+            python fetch_props_oddsapi.py \
+              --sport "$SPORT" \
+              --season "$SEASON" \
+              --date "$PROPS_DATE" \
+              --out ../outputs/props_raw.csv || true
+          else
+            echo "Pulling latest available props"
+            python fetch_props_oddsapi.py \
+              --sport "$SPORT" \
+              --season "$SEASON" \
+              --out ../outputs/props_raw.csv || true
+          fi
           echo "::endgroup::"
 
 # If the above failed to create a usable file, drop a header-only placeholder
