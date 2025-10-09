@@ -1170,47 +1170,44 @@ def main() -> int:
 
     fetch_bundle(seasons)
 
-    try:
+try:
     for s in seasons:
         print(f"[compose] season {s}")
+
+        # fresh cache per season
         cache: Dict[str, pd.DataFrame] = {}
-        cache["pbp"] = _get_or_resolve("pbp", s, cache)  # early for proxies
 
-        # 🆕 Fetch and compose odds consensus FIRST (before team/player forms)
-        game_odds, props_odds = compose_odds(s)
+        # resolve PBP early (some downstream proxies depend on it)
+        cache["pbp"] = _get_or_resolve("pbp", s, cache)
 
-        # 🆕 Write odds results so downstream steps can read them
-        if _ok(game_odds):
-            _write_csv(game_odds, DATA_MIRROR / "odds_game_consensus.csv")
-        if _ok(props_odds):
-            _write_csv(props_odds, DATA_MIRROR / "odds_props_consensus.csv")
-
-        # Existing form builders
+        # ---- team/player form (existing) ----
         team_form, proe_week = compose_team_form(s, cache, strict, data_issues)
         player_form = compose_player_form(s, cache, strict, data_issues)
 
-        # Write outputs
+        # ---- odds consensus (NEW) ----
+        game_odds, props_odds = compose_odds(s)
+
+        # ---- write outputs (existing) ----
         _write_csv(team_form, OUT_METRICS / "team_form.csv")
         _write_csv(player_form, OUT_METRICS / "player_form.csv")
         _write_csv(team_form, DATA_MIRROR / "team_form.csv")
         _write_csv(player_form, DATA_MIRROR / "player_form.csv")
 
-        # Optional export of weekly proe (debug/inspection)
+        # optional: weekly PROE export
         if _ok(proe_week):
             out_proe = ROOT / "outputs" / "proe" / f"proe_week_{s}.csv"
             _write_csv(proe_week, out_proe)
 
-        # write data quality issues when non-strict
-        if data_issues and not strict:
-            dq = pd.DataFrame({"issue": data_issues})
-            _write_csv(dq, ROOT / "outputs" / "data_quality_issues.csv")
+        # ---- write odds mirrors (optional but convenient for run_model.py) ----
+        if _ok(game_odds):
+            _write_csv(game_odds, DATA_MIRROR / "odds_game_consensus.csv")
+        if _ok(props_odds):
+            _write_csv(props_odds, DATA_MIRROR / "odds_props_consensus.csv")
 
-        print("✅ make_all completed.")
-        return 0
-
-    except DataQualityError as e:
-        print(f"❌ DataQualityError: {e}")
-        return 1
+except Exception as e:
+    # keep the log friendly, then re-raise so CI fails loudly
+    print(f"[compose] ERROR: {e}")
+    raise
 
 if __name__ == "__main__":
     sys.exit(main())
