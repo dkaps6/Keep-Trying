@@ -5,20 +5,17 @@ from engine import run_pipeline
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--season", required=True, help="Season year, e.g., 2025")
-    ap.add_argument("--date", default="", help="ISO date (YYYY-MM-DD) for slate and odds window")
-    ap.add_argument("--books", default="draftkings,fanduel,betmgm,caesars",
-                    help="Comma-separated sportsbook keys")
-    ap.add_argument("--markets", default="",
-                    help="Comma-separated markets override (else pipeline default)")
+    ap.add_argument("--season", required=True, help="e.g., 2025")
+    ap.add_argument("--date", default="", help="ISO date YYYY-MM-DD (optional)")
+    ap.add_argument("--books", default="draftkings,fanduel,betmgm,caesars")
+    ap.add_argument("--markets", default="", help="optional override, comma-separated")
     args = ap.parse_args()
 
-    # Hand through to the orchestrator
     run_pipeline(
-        season=args.season,
-        date=args.date,
-        books=args.books.split(",") if args.books else None,
-        markets=args.markets.split(",") if args.markets else None,
+        season=str(args.season),
+        date=str(args.date),
+        books=[b.strip() for b in args.books.split(",") if b.strip()],
+        markets=[m.strip() for m in args.markets.split(",") if m.strip()] or None,
     )
 
 if __name__ == "__main__":
