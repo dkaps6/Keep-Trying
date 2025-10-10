@@ -1,155 +1,54 @@
 from __future__ import annotations
-from typing import Dict, List, TypedDict, Optional
+import os, json, requests, pandas as pd
 from pathlib import Path
-import importlib, inspect, sys
-import pandas as pd
 
-REPO = Path(__file__).resolve().parents[1]
-if str(REPO) not in sys.path:
-    sys.path.insert(0, str(REPO))
+OUT = Path("external"); OUT.mkdir(exist_ok=True)
+NFLV_OUT = OUT/"nflverse_bundle"/"outputs"; NFLV_OUT.mkdir(parents=True, exist_ok=True)
 
-DATA = REPO / "data"
-OUT_EXT = REPO / "external" / "nflverse_bundle" / "outputs"
-DATA.mkdir(parents=True, exist_ok=True)
+def _ok(df: pd.DataFrame) -> bool:
+    return isinstance(df, pd.DataFrame) and not df.empty
 
-class ProviderResult(TypedDict, total=False):
-    ok: bool
-    source: str
-    wrote: Dict[str, str]
-    rows: Dict[str, int]
-    notes: List[str]
-
-def _rows(path: Path) -> int:
+def run_nflverse(season: int, date: str|None):
+    # nfl_data_py is our primary
     try:
-        if path.suffix == ".parquet":
-            return len(pd.read_parquet(path))
-        return len(pd.read_csv(path))
-    except Exception:
-        return 0
+        import nfl_data_py as nfl
+        pbp = nfl.import_pbp_data([season])
+        sched = nfl.import_schedules([season])
+        # Write mirrors for builders if you want to inspect
+        (NFLV_OUT/"pbp.parquet").parent.mkdir(parents=True, exist_ok=True)
+        pbp.to_parquet(NFLV_OUT/"pbp.parquet", index=False)
+        sched.to_csv(NFLV_OUT/"schedules.csv", index=False)
+        return {"ok": True, "source":"nflverse", "notes":["pbp+sched from nfl_data_py"], "rows":{"pbp":len(pbp),"sched":len(sched)}}
+    except Exception as e:
+        return {"ok": False, "source":"nflverse", "notes":[f"nfl_data_py failed: {e}"]}
 
-def _mirror(src: Path, dest: Path) -> int:
-    if not src.exists():
-        return 0
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(src.read_bytes())
-    return _rows(dest)
+def run_espn(season: int, date: str|None):
+    # use public site.api endpoints; cookie optional but improves reliability
+    try:
+        cookie = os.getenv("ESPN_COOKIE","")
+        headers = {"Cookie": cookie} if cookie else {}
+        # scoreboards for season (coarse); this is enough for builders to align event_ids if needed
+        url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?year={season}"
+        r = requests.get(url, headers=headers, timeout=20); r.raise_for_status()
+        data = r.json()
+        pd.DataFrame(data.get("events",[])).to_json(NFLV_OUT/"espn_scoreboard.json", orient="records")
+        return {"ok": True, "source":"ESPN", "rows":{"events":len(data.get('events',[]))}, "notes":["scoreboard pulled"]}
+    except Exception as e:
+        return {"ok": False, "source":"ESPN", "notes":[str(e)]}
 
-def _first_exists(*cands: Path) -> Optional[Path]:
-    for p in cands:
-        if p.exists():
-            return p
-    return None
+def run_nflgsis(season: int, date: str|None):
+    # Placeholder: many GSIS feeds require licensed endpoints. We just prove auth is present.
+    if not (os.getenv("NFLGSIS_USERNAME") and os.getenv("NFLGSIS_PASSWORD")):
+        return {"ok": False, "source":"NFLGSIS", "notes":["missing creds"]}
+    return {"ok": False, "source":"NFLGSIS", "notes":["skipped (no public endpoint here)"]}
 
-def _result(source: str) -> ProviderResult:
-    return {"ok": False, "source": source, "wrote": {}, "rows": {}, "notes": []}
+def run_msf(season: int, date: str|None):
+    if not os.getenv("MSF_KEY"):
+        return {"ok": False, "source":"MySportsFeeds", "notes":["missing key"]}
+    # you can add real pulls here; we only mark as present
+    return {"ok": False, "source":"MySportsFeeds", "notes":["stub (wire your paid endpoint here)"]}
 
-def _import_first(module_names: List[str], notes: List[str]):
-    for m in module_names:
-        try:
-            return importlib.import_module(m)
-        except Exception as e:
-            notes.append(f"import failed for {m}: {e}")
-    return None
-
-def _try_module(source: str, module_names: List[str], call_hints: List[str],
-                season: int, date: Optional[str]) -> ProviderResult:
-    res = _result(source)
-    mod = _import_first(module_names, res["notes"])
-    if mod is None:
-        return res
-
-    called = False
-    for name in call_hints:
-        fn = getattr(mod, name, None)
-        if fn and inspect.isfunction(fn):
-            try:
-                sig = inspect.signature(fn)
-                kwargs = {}
-                if "season" in sig.parameters: kwargs["season"] = season
-                if "date" in sig.parameters: kwargs["date"] = date
-                fn(**kwargs)
-                called = True
-                res["notes"].append(f"called {mod.__name__}.{name}{kwargs}")
-                break
-            except Exception as e:
-                res["notes"].append(f"{name} failed: {e}")
-    if not called and hasattr(mod, "main") and inspect.isfunction(mod.main):
-        try:
-            mod.main()
-            res["notes"].append(f"called {mod.__name__}.main()")
-            called = True
-        except Exception as e:
-            res["notes"].append(f"main failed: {e}")
-
-    wrote, rows = {}, {}
-    pbp_src = _first_exists(
-        OUT_EXT / "pbp" / f"pbp_{season}.parquet",
-        OUT_EXT / "pbp" / f"pbp_{season}.csv",
-        DATA / f"pbp_{season}.parquet",
-        DATA / f"pbp_{season}.csv",
-    )
-    if pbp_src:
-        target = DATA / pbp_src.name
-        r = _mirror(pbp_src, target)
-        wrote["pbp"] = str(target); rows["pbp"] = r
-
-    wk_src = _first_exists(
-        OUT_EXT / "player_stats" / f"player_stats_week_{season}.csv",
-        DATA / "player_stats_week.csv",
-    )
-    if wk_src:
-        r = _mirror(wk_src, DATA / "player_stats_week.csv")
-        wrote["player_stats_week"] = str(DATA / "player_stats_week.csv"); rows["player_stats_week"] = r
-
-    rost_src = _first_exists(
-        OUT_EXT / "rosters" / f"rosters_{season}.csv",
-        DATA / "rosters.csv",
-    )
-    if rost_src:
-        r = _mirror(rost_src, DATA / "rosters.csv")
-        wrote["rosters"] = str(DATA / "rosters.csv"); rows["rosters"] = r
-
-    res["wrote"] = wrote
-    res["rows"] = rows
-    res["ok"] = bool(rows.get("player_stats_week", 0) or rows.get("pbp", 0))
-    return res
-
-def run_nflverse(season: int, date: Optional[str]) -> ProviderResult:
-    return _try_module(
-        "nflverse",
-        ["external.nflverse_bundle.fetch_all", "scripts.providers.nflverse_entry"],
-        ["fetch_all", "fetch", "run", "build", "main"],
-        season, date
-    )
-
-def run_espn(season: int, date: Optional[str]) -> ProviderResult:
-    return _try_module(
-        "ESPN",
-        ["scripts.providers.espn_entry", "scripts.providers.espn_pbp", "espn_pbp"],
-        ["fetch", "run", "download", "build"],
-        season, date
-    )
-
-def run_nflgsis(season: int, date: Optional[str]) -> ProviderResult:
-    return _try_module(
-        "NFLGSIS",
-        ["scripts.providers.nflgsis", "nflgsis"],
-        ["fetch", "run", "download", "build", "main"],
-        season, date
-    )
-
-def run_apisports(season: int, date: Optional[str]) -> ProviderResult:
-    return _try_module(
-        "API-Sports",
-        ["scripts.providers.apisports", "apisports"],
-        ["fetch", "run", "download", "build", "main"],
-        season, date
-    )
-
-def run_msf(season: int, date: Optional[str]) -> ProviderResult:
-    return _try_module(
-        "MySportsFeeds",
-        ["scripts.providers.msf", "msf"],
-        ["fetch", "run", "download", "build", "main"],
-        season, date
-    )
+def run_apisports(season: int, date: str|None):
+    if not os.getenv("APISPORTS_KEY"):
+        return {"ok": False, "source":"API-Sports", "notes":["missing key"]}
+    return {"ok": False, "source":"API-Sports", "notes":["stub (used only as last fallback)"]}
