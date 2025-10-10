@@ -1,17 +1,15 @@
-# engine.py
 from __future__ import annotations
 import os, sys, shlex, subprocess
 from pathlib import Path
 from datetime import datetime
 
-# if you already have these adapters, they’re used as-is
+# import provider runners (soft-fail to keep pipeline alive)
 try:
     from engine_adapters.providers import run_nflverse, run_espn, run_nflgsis, run_apisports, run_msf
 except Exception:
-    # soft stubs so pipeline still runs if adapters aren’t present
     def _stub(name):
         def _run(season:int, date:str|None):
-            return {"ok": False, "source": name, "rows": {}, "wrote": {}, "notes": [f"{name} adapter missing"]}
+            return {"ok": False, "source": name, "notes": [f"{name} adapter missing"]}
         return _run
     run_nflverse=_stub("nflverse"); run_espn=_stub("espn")
     run_nflgsis=_stub("nflgsis"); run_apisports=_stub("apisports"); run_msf=_stub("msf")
@@ -28,8 +26,8 @@ def _size(p: str) -> str:
     return f"{fp.stat().st_size}B" if fp.exists() else "MISSING"
 
 def _provider_chain(season: int, date: str | None):
-    print("[engine] Provider order: nflverse → ESPN → NFLGSIS → API-Sports → MSF")
-    for runner in (run_nflverse, run_espn, run_nflgsis, run_apisports, run_msf):
+    print("[engine] Provider order: nflverse → ESPN → NFLGSIS → MySportsFeeds → API-Sports")
+    for runner in (run_nflverse, run_espn, run_nflgsis, run_msf, run_apisports):
         try:
             res = runner(season, date)
         except Exception as e:
@@ -41,20 +39,18 @@ def _provider_chain(season: int, date: str | None):
     print("[engine] ⚠ no external provider succeeded; will rely on builders")
 
 def run_pipeline(*, season: str, date: str = "", books=None, markets=None):
-    # make dirs
     for d in ("data", "outputs", "outputs/metrics", "logs"):
         Path(d).mkdir(parents=True, exist_ok=True)
+    print(f"[engine] keys: ODDS_API_KEY={'set' if os.getenv('ODDS_API_KEY') else 'missing'} "
+          f"ESPN_COOKIE={'set' if os.getenv('ESPN_COOKIE') else 'missing'}")
 
-    # show keys presence (masked)
-    print(f"[engine] ODDS_API_KEY={'set' if os.getenv('ODDS_API_KEY') else 'missing'}  ESPN_COOKIE={'set' if os.getenv('ESPN_COOKIE') else 'missing'}")
-
-    # 1) upstream data providers (best-effort)
+    # 1) upstream providers (best-effort)
     try:
         _provider_chain(int(season), date or None)
     except Exception as e:
         print(f"[engine] provider chain error (non-fatal): {e}")
 
-    # 2) build engineered tables
+    # 2) builders
     _run(f"python scripts/make_team_form.py --season {season}")
     print(f"[engine]   data/team_form.csv → {_size('data/team_form.csv')}")
     _run(f"python scripts/make_player_form.py --season {season}")
@@ -62,7 +58,7 @@ def run_pipeline(*, season: str, date: str = "", books=None, markets=None):
     _run(f"python scripts/make_metrics.py --season {season}")
     print(f"[engine]   data/metrics_ready.csv → {_size('data/metrics_ready.csv')}")
 
-    # 3) props (Odds API)
+    # 3) odds props
     b = ",".join(books or ["draftkings","fanduel","betmgm","caesars"])
     m = ",".join(markets or [])
     _run(f"python scripts/fetch_props_oddsapi.py --books {b} {'--markets '+m if m else ''} --date {date} --out outputs/props_raw.csv")
@@ -78,7 +74,6 @@ def run_pipeline(*, season: str, date: str = "", books=None, markets=None):
     print(f"[engine] ✅ complete (run_id={rid})")
     return 0
 
-# optional CLI so you can run `python engine.py --season 2025 --date 2025-10-12`
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
