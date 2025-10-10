@@ -13,7 +13,7 @@ def main():
     if not key:
         print('[oddsapi] key missing; wrote header-only CSV'); return 0
     base='https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds'
-    params={'regions':'us','oddsFormat':'american','markets':'h2h,spreads,totals,player_pass_yds,player_rec_yds,player_rush_yds,player_receptions','apiKey':key}
+    params={'regions':'us','oddsFormat':'american','markets':'h2h,spreads,totals,player_pass_yds,player_rec_yds,player_rush_yds,player_receptions,player_anytime_td','apiKey':key}
     if a.date: params['dateFormat']='iso'; params['commenceTimeFrom']=a.date
     try:
         r=requests.get(base, params=params, timeout=30); r.raise_for_status(); data=r.json()
@@ -33,3 +33,22 @@ def main():
                         rows.append([name,team,opp,g.get('id'),mkey,line,price,None,bk_key,g.get('commence_time'),g.get('sport_key','nfl')])
     pd.DataFrame(rows, columns=cols).to_csv(out, index=False); print(f"[oddsapi] wrote {out} rows={len(rows)}"); return 0
 if __name__=='__main__': main()
+
+
+# also write game-level totals/spreads if present
+    games_rows=[]; games_cols=['event_id','commence_time','sport_key','home_team','away_team','market','point','book']
+    for g in data:
+        for bk in g.get('bookmakers', []):
+            for mk in bk.get('markets', []):
+                if mk.get('key') in ('h2h','spreads','totals'):
+                    point = None
+                    if mk.get('key')=='totals' and mk.get('outcomes'):
+                        # use first as total line
+                        point = mk['outcomes'][0].get('point')
+                    elif mk.get('key')=='spreads' and mk.get('outcomes'):
+                        point = mk['outcomes'][0].get('point')
+                    games_rows.append([g.get('id'), g.get('commence_time'), g.get('sport_key'),
+                                       g.get('home_team'), g.get('away_team'), mk.get('key'), point, bk.get('key')])
+    if games_rows:
+        pd.DataFrame(games_rows, columns=games_cols).to_csv('outputs/odds_game.csv', index=False)
+        print(f"[oddsapi] wrote outputs/odds_game.csv rows={len(games_rows)}")
