@@ -27,45 +27,20 @@ def _nflverse_team(season:int) -> pd.DataFrame:
     df = grp.merge(pace, on="team", how="left").merge(proe, on="team", how="left")
     return df
 
-def _fallback_csv(name:str) -> pd.DataFrame:
-    p = Path(f"data/{name}.csv")
-    return pd.read_csv(p) if p.exists() and p.stat().st_size>0 else pd.DataFrame()
-
-def _merge_colwise(base:pd.DataFrame, fb:pd.DataFrame, on="team"):
-    if fb.empty: return base
-    cols = [c for c in fb.columns if c!=on]
-    base = base.merge(fb[[on]+cols], on=on, how="left", suffixes=("","_fb"))
-    for c in cols:
-        fbcol = f"{c}_fb"
-        if fbcol in base.columns:
-            base[c] = np.where(base[c].isna(), base[fbcol], base[c])
-            base.drop(columns=[fbcol], inplace=True)
-    return base
-
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument("--season", type=int, required=True)
-    a=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument("--season", type=int, required=True); a=ap.parse_args()
     Path("data").mkdir(exist_ok=True); Path("outputs/metrics").mkdir(parents=True, exist_ok=True)
-
     try:
         df = _nflverse_team(a.season)
         print(f"[team_form] nflverse rows={len(df)}")
-    except Exception as e:
+    except Exception as e:   # <- no bare 'Error'
         print(f"[team_form] nflverse error: {e}")
         df = pd.DataFrame(columns=["team"])
-
     if not df.empty:
         df["team"]=df["team"].map(normalize_team)
-
-    for src in ["team_form_espn","team_form_nflgsis","team_form_msf","team_form_apisports"]:
-        fb = _fallback_csv(src)
-        if not fb.empty: print(f"[team_form] merge fallback {src} rows={len(fb)}")
-        df = _merge_colwise(df, fb)
-
-    for c in ["def_pass_epa","def_rush_epa","def_sack_rate","pace","proe"]:
-        if c in df.columns:
-            df[c+"_z"] = _z(df[c].fillna(df[c].median()))
-
+        for c in ["def_pass_epa","def_rush_epa","def_sack_rate","pace","proe"]:
+            if c in df.columns:
+                df[c+"_z"] = _z(df[c].fillna(df[c].median()))
     df.to_csv("data/team_form.csv", index=False)
     df.to_csv("outputs/metrics/team_form.csv", index=False)
     print(f"[team_form] wrote rows={len(df)} → data/team_form.csv")
