@@ -28,11 +28,9 @@ def _nflverse_player(season:int) -> pd.DataFrame:
     car_team = ru.groupby("team").size().rename("team_carries").reset_index()
 
     rz = pbp[(pbp["yardline_100"]<=20)].copy()
-    rz_rush = rz[rz["rush"]==1].copy()
-    rz_rush["player"] = rz_rush["rusher_player_name"].fillna("")
+    rz_rush = rz[rz["rush"]==1].copy(); rz_rush["player"]=rz_rush["rusher_player_name"].fillna("")
     rz_car = rz_rush[rz_rush["player"]!=""].groupby(["team","player"]).size().rename("rz_carries").reset_index()
-    rz_pass = rz[rz["pass"]==1].copy()
-    rz_pass["player"] = rz_pass["receiver_player_name"].fillna("")
+    rz_pass = rz[rz["pass"]==1].copy(); rz_pass["player"]=rz_pass["receiver_player_name"].fillna("")
     rz_tgt = rz_pass[rz_pass["player"]!=""].groupby(["team","player"]).size().rename("rz_tgts").reset_index()
     rz_car_team = rz_rush.groupby("team").size().rename("team_rz_carries").reset_index()
     rz_tgt_team = rz_pass.groupby("team").size().rename("team_rz_tgts").reset_index()
@@ -56,39 +54,18 @@ def _nflverse_player(season:int) -> pd.DataFrame:
     df = df.merge(qb, on="team", how="left").merge(ypt, on="player", how="left").merge(ypc, on="player", how="left")
     return df
 
-def _fallback_csv(name:str) -> pd.DataFrame:
-    p = Path(f"data/{name}.csv")
-    return pd.read_csv(p) if p.exists() and p.stat().st_size>0 else pd.DataFrame()
-
-def _merge_colwise(base:pd.DataFrame, fb:pd.DataFrame):
-    if fb.empty: return base
-    on=["team","player"]
-    for c in fb.columns:
-        if c in on: continue
-        if c not in base.columns: base[c]=np.nan
-        base[c] = np.where(base[c].isna(), fb[c], base[c]) if c in fb.columns else base[c]
-    return base
-
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--season", type=int, required=True); a=ap.parse_args()
     Path("data").mkdir(exist_ok=True); Path("outputs/metrics").mkdir(parents=True, exist_ok=True)
-
     try:
         df = _nflverse_player(a.season)
         print(f"[player_form] nflverse rows={len(df)}")
-    except Exception as e:
+    except Exception as e:     # <- no bare 'Error'
         print(f"[player_form] nflverse error: {e}")
         df = pd.DataFrame(columns=["team","player"])
-
     if not df.empty:
         df["team"]=df["team"].map(normalize_team)
         df["player"]=df["player"].map(normalize_player)
-
-    for src in ["player_form_espn","player_form_nflgsis","player_form_msf","player_form_apisports"]:
-        fb = _fallback_csv(src)
-        if not fb.empty: print(f"[player_form] merge fallback {src} rows={len(fb)}")
-        df = _merge_colwise(df, fb)
-
     df.to_csv("data/player_form.csv", index=False)
     df.to_csv("outputs/metrics/player_form.csv", index=False)
     print(f"[player_form] wrote rows={len(df)} → data/player_form.csv")
