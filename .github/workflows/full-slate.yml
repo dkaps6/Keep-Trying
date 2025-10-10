@@ -7,10 +7,10 @@ on:
         description: "Season (e.g. 2025)"
         default: "2025"
       date:
-        description: "ISO slate date (YYYY-MM-DD)"
+        description: "ISO slate date (YYYY-MM-DD) or blank"
         default: ""
   schedule:
-    - cron: "0 14 * * 4,5"   # Thu/Fri 14:00 UTC (edit as you like)
+    - cron: "0 14 * * 4,5"   # Thu/Fri 14:00 UTC
 
 jobs:
   slate:
@@ -25,24 +25,37 @@ jobs:
       APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
       MC_TRIALS: "25000"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Prepare dirs
         run: |
           mkdir -p data outputs outputs/metrics logs
+
+      - name: Add repo to PYTHONPATH
+        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
+
       - name: Run pipeline
         run: |
           python -m engine --season "${{ inputs.season || '2025' }}" --date "${{ inputs.date || '' }}"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: outputs
+          name: outputs-and-logs
           path: |
             outputs/**
             logs/**
+            data/team_form.csv
+            data/player_form.csv
+            data/metrics_ready.csv
