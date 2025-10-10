@@ -20,7 +20,7 @@ def _safe_write_csv(df: pd.DataFrame, path: Path):
 def run_nflverse(season: int, date: str|None):
     try:
         import nfl_data_py as nfl
-    except Exception as e:
+    except Exception as e:   # <- no bare 'Error'
         print(f"[provider:nflverse] import failed: {e}")
         _safe_write_csv(pd.DataFrame(), NFLV_OUT/"schedules.csv")
         _safe_write_csv(pd.DataFrame(), NFLV_OUT/"pbp.csv")
@@ -30,15 +30,14 @@ def run_nflverse(season: int, date: str|None):
         pbp = nfl.import_pbp_data([season])
         print(f"[provider:nflverse] fetching schedules for {season} …")
         sched = nfl.import_schedules([season])
-    except Exception as e:
+    except Exception as e:   # <- no bare 'Error'
         print(f"[provider:nflverse] fetch error: {e}")
         _safe_write_csv(pd.DataFrame(), NFLV_OUT/"schedules.csv")
         _safe_write_csv(pd.DataFrame(), NFLV_OUT/"pbp.csv")
         return {"ok": False, "source":"nflverse", "notes":[f"fetch error: {e}"]}
 
-    wrote = {}
-    wrote["pbp.csv"]   = _safe_write_csv(pbp,   NFLV_OUT/"pbp.csv")
-    wrote["sched.csv"] = _safe_write_csv(sched, NFLV_OUT/"schedules.csv")
+    _safe_write_csv(pbp,   NFLV_OUT/"pbp.csv")
+    _safe_write_csv(sched, NFLV_OUT/"schedules.csv")
     ok = _ok(pbp) and _ok(sched)
     return {"ok": ok, "source":"nflverse", "rows":{"pbp":len(pbp),"sched":len(sched)}, "notes":["pbp+sched via nfl_data_py"]}
 
