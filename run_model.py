@@ -6,9 +6,9 @@ from engine import run_pipeline
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", required=True, help="e.g., 2025")
-    ap.add_argument("--date", default="", help="ISO date YYYY-MM-DD (optional)")
+    ap.add_argument("--date", default="", help="ISO date YYYY-MM-DD")
     ap.add_argument("--books", default="draftkings,fanduel,betmgm,caesars")
-    ap.add_argument("--markets", default="", help="optional override, comma-separated")
+    ap.add_argument("--markets", default="", help="optional comma-separated override")
     args = ap.parse_args()
 
     run_pipeline(
