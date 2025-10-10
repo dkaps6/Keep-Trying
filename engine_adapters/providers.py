@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, json, requests, pandas as pd
+import os, requests, pandas as pd
 from pathlib import Path
 
 OUT = Path("external"); OUT.mkdir(exist_ok=True)
@@ -8,47 +8,68 @@ NFLV_OUT = OUT/"nflverse_bundle"/"outputs"; NFLV_OUT.mkdir(parents=True, exist_o
 def _ok(df: pd.DataFrame) -> bool:
     return isinstance(df, pd.DataFrame) and not df.empty
 
+def _safe_write_csv(df: pd.DataFrame, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_csv(path, index=False)
+        return True
+    except Exception as e:
+        print(f"[provider] write failed for {path}: {e}")
+        return False
+
 def run_nflverse(season: int, date: str|None):
-    # nfl_data_py is our primary
     try:
         import nfl_data_py as nfl
-        pbp = nfl.import_pbp_data([season])
-        sched = nfl.import_schedules([season])
-        # Write mirrors for builders if you want to inspect
-        (NFLV_OUT/"pbp.parquet").parent.mkdir(parents=True, exist_ok=True)
-        pbp.to_parquet(NFLV_OUT/"pbp.parquet", index=False)
-        sched.to_csv(NFLV_OUT/"schedules.csv", index=False)
-        return {"ok": True, "source":"nflverse", "notes":["pbp+sched from nfl_data_py"], "rows":{"pbp":len(pbp),"sched":len(sched)}}
     except Exception as e:
-        return {"ok": False, "source":"nflverse", "notes":[f"nfl_data_py failed: {e}"]}
+        print(f"[provider:nflverse] import failed: {e}")
+        _safe_write_csv(pd.DataFrame(), NFLV_OUT/"schedules.csv")
+        _safe_write_csv(pd.DataFrame(), NFLV_OUT/"pbp.csv")
+        return {"ok": False, "source":"nflverse", "notes":[f"nfl_data_py import error: {e}"]}
+    try:
+        print(f"[provider:nflverse] fetching PBP for {season} …")
+        pbp = nfl.import_pbp_data([season])
+        print(f"[provider:nflverse] fetching schedules for {season} …")
+        sched = nfl.import_schedules([season])
+    except Exception as e:
+        print(f"[provider:nflverse] fetch error: {e}")
+        _safe_write_csv(pd.DataFrame(), NFLV_OUT/"schedules.csv")
+        _safe_write_csv(pd.DataFrame(), NFLV_OUT/"pbp.csv")
+        return {"ok": False, "source":"nflverse", "notes":[f"fetch error: {e}"]}
+
+    wrote = {}
+    wrote["pbp.csv"]   = _safe_write_csv(pbp,   NFLV_OUT/"pbp.csv")
+    wrote["sched.csv"] = _safe_write_csv(sched, NFLV_OUT/"schedules.csv")
+    ok = _ok(pbp) and _ok(sched)
+    return {"ok": ok, "source":"nflverse", "rows":{"pbp":len(pbp),"sched":len(sched)}, "notes":["pbp+sched via nfl_data_py"]}
+
+def _espn_cookie():
+    c = os.getenv("ESPN_COOKIE","")
+    return c.strip()
 
 def run_espn(season: int, date: str|None):
-    # use public site.api endpoints; cookie optional but improves reliability
     try:
-        cookie = os.getenv("ESPN_COOKIE","")
-        headers = {"Cookie": cookie} if cookie else {}
-        # scoreboards for season (coarse); this is enough for builders to align event_ids if needed
+        headers = {"Cookie": _espn_cookie()} if _espn_cookie() else {}
         url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?year={season}"
         r = requests.get(url, headers=headers, timeout=20); r.raise_for_status()
         data = r.json()
-        pd.DataFrame(data.get("events",[])).to_json(NFLV_OUT/"espn_scoreboard.json", orient="records")
-        return {"ok": True, "source":"ESPN", "rows":{"events":len(data.get('events',[]))}, "notes":["scoreboard pulled"]}
+        df = pd.json_normalize(data.get("events", []))
+        _safe_write_csv(df, NFLV_OUT/"espn_scoreboard.csv")
+        return {"ok": not df.empty, "source":"ESPN", "rows":{"events":len(df)}, "notes":["scoreboard pulled"]}
     except Exception as e:
+        _safe_write_csv(pd.DataFrame(), NFLV_OUT/"espn_scoreboard.csv")
         return {"ok": False, "source":"ESPN", "notes":[str(e)]}
 
 def run_nflgsis(season: int, date: str|None):
-    # Placeholder: many GSIS feeds require licensed endpoints. We just prove auth is present.
     if not (os.getenv("NFLGSIS_USERNAME") and os.getenv("NFLGSIS_PASSWORD")):
         return {"ok": False, "source":"NFLGSIS", "notes":["missing creds"]}
-    return {"ok": False, "source":"NFLGSIS", "notes":["skipped (no public endpoint here)"]}
+    return {"ok": False, "source":"NFLGSIS", "notes":["no public endpoint wired"]}
 
 def run_msf(season: int, date: str|None):
     if not os.getenv("MSF_KEY"):
         return {"ok": False, "source":"MySportsFeeds", "notes":["missing key"]}
-    # you can add real pulls here; we only mark as present
-    return {"ok": False, "source":"MySportsFeeds", "notes":["stub (wire your paid endpoint here)"]}
+    return {"ok": False, "source":"MySportsFeeds", "notes":["stub (wire paid endpoint)"]}
 
 def run_apisports(season: int, date: str|None):
     if not os.getenv("APISPORTS_KEY"):
         return {"ok": False, "source":"API-Sports", "notes":["missing key"]}
-    return {"ok": False, "source":"API-Sports", "notes":["stub (used only as last fallback)"]}
+    return {"ok": False, "source":"API-Sports", "notes":["stub (last fallback)"]}
