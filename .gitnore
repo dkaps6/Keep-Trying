@@ -1,18 +1,12 @@
-
-# Python
 __pycache__/
 *.pyc
 *.pyo
 
-# Generated artifacts
 data/*
 !data/.gitkeep
 outputs/*
 !outputs/.gitkeep
 logs/*
 !logs/.gitkeep
-
-# Local env & notebooks
-.venv/
 .env
-*.ipynb_checkpoints
+.venv/
