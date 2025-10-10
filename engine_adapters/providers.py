@@ -82,7 +82,6 @@ def _try_module(source: str, module_names: List[str], call_hints: List[str],
             res["notes"].append(f"main failed: {e}")
 
     wrote, rows = {}, {}
-
     pbp_src = _first_exists(
         OUT_EXT / "pbp" / f"pbp_{season}.parquet",
         OUT_EXT / "pbp" / f"pbp_{season}.csv",
@@ -110,11 +109,6 @@ def _try_module(source: str, module_names: List[str], call_hints: List[str],
         r = _mirror(rost_src, DATA / "rosters.csv")
         wrote["rosters"] = str(DATA / "rosters.csv"); rows["rosters"] = r
 
-    inj_src = _first_exists(DATA / "injuries.csv", OUT_EXT / "injuries.csv")
-    if inj_src:
-        r = _mirror(inj_src, DATA / "injuries.csv")
-        wrote["injuries"] = str(DATA / "injuries.csv"); rows["injuries"] = r
-
     res["wrote"] = wrote
     res["rows"] = rows
     res["ok"] = bool(rows.get("player_stats_week", 0) or rows.get("pbp", 0))
@@ -139,7 +133,7 @@ def run_espn(season: int, date: Optional[str]) -> ProviderResult:
 def run_nflgsis(season: int, date: Optional[str]) -> ProviderResult:
     return _try_module(
         "NFLGSIS",
-        ["nflgsis", "scripts.providers.nflgsis"],
+        ["scripts.providers.nflgsis", "nflgsis"],
         ["fetch", "run", "download", "build", "main"],
         season, date
     )
@@ -147,7 +141,7 @@ def run_nflgsis(season: int, date: Optional[str]) -> ProviderResult:
 def run_apisports(season: int, date: Optional[str]) -> ProviderResult:
     return _try_module(
         "API-Sports",
-        ["apisports", "scripts.providers.apisports"],
+        ["scripts.providers.apisports", "apisports"],
         ["fetch", "run", "download", "build", "main"],
         season, date
     )
@@ -155,7 +149,7 @@ def run_apisports(season: int, date: Optional[str]) -> ProviderResult:
 def run_msf(season: int, date: Optional[str]) -> ProviderResult:
     return _try_module(
         "MySportsFeeds",
-        ["msf", "scripts.providers.msf"],
+        ["scripts.providers.msf", "msf"],
         ["fetch", "run", "download", "build", "main"],
         season, date
     )
