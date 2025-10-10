@@ -1,17 +1,15 @@
-name: Full Slate (orchestrated via run_model)
-
+name: Full Slate (orchestrated)
 on:
   workflow_dispatch:
     inputs:
       season:
-        description: "Season (e.g., 2025)"
+        description: 'Season (e.g., 2025)'
         required: true
-        default: "2025"
+        default: '2025'
       date:
-        description: "ISO date (YYYY-MM-DD) optional"
+        description: 'ISO date (YYYY-MM-DD)'
         required: false
-        default: ""
-
+        default: ''
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -26,37 +24,25 @@ jobs:
       RUN_TS: ${{ github.run_id }}
       RUN_ID: ${{ github.run_id }}
       LOG_DIR: logs/daily_runs
-      MC_TRIALS: "25000"
-
+      MC_TRIALS: '25000'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || true
-
-      - name: Prepare working dirs
-        run: |
-          mkdir -p data outputs logs
-
+      - name: Prepare dirs
+        run: mkdir -p data outputs logs outputs/metrics
       - name: Run pipeline
-        run: |
-          python run_model.py --season "${{ github.event.inputs.season }}" --date "${{ github.event.inputs.date }}"
-
+        run: python run_model.py --season "${{ github.event.inputs.season }}" --date "${{ github.event.inputs.date }}"
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: model_outputs
           path: |
-            data/*.csv
-            data/*.parquet
-            outputs/**/*.csv
-            outputs/**/*.parquet
-            logs/**/*.*
+            data/**
+            outputs/**
+            logs/**
           if-no-files-found: warn
