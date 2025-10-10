@@ -1,0 +1,12 @@
+from __future__ import annotations
+import os, json, pandas as pd, pathlib
+def _load_cookies():
+    raw = os.getenv("ESPN_COOKIE"); 
+    if not raw: raise RuntimeError("ESPN_COOKIE not set")
+    try: return json.loads(raw)
+    except Exception as e: raise RuntimeError(f"ESPN_COOKIE invalid JSON: {e}")
+def fetch(season: int, date: str | None = None) -> None:
+    _ = _load_cookies()
+    pathlib.Path("data").mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"season": season, "ok": True}]).to_csv("data/espn_probe.csv", index=False)
+    print("[ESPN] wrote data/espn_probe.csv")
