@@ -8,11 +8,11 @@ _loader_name = "none"
 try:
     import nflreadpy as _loader  # type: ignore
     _loader_name = "nflreadpy"
-except Exception:
+except Exception as e:
     try:
         import nfl_data_py as _loader  # type: ignore
         _loader_name = "nfl_data_py"
-    except Exception:
+    except Exception as e:
         _loader = None
 
 def _fn(name: str):
@@ -31,9 +31,9 @@ def _safe_call(func, **kwargs):
         try:
             kwargs.pop("file_type", None)
             return func(**kwargs)
-        except Exception:
+        except Exception as e:
             return None
-    except Exception:
+    except Exception as e:
         return None
 
 # ------------- basic loaders -------------
