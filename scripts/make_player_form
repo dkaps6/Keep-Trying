@@ -1,5 +1,0 @@
-from __future__ import annotations
-import argparse
-from scripts.build_player_form import build_player_form
-if __name__=='__main__':
- ap=argparse.ArgumentParser(); ap.add_argument('--season', type=int, required=True); a=ap.parse_args(); df=build_player_form(a.season); print(f"[make_player_form] wrote {len(df)} rows")
