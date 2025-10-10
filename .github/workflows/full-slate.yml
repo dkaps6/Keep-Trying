@@ -36,7 +36,7 @@ jobs:
       - name: Prepare dirs
         run: mkdir -p data outputs logs outputs/metrics
       - name: Run pipeline
-        run: python run_model.py --season "${{ github.event.inputs.season }}" --date "${{ github.event.inputs.date }}"
+          python -m engine --season "2025" --date "2025-10-12"
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
